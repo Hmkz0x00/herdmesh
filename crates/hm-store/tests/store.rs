@@ -5,8 +5,21 @@ use ed25519_dalek::SigningKey;
 use hm_proto::{
     AgentRef, AgentStatus, Event, EventBody, Lamport, NodeId, Ref, Role, RoomId, TaskId, TaskStatus,
 };
-use hm_store::{AppendOutcome, Store, StoreError, Views, next_lamport};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use hm_store::{AppendOutcome, Lease, Store, StoreError, Views, next_lamport};
 use proptest::prelude::*;
+
+/// Unique seq per signed test event (only uniqueness per author matters here).
+fn fresh_seq() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn leases(s: &Store, now: u64) -> BTreeMap<String, Lease> {
+    s.views().active_leases(now).collect()
+}
 
 fn key_from(seed: u8) -> SigningKey {
     // Deterministic per-seed test keys derived at runtime (never real keys).
@@ -18,7 +31,7 @@ fn room() -> RoomId {
 }
 
 fn ev(k: &SigningKey, name: &str, lamport: u64, ts: u64, body: EventBody) -> Event {
-    Event::sign(k, room(), name, Lamport(lamport), ts, body).unwrap()
+    Event::sign(k, room(), name, fresh_seq(), Lamport(lamport), ts, body).unwrap()
 }
 
 fn agent(k: &SigningKey, name: &str) -> AgentRef {
@@ -148,7 +161,8 @@ fn board_decisions_members() {
     assert_eq!(v.decisions[0].title, "use sqlite");
     assert_eq!(v.decisions[0].refs, vec![r]);
     let a = &v.members[&agent(&k1, "a")];
-    assert_eq!(a.role, Some(Role::Owner));
+    // A Join's self-declared role is ignored: no genesis pinned → member.
+    assert_eq!(a.role, Some(Role::Member));
     assert!(a.present);
     assert_eq!(a.last_lamport, Lamport(6));
     let b = &v.members[&agent(&k2, "b")];
@@ -175,41 +189,35 @@ fn leases_first_in_order_wins_and_expire() {
     // b claims at lamport 2, a at lamport 1: a wins regardless of arrival order.
     s.append(&claim(&k2, "b", 2, 1_000)).unwrap();
     s.append(&claim(&k1, "a", 1, 1_000)).unwrap();
-    let l = &s.views().leases["src/lib.rs"];
+    let l = &leases(&s, 1_000)["src/lib.rs"];
     assert_eq!(l.holder, agent(&k1, "a"));
     assert_eq!(l.expires_at_ms, 11_000);
     assert_eq!(s.views().active_leases(10_999).count(), 1);
     assert_eq!(s.views().active_leases(11_000).count(), 0);
 
     // After a's lease expired (by claim ts), b's new claim wins.
-    s.append(&claim(&k2, "b", 3, 20_000)).unwrap();
-    assert_eq!(s.views().leases["src/lib.rs"].holder, agent(&k2, "b"));
+    let b2 = claim(&k2, "b", 3, 20_000);
+    s.append(&b2).unwrap();
+    assert_eq!(leases(&s, 20_000)["src/lib.rs"].holder, agent(&k2, "b"));
 
     // Release by a non-holder is ignored; by the holder removes it.
     let release = |k: &SigningKey, n: &str, l: u64| {
-        ev(
-            k,
-            n,
-            l,
-            20_001,
-            EventBody::LeaseRelease {
-                paths: vec!["src/lib.rs".into()],
-            },
-        )
+        ev(k, n, l, 20_001, EventBody::LeaseRelease { claim: b2.id })
     };
     s.append(&release(&k1, "a", 4)).unwrap();
-    assert!(s.views().leases.contains_key("src/lib.rs"));
+    assert!(leases(&s, 20_001).contains_key("src/lib.rs"));
     s.append(&release(&k2, "b", 5)).unwrap();
-    assert!(s.views().leases.is_empty());
+    assert!(leases(&s, 20_001).is_empty());
 }
 
 #[test]
 fn lamport_helper() {
-    assert_eq!(next_lamport([]), Lamport(1));
+    assert_eq!(next_lamport([]), Some(Lamport(1)));
     assert_eq!(
         next_lamport([Lamport(3), Lamport(9), Lamport(1)]),
-        Lamport(10)
+        Some(Lamport(10))
     );
+    assert_eq!(next_lamport([Lamport(u64::MAX)]), None);
     let k = key_from(1);
     let mut s = Store::open_in_memory(room()).unwrap();
     assert_eq!(s.next_lamport().unwrap(), Lamport(1));
@@ -294,7 +302,9 @@ fn arb_body() -> impl Strategy<Value = EventBody> {
             }),
         (paths.clone(), 1u32..30)
             .prop_map(|(paths, ttl_secs)| EventBody::LeaseClaim { paths, ttl_secs }),
-        paths.prop_map(|paths| EventBody::LeaseRelease { paths }),
+        prop::sample::select(vec![0u8, 1, 2]).prop_map(|n| EventBody::LeaseRelease {
+            claim: hm_proto::EventId::from_bytes([n; 32]),
+        }),
         "[a-z]{1,6}".prop_map(|title| EventBody::Decision {
             title,
             rationale: String::new(),

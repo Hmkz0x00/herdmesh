@@ -1,6 +1,6 @@
 //! Signed, content-addressed room events.
 //!
-//! Canonical bytes = `DOMAIN || WIRE_VERSION || postcard(room, author, lamport, ts, body)`.
+//! Canonical bytes = `DOMAIN || WIRE_VERSION || postcard(room, author, seq, lamport, ts, body)`.
 //! `id = blake3(canonical)`; `sig = ed25519(author.node, canonical)`.
 //! Wire bytes = `WIRE_VERSION || postcard(Event)`.
 
@@ -14,7 +14,7 @@ use crate::ids::{AgentRef, EventId, Lamport, NodeId, RoomId, TaskId, to_hex};
 use crate::refs::Ref;
 
 /// Wire format version; first byte of every encoded event.
-pub const WIRE_VERSION: u8 = 1;
+pub const WIRE_VERSION: u8 = 2;
 
 /// Domain separation so event signatures can't be replayed as anything else.
 const DOMAIN: &[u8] = b"herdmesh/event";
@@ -25,6 +25,22 @@ pub enum Role {
     Owner,
     Member,
     Observer,
+}
+
+impl Role {
+    /// Whether a node with this role may author events of `kind`. Views
+    /// ignore (but still store) events whose author lacks permission.
+    pub fn may(self, kind: EventKind) -> bool {
+        use EventKind as K;
+        match self {
+            Self::Owner => true,
+            Self::Member => !matches!(kind, K::RoleGrant | K::Genesis),
+            Self::Observer => matches!(
+                kind,
+                K::Join | K::Leave | K::Presence | K::Ask | K::Answer | K::Note
+            ),
+        }
+    }
 }
 
 /// Agent status mirrored from herdr.
@@ -70,8 +86,10 @@ pub enum EventBody {
         paths: Vec<String>,
         ttl_secs: u32,
     },
+    /// Ends the lease taken by the `LeaseClaim` event `claim`. Only honored
+    /// from the claim's author node.
     LeaseRelease {
-        paths: Vec<String>,
+        claim: EventId,
     },
     Decision {
         title: String,
@@ -101,6 +119,16 @@ pub enum EventBody {
         since: Lamport,
         text: String,
     },
+    /// First event of a room. Its id is carried in the ticket; only that
+    /// Genesis anchors roles.
+    Genesis {
+        owner: NodeId,
+    },
+    /// Owner-only: set `node`'s role.
+    RoleGrant {
+        node: NodeId,
+        role: Role,
+    },
 }
 
 /// Fieldless event kind, derived from the body.
@@ -119,10 +147,12 @@ pub enum EventKind {
     Answer,
     Note,
     Digest,
+    Genesis,
+    RoleGrant,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 13] = [
+    pub const ALL: [EventKind; 15] = [
         Self::Join,
         Self::Leave,
         Self::Presence,
@@ -136,6 +166,8 @@ impl EventKind {
         Self::Answer,
         Self::Note,
         Self::Digest,
+        Self::Genesis,
+        Self::RoleGrant,
     ];
 }
 
@@ -155,6 +187,8 @@ impl EventBody {
             Self::Answer { .. } => EventKind::Answer,
             Self::Note { .. } => EventKind::Note,
             Self::Digest { .. } => EventKind::Digest,
+            Self::Genesis { .. } => EventKind::Genesis,
+            Self::RoleGrant { .. } => EventKind::RoleGrant,
         }
     }
 }
@@ -184,6 +218,8 @@ pub struct Event {
     pub id: EventId,
     pub room: RoomId,
     pub author: AgentRef,
+    /// Per author node sequence number: 1, 2, 3, ... (single writer per node).
+    pub seq: u64,
     pub lamport: Lamport,
     /// Unix millis; informational only, never used for ordering.
     pub ts: u64,
@@ -196,6 +232,7 @@ pub struct Event {
 struct Unsigned<'a> {
     room: &'a RoomId,
     author: &'a AgentRef,
+    seq: &'a u64,
     lamport: &'a Lamport,
     ts: &'a u64,
     body: &'a EventBody,
@@ -207,14 +244,19 @@ impl Event {
         key: &SigningKey,
         room: RoomId,
         agent_name: impl Into<String>,
+        seq: u64,
         lamport: Lamport,
         ts: u64,
         body: EventBody,
     ) -> Result<Self, ProtoError> {
+        if seq == 0 {
+            return Err(ProtoError::ZeroSeq);
+        }
         let mut ev = Self {
             id: EventId::from_bytes([0; 32]),
             room,
             author: AgentRef::new(NodeId::from_verifying_key(&key.verifying_key()), agent_name),
+            seq,
             lamport,
             ts,
             body,
@@ -238,6 +280,7 @@ impl Event {
         let unsigned = Unsigned {
             room: &self.room,
             author: &self.author,
+            seq: &self.seq,
             lamport: &self.lamport,
             ts: &self.ts,
             body: &self.body,
@@ -255,6 +298,9 @@ impl Event {
 
     /// Check that `id` matches the content and `sig` is the author node's signature.
     pub fn verify(&self) -> Result<(), ProtoError> {
+        if self.seq == 0 {
+            return Err(ProtoError::ZeroSeq);
+        }
         let canonical = self.canonical_bytes()?;
         if blake3::hash(&canonical).as_bytes() != self.id.as_bytes() {
             return Err(ProtoError::IdMismatch);

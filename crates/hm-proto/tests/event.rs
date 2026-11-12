@@ -53,9 +53,7 @@ fn all_bodies(k: &SigningKey) -> Vec<EventBody> {
             paths: vec!["crates/hm-proto/**".into()],
             ttl_secs: 3600,
         },
-        EventBody::LeaseRelease {
-            paths: vec!["crates/hm-proto/**".into()],
-        },
+        EventBody::LeaseRelease { claim: ask_id },
         EventBody::Decision {
             title: "postcard wire".into(),
             rationale: "compact, deterministic".into(),
@@ -83,11 +81,18 @@ fn all_bodies(k: &SigningKey) -> Vec<EventBody> {
             since: Lamport(10),
             text: "summary".into(),
         },
+        EventBody::Genesis {
+            owner: agent(k).node,
+        },
+        EventBody::RoleGrant {
+            node: NodeId::from_bytes([9u8; 32]),
+            role: Role::Observer,
+        },
     ]
 }
 
 fn sample(k: &SigningKey, body: EventBody) -> Event {
-    Event::sign(k, room(), "claude", Lamport(42), 1_700_000_000_000, body).unwrap()
+    Event::sign(k, room(), "claude", 1, Lamport(42), 1_700_000_000_000, body).unwrap()
 }
 
 #[test]
@@ -118,8 +123,66 @@ fn id_is_stable_for_equal_events() {
     let b = sample(&k, EventBody::Leave);
     assert_eq!(a.id, b.id);
     assert_eq!(a.id, a.compute_id().unwrap());
-    let c = Event::sign(&k, room(), "claude", Lamport(43), a.ts, EventBody::Leave).unwrap();
+    let c = Event::sign(&k, room(), "claude", 1, Lamport(43), a.ts, EventBody::Leave).unwrap();
     assert_ne!(a.id, c.id);
+}
+
+#[test]
+fn wire_version_is_2() {
+    assert_eq!(WIRE_VERSION, 2);
+}
+
+#[test]
+fn seq_is_signed() {
+    let k = key();
+    let a = sample(&k, EventBody::Leave);
+    let b = Event::sign(&k, room(), "claude", 2, a.lamport, a.ts, EventBody::Leave).unwrap();
+    assert_eq!(a.seq, 1);
+    assert_ne!(a.id, b.id);
+    let mut c = a.clone();
+    c.seq = 2;
+    assert!(c.verify().is_err());
+}
+
+#[test]
+fn zero_seq_is_rejected() {
+    let k = key();
+    assert!(matches!(
+        Event::sign(&k, room(), "claude", 0, Lamport(1), 1, EventBody::Leave),
+        Err(ProtoError::ZeroSeq)
+    ));
+    // A peer-built event with seq 0 fails verification even when well signed.
+    let mut ev = sample(&k, EventBody::Leave);
+    ev.seq = 0;
+    assert!(matches!(ev.verify(), Err(ProtoError::ZeroSeq)));
+}
+
+#[test]
+fn role_permissions() {
+    use EventKind as K;
+    for kind in EventKind::ALL {
+        assert!(Role::Owner.may(kind), "{kind:?}");
+    }
+    assert!(!Role::Member.may(K::RoleGrant));
+    assert!(!Role::Member.may(K::Genesis));
+    assert!(Role::Member.may(K::LeaseClaim));
+    assert!(Role::Member.may(K::Decision));
+    for k in [K::Join, K::Leave, K::Presence, K::Ask, K::Answer, K::Note] {
+        assert!(Role::Observer.may(k), "{k:?}");
+    }
+    for k in [
+        K::TaskAdd,
+        K::TaskUpdate,
+        K::LeaseClaim,
+        K::LeaseRelease,
+        K::Decision,
+        K::Handoff,
+        K::Digest,
+        K::RoleGrant,
+        K::Genesis,
+    ] {
+        assert!(!Role::Observer.may(k), "{k:?}");
+    }
 }
 
 #[test]
@@ -183,6 +246,7 @@ fn note_event(k: &SigningKey, text: String, lamport: u64) -> Event {
         k,
         room(),
         "claude",
+        1,
         Lamport(lamport),
         1,
         EventBody::Note {
@@ -219,7 +283,7 @@ proptest! {
     fn field_tamper_is_rejected(
         text in ".{1,40}",
         lamport in any::<u64>(),
-        which in 0usize..4,
+        which in 0usize..5,
         pos in any::<prop::sample::Index>(),
         xor in 1u8..=255,
     ) {
@@ -244,6 +308,7 @@ proptest! {
                 b[i] ^= xor;
                 ev.author.agent_name = String::from_utf8_lossy(&b).into_owned();
             }
+            3 => ev.seq ^= u64::from(xor) << (8 * pos.index(8)),
             _ => ev.lamport = Lamport(ev.lamport.0 ^ (u64::from(xor) << (8 * pos.index(8)))),
         }
         prop_assert!(ev.verify().is_err());

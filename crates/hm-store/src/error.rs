@@ -12,4 +12,12 @@ pub enum StoreError {
     WrongRoom,
     #[error("corrupt store: bad {0}")]
     Corrupt(&'static str),
+    #[error("lamport jumps too far past the local max")]
+    LamportJump,
+    #[error("lamport or seq clock exhausted")]
+    ClockExhausted,
+    #[error("store was written by an older, incompatible version; remove it and re-sync")]
+    IncompatibleSchema,
+    #[error("store is pinned to a different genesis event")]
+    GenesisMismatch,
 }
