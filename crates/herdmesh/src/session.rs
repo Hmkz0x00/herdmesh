@@ -442,7 +442,7 @@ pub fn render_status(
         let _ = writeln!(
             s,
             "  {} by {} ({left}s left)",
-            sanitize_display(path, TEXT_MAX),
+            sanitize_display(&path, TEXT_MAX),
             short_agent(&l.holder)
         );
     }
@@ -638,15 +638,14 @@ mod tests {
             },
         );
         let ev = hm_proto::EventId::from_bytes([0; 32]);
-        v.leases.insert(
-            format!("src/{evil}"),
-            Lease {
-                holder: who.clone(),
-                claim: ev,
-                lamport: Lamport(1),
-                expires_at_ms: 70_000,
-            },
-        );
+        v.leases.add_claim(ClaimRec {
+            id: hm_proto::EventId::from_bytes([9; 32]),
+            holder: who.clone(),
+            lamport: Lamport(1),
+            ts: 0,
+            paths: vec![format!("src/{evil}")],
+            ttl_secs: 60,
+        });
         v.board.insert(
             TaskId::new("t-1").unwrap(),
             Task {
@@ -687,6 +686,7 @@ mod tests {
             &SigningKey::from_bytes(&[4; 32]),
             RoomId::from_bytes([1; 32]),
             evil,
+            1,
             Lamport(1),
             1,
             EventBody::Note {

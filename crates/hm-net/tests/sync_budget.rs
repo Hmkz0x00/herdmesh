@@ -41,6 +41,7 @@ fn notes(n: u64) -> Vec<Event> {
                 &k,
                 room(),
                 "ag",
+                i,
                 Lamport(i),
                 1_000 + i,
                 EventBody::Note {
