@@ -12,4 +12,12 @@ workspace = true
 
 [dependencies]
 hm-proto.workspace = true
-hm-brief.workspace = true
+async-trait.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rmcp = { workspace = true, features = ["client"] }
