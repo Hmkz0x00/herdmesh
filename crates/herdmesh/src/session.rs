@@ -110,7 +110,8 @@ pub fn make_ticket(
     RoomTicket::new(secret, genesis, bootstrap)
 }
 
-fn node_key(data: &DataDir) -> Result<SigningKey, SessionError> {
+/// The node identity as an event-signing key.
+pub fn node_key(data: &DataDir) -> Result<SigningKey, SessionError> {
     // Same 32 bytes iroh uses: events are signed by our node identity.
     let key = load_or_create_key(&data.node_key(), data.insecure_key_allowed())?;
     Ok(SigningKey::from_bytes(&key.to_bytes()))
@@ -231,12 +232,25 @@ impl RoomSession {
         id: RoomId,
         relay: RelayChoice,
     ) -> Result<Self, SessionError> {
+        let net = bind_net(data, relay.clone()).await?;
+        let store: SharedStore = Arc::new(Mutex::new(Store::open(data.events_db(&id), id)?));
+        Self::open_with(data, id, relay, net, store).await
+    }
+
+    /// Like [`RoomSession::open`] on an endpoint and store the caller owns
+    /// (the daemon shares one `Net` across rooms and the store with its
+    /// IPC side). [`RoomSession::close`] then shuts that endpoint down too.
+    pub async fn open_with(
+        data: &DataDir,
+        id: RoomId,
+        relay: RelayChoice,
+        net: Net,
+        store: SharedStore,
+    ) -> Result<Self, SessionError> {
         let cfg = data.load_room(&id)?;
         let secret = data.load_secret(&id, &cfg)?;
         let known_peers = data.load_peers(&id)?;
         let key = node_key(data)?;
-        let net = bind_net(data, relay.clone()).await?;
-        let store: SharedStore = Arc::new(Mutex::new(Store::open(data.events_db(&id), id)?));
         net.sync_rooms()
             .insert(secret.clone(), Arc::clone(&store))?;
         let (tx, rx) = join_room(&net, &secret, known_peers.clone()).await?;
@@ -368,6 +382,16 @@ impl RoomSession {
         self.lock()?.append(&ev)?;
         self.tx.publish(&ev).await?;
         Ok(ev)
+    }
+
+    /// Broadcast an already signed and stored event (the daemon signs).
+    pub async fn broadcast(&self, ev: &Event) -> Result<(), SessionError> {
+        Ok(self.tx.publish(ev).await?)
+    }
+
+    /// Stop serving this room but leave the shared endpoint running.
+    pub fn detach(self) {
+        let _ = self.net.sync_rooms().remove(&self.id);
     }
 
     /// Handle one incoming item (gossip or a finished sync). `None` when the

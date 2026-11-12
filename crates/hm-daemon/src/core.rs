@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ed25519_dalek::SigningKey;
 use hm_brief::{agent_label, clean};
+use hm_net::SharedStore;
 use hm_proto::budget::{BRIEF_DEFAULT_MAX, ROOM_CARD_MAX, estimate_tokens};
 use hm_proto::{
     AgentRef, Event, EventBody, EventId, Lamport, NodeId, Ref, Role, RoomId, TaskId, TaskStatus,
@@ -66,13 +67,37 @@ pub fn wrapped_cost(author: &str, text: &str) -> usize {
     ))
 }
 
-struct RoomState {
+/// One room as held by the daemon. The store is shared with the net layer
+/// (sync serving, gossip intake); lock order is always rooms, then store.
+struct RoomEntry {
     name: String,
-    store: Store,
+    store: SharedStore,
+}
+
+/// A locked room, as the request handlers see it.
+struct RoomState<'a> {
+    name: &'a str,
+    store: &'a mut Store,
+}
+
+/// Something a local agent should be told about (see [`Daemon::pending_pings`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ping {
+    pub room: RoomId,
+    /// The Ask/Handoff event that triggered it.
+    pub event: EventId,
+    /// Local agent name the event is addressed to.
+    pub agent: String,
+    /// `"Ask"` or `"Handoff"`.
+    pub kind: &'static str,
+    /// Sanitised `node6/name` label of the sender.
+    pub from: String,
+    /// First ref of a handoff (e.g. `task#12`), if any.
+    pub re: Option<String>,
 }
 
 struct Rooms {
-    by_id: BTreeMap<RoomId, RoomState>,
+    by_id: BTreeMap<RoomId, RoomEntry>,
     default: Option<RoomId>,
 }
 
@@ -186,17 +211,124 @@ impl Daemon {
     /// Register a room whose genesis is already pinned in `store` (joined
     /// from a ticket). The first room added becomes the default.
     pub fn add_room(&self, name: &str, store: Store) -> RoomId {
-        let id = store.room();
+        self.add_room_shared(name, Arc::new(Mutex::new(store)))
+    }
+
+    /// Like [`Daemon::add_room`] for a store the net layer also holds.
+    pub fn add_room_shared(&self, name: &str, store: SharedStore) -> RoomId {
+        let id = lock(&store).room();
         let mut rooms = lock(&self.rooms);
         rooms.default.get_or_insert(id);
         rooms.by_id.insert(
             id,
-            RoomState {
+            RoomEntry {
                 name: name.to_owned(),
                 store,
             },
         );
         id
+    }
+
+    /// Ids of every loaded room.
+    pub fn room_ids(&self) -> Vec<RoomId> {
+        lock(&self.rooms).by_id.keys().copied().collect()
+    }
+
+    fn entry(&self, room: RoomId) -> Res<(String, SharedStore)> {
+        lock(&self.rooms)
+            .by_id
+            .get(&room)
+            .map(|e| (e.name.clone(), Arc::clone(&e.store)))
+            .ok_or(ErrCode::NoRoom)
+    }
+
+    #[doc(hidden)]
+    pub fn store_for_test(&self, room: RoomId) -> SharedStore {
+        self.entry(room)
+            .map(|e| e.1)
+            .unwrap_or_else(|_| unreachable!("test room"))
+    }
+
+    /// Names of the agents of *this node* registered in `room`.
+    pub fn local_members(&self, room: RoomId) -> Vec<String> {
+        let Ok((_, store)) = self.entry(room) else {
+            return Vec::new();
+        };
+        lock(&store)
+            .views()
+            .members
+            .keys()
+            .filter(|a| a.node == self.node)
+            .map(|a| a.agent_name.clone())
+            .collect()
+    }
+
+    /// Announce `status` for local agent `agent` (must be a room member).
+    pub fn set_presence(
+        &self,
+        room: RoomId,
+        agent: &str,
+        status: hm_proto::AgentStatus,
+    ) -> Result<(), ErrCode> {
+        if !valid_agent(agent) {
+            return Err(ErrCode::BadRequest);
+        }
+        let (name, store) = self.entry(room)?;
+        let mut guard = lock(&store);
+        if !guard
+            .views()
+            .members
+            .contains_key(&AgentRef::new(self.node, agent))
+        {
+            return Err(ErrCode::NotFound);
+        }
+        let mut st = RoomState {
+            name: &name,
+            store: &mut guard,
+        };
+        self.emit(&mut st, agent, EventBody::Presence { status })
+            .map(|_| ())
+    }
+
+    /// Unread Asks and Handoffs addressed to local agents (past their inbox
+    /// cursor). The caller dedupes; an agent clears them with `inbox ack`.
+    pub fn pending_pings(&self) -> Vec<Ping> {
+        let mut out = Vec::new();
+        for room in self.room_ids() {
+            let Ok((_, store)) = self.entry(room) else {
+                continue;
+            };
+            let store = lock(&store);
+            let views = store.views();
+            for me in views.members.keys().filter(|a| a.node == self.node) {
+                let key = AgentRef::new(me.node, format!("inbox:{}", me.agent_name));
+                let cursor = store.cursor(&key).ok().flatten().unwrap_or(Lamport(0));
+                let Ok(events) = store.events_since(cursor) else {
+                    continue;
+                };
+                for e in events
+                    .iter()
+                    .filter(|e| e.author != *me && views.role_of(&e.author.node).may(e.kind()))
+                {
+                    let (kind, re) = match &e.body {
+                        EventBody::Ask { to: Some(t), .. } if t == me => ("Ask", None),
+                        EventBody::Handoff {
+                            to: Some(t), refs, ..
+                        } if t == me => ("Handoff", refs.first().map(ToString::to_string)),
+                        _ => continue,
+                    };
+                    out.push(Ping {
+                        room,
+                        event: e.id,
+                        agent: me.agent_name.clone(),
+                        kind,
+                        from: agent_label(&e.author),
+                        re,
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// Start a new room owned by this node: sign Genesis, pin it, store it.
@@ -218,7 +350,7 @@ impl Daemon {
         Ok(self.add_room(name, store))
     }
 
-    fn emit(&self, st: &mut RoomState, agent: &str, body: EventBody) -> Res<Event> {
+    fn emit(&self, st: &mut RoomState<'_>, agent: &str, body: EventBody) -> Res<Event> {
         let now = (self.clock)();
         if !st.store.views().role_of(&self.node).may(body.kind()) {
             return Err(ErrCode::Forbidden);
@@ -242,7 +374,7 @@ impl Daemon {
     }
 
     /// First request from an agent announces it to the room.
-    fn ensure_member(&self, st: &mut RoomState, me: &AgentRef) -> Res<()> {
+    fn ensure_member(&self, st: &mut RoomState<'_>, me: &AgentRef) -> Res<()> {
         if st.store.views().members.contains_key(me) {
             return Ok(());
         }
@@ -251,7 +383,7 @@ impl Daemon {
     }
 
     /// `node6/name`, a bare name known in the room, or a bare local name.
-    fn resolve(&self, st: &RoomState, to: &str) -> Res<AgentRef> {
+    fn resolve(&self, st: &RoomState<'_>, to: &str) -> Res<AgentRef> {
         let members = &st.store.views().members;
         if let Some((node, name)) = to.split_once('/') {
             if node.len() < 4 || !valid_agent(name) {
@@ -276,13 +408,13 @@ impl Daemon {
         }
     }
 
-    fn call(&self, st: &mut RoomState, agent: &str, call: Call) -> Res<Items> {
+    fn call(&self, st: &mut RoomState<'_>, agent: &str, call: Call) -> Res<Items> {
         let me = AgentRef::new(self.node, agent);
         self.ensure_member(st, &me)?;
         let now = (self.clock)();
         match call {
             Call::RoomCard => ok(fit_card(hm_brief::room_card(
-                &st.name,
+                st.name,
                 st.store.views(),
                 now,
             ))),
@@ -440,7 +572,7 @@ impl Daemon {
             }
             Call::GetEvent { id } => {
                 let id = parse_event_id(&id)?;
-                match hm_brief::get_event(&st.store, &id).map_err(internal)? {
+                match hm_brief::get_event(st.store, &id).map_err(internal)? {
                     Some(t) => ok(t),
                     None => Err(ErrCode::NotFound),
                 }
@@ -449,7 +581,7 @@ impl Daemon {
         }
     }
 
-    fn claim_result(st: &RoomState, ev: &Event, now: u64) -> Res<Items> {
+    fn claim_result(st: &RoomState<'_>, ev: &Event, now: u64) -> Res<Items> {
         let state = st.store.claim_state(&ev.id, now).map_err(internal)?;
         let text = match state {
             Some(ClaimState::Lost { winner }) => {
@@ -476,13 +608,13 @@ impl Daemon {
         ok(text)
     }
 
-    fn brief(&self, st: &mut RoomState, me: &AgentRef, max: usize, now: u64) -> Res<Items> {
+    fn brief(&self, st: &mut RoomState<'_>, me: &AgentRef, max: usize, now: u64) -> Res<Items> {
         let max = if max == 0 { BRIEF_DEFAULT_MAX } else { max }.min(MAX_BRIEF_TOKENS);
         let cursor = st.store.cursor(me).map_err(internal)?.unwrap_or(Lamport(0));
         // Fit *after* MCP wrapping: shrink the inner budget until it does.
         let mut inner = max;
         let b = loop {
-            let b = hm_brief::brief(&st.store, me, cursor, now, inner).map_err(internal)?;
+            let b = hm_brief::brief(st.store, me, cursor, now, inner).map_err(internal)?;
             if wrapped_cost(DAEMON_AUTHOR, &b.text) <= max || inner == 0 {
                 break b;
             }
@@ -494,7 +626,7 @@ impl Daemon {
 
     /// Inbox cursor lives beside the brief cursor under a reserved name
     /// (`:` can't occur in a valid agent name).
-    fn inbox(st: &mut RoomState, me: &AgentRef, ack: bool) -> Res<Items> {
+    fn inbox(st: &mut RoomState<'_>, me: &AgentRef, ack: bool) -> Res<Items> {
         let key = AgentRef::new(me.node, format!("inbox:{}", me.agent_name));
         let cursor = st
             .store
@@ -551,7 +683,7 @@ impl Daemon {
         Ok(items)
     }
 
-    fn search(st: &RoomState, query: &str, limit: usize) -> Res<Items> {
+    fn search(st: &RoomState<'_>, query: &str, limit: usize) -> Res<Items> {
         let q = query.to_lowercase();
         let events = st.store.events_since(Lamport(0)).map_err(internal)?;
         let floor = events
@@ -581,14 +713,19 @@ impl Daemon {
         if !valid_agent(&req.agent) {
             return Response::Err(ErrCode::BadRequest);
         }
-        let mut rooms = lock(&self.rooms);
+        let rooms = lock(&self.rooms);
         let Some(id) = req.room.or(rooms.default) else {
             return Response::Err(ErrCode::NoRoom);
         };
-        let Some(st) = rooms.by_id.get_mut(&id) else {
+        let Some(entry) = rooms.by_id.get(&id) else {
             return Response::Err(ErrCode::NoRoom);
         };
-        match self.call(st, &req.agent, req.call) {
+        let mut guard = lock(&entry.store);
+        let mut st = RoomState {
+            name: &entry.name,
+            store: &mut guard,
+        };
+        match self.call(&mut st, &req.agent, req.call) {
             Ok(items) => Response::Ok(items),
             Err(e) => Response::Err(e),
         }

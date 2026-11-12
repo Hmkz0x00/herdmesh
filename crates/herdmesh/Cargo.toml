@@ -18,6 +18,7 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 hm-daemon.workspace = true
+hm-herdr.workspace = true
 hm-mcp.workspace = true
 hm-net.workspace = true
 hm-proto.workspace = true

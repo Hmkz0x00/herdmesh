@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use herdmesh::daemon;
 use herdmesh::data::DataDir;
 use herdmesh::room::{self, DEFAULT_AGENT};
 
@@ -34,10 +35,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RoomCmd,
     },
-    /// Run the per-machine daemon (not yet implemented).
+    /// Run the per-machine daemon (one per user) until Ctrl+C.
     Daemon,
-    /// Run the MCP stdio server for one agent (not yet implemented).
-    Mcp,
+    /// Run the MCP stdio server for one agent; starts the daemon if needed.
+    Mcp {
+        /// Agent name this server acts as.
+        #[arg(long)]
+        agent: String,
+        /// Room (local name or id) to use instead of the default room.
+        #[arg(long)]
+        room: Option<String>,
+    },
     /// Check the local environment (herdr binary, data dir).
     Doctor,
 }
@@ -129,12 +137,62 @@ fn room_main(data: Option<DataDir>, cmd: RoomCmd) -> ExitCode {
     }
 }
 
-/// Exit code for subcommands that are still stubs.
-const EXIT_NOT_IMPLEMENTED: u8 = 2;
+/// Run `fut` on a fresh runtime; print errors as `herdmesh <name>: ...`.
+fn block_on<E: std::fmt::Display>(
+    name: &str,
+    fut: impl std::future::Future<Output = Result<(), E>>,
+) -> ExitCode {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("herdmesh {name}: tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match rt.block_on(fut) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("herdmesh {name}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
-fn not_implemented(name: &str) -> ExitCode {
-    eprintln!("herdmesh {name}: not yet implemented");
-    ExitCode::from(EXIT_NOT_IMPLEMENTED)
+fn daemon_main(data: Option<DataDir>) -> ExitCode {
+    let Some(data) = data else {
+        eprintln!("herdmesh daemon: no data dir; pass --data-dir");
+        return ExitCode::FAILURE;
+    };
+    block_on("daemon", async {
+        let opts = daemon::DaemonOptions::from_data(&data)?;
+        let ctrl_c = async {
+            if tokio::signal::ctrl_c().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        daemon::run(&data, opts, ctrl_c, |l| eprintln!("{l}")).await
+    })
+}
+
+fn mcp_main(data: Option<DataDir>, agent: &str, room: Option<&str>) -> ExitCode {
+    let Some(data) = data else {
+        eprintln!("herdmesh mcp: no data dir; pass --data-dir");
+        return ExitCode::FAILURE;
+    };
+    block_on("mcp", async {
+        let backend = daemon::mcp_backend(&data, &daemon::default_socket(), agent, room, || {
+            daemon::spawn_detached(&data)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        // stdout belongs to the MCP transport; logs stay on stderr.
+        hm_mcp::serve_stdio(std::sync::Arc::new(backend))
+            .await
+            .map_err(|e| e.to_string())
+    })
 }
 
 fn main() -> ExitCode {
@@ -149,8 +207,14 @@ fn main() -> ExitCode {
             data_dir(cli.data_dir).map(|d| d.allow_insecure_key(cli.allow_insecure_key)),
             cmd,
         ),
-        Cmd::Daemon => not_implemented("daemon"),
-        Cmd::Mcp => not_implemented("mcp"),
+        Cmd::Daemon => daemon_main(
+            data_dir(cli.data_dir).map(|d| d.allow_insecure_key(cli.allow_insecure_key)),
+        ),
+        Cmd::Mcp { agent, room } => mcp_main(
+            data_dir(cli.data_dir).map(|d| d.allow_insecure_key(cli.allow_insecure_key)),
+            &agent,
+            room.as_deref(),
+        ),
         Cmd::Doctor => {
             let mut cfg = doctor::DoctorConfig::from_env();
             if cli.data_dir.is_some() {
@@ -179,9 +243,19 @@ mod tests {
 
     #[test]
     fn parses_all_subcommands() {
-        for sub in ["daemon", "mcp", "doctor"] {
+        for sub in ["daemon", "doctor"] {
             assert!(Cli::try_parse_from(["herdmesh", sub]).is_ok(), "{sub}");
         }
+        assert!(
+            Cli::try_parse_from(["herdmesh", "mcp"]).is_err(),
+            "needs --agent"
+        );
+        let c =
+            Cli::try_parse_from(["herdmesh", "mcp", "--agent", "bob", "--room", "alpha"]).unwrap();
+        assert!(matches!(
+            c.command,
+            Cmd::Mcp { agent, room: Some(r) } if agent == "bob" && r == "alpha"
+        ));
     }
 
     #[test]
