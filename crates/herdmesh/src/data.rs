@@ -6,7 +6,7 @@
 //!   node.key                 32-byte node secret (0600)
 //!   rooms/<room_id hex>/
 //!     room.toml              name, role, agent_name, secret_file
-//!     secret.key             32-byte room secret (0600)
+//!     secret.key             32-byte room secret (owner-only: 0600 / DACL)
 //!     peers.json             bootstrap EndpointAddrs (not secret)
 //!     sync.json              last sync result per peer (for `room status`)
 //!     events.sqlite          hm-store event log
@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use hm_net::secure_file::{SecureFileError, create_private, read_private};
 use hm_net::{RelayChoice, RoomSecret};
 use hm_proto::{Role, RoomId};
 use iroh::{EndpointAddr, RelayUrl};
@@ -45,6 +46,8 @@ pub enum DataError {
     NameTaken(String),
     #[error("room {0} already exists locally")]
     RoomExists(String),
+    #[error(transparent)]
+    SecretFile(#[from] SecureFileError),
 }
 
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> DataError + '_ {
@@ -58,11 +61,27 @@ fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> DataError + '_ {
 #[derive(Debug, Clone)]
 pub struct DataDir {
     root: PathBuf,
+    allow_insecure_key: bool,
 }
 
 impl DataDir {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            allow_insecure_key: false,
+        }
+    }
+
+    /// Accept node/room secret files others can read (`--allow-insecure-key`):
+    /// warn instead of refusing.
+    #[must_use]
+    pub fn allow_insecure_key(mut self, allow: bool) -> Self {
+        self.allow_insecure_key = allow;
+        self
+    }
+
+    pub fn insecure_key_allowed(&self) -> bool {
+        self.allow_insecure_key
     }
 
     /// Same default as `herdmesh doctor`: `<platform data dir>/herdmesh`.
@@ -217,7 +236,7 @@ impl DataDir {
 
     pub fn load_secret(&self, id: &RoomId, cfg: &RoomConfig) -> Result<RoomSecret, DataError> {
         let path = self.room_dir(id).join(&cfg.secret_file);
-        let bytes = std::fs::read(&path).map_err(io_err(&path))?;
+        let bytes = read_private(&path, self.allow_insecure_key)?;
         let arr: [u8; 32] = bytes
             .try_into()
             .map_err(|_| DataError::SecretFormat { path })?;
@@ -267,14 +286,7 @@ pub fn room_id_from_hex(s: &str) -> Option<RoomId> {
 /// Write a secret file the way `node.key` is written: `create_new` (never
 /// overwrite) and mode 0600 on Unix.
 pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), DataError> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path).map_err(io_err(path))?;
+    let mut f = create_private(path)?;
     f.write_all(bytes).map_err(io_err(path))?;
     f.sync_all().map_err(io_err(path))
 }
@@ -371,6 +383,41 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let d = DataDir::new(t.path().join("hm"));
         (t, d)
+    }
+
+    fn broaden(p: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("icacls")
+                .arg(p)
+                .args(["/grant", "*S-1-1-0:R"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn room_secret_is_owner_only_and_broader_is_refused_unless_allowed() {
+        let (_t, d) = dd();
+        let secret = RoomSecret::from_bytes([4; 32]);
+        let cfg = RoomConfig::new("alpha", RoleName::Owner, "a");
+        let id = d.create_room(&secret, &cfg, &[]).unwrap();
+        let path = d.room_secret(&id);
+        assert_eq!(hm_net::secure_file::check_private(&path).unwrap(), None);
+        assert_eq!(d.load_secret(&id, &cfg).unwrap(), secret);
+
+        broaden(&path);
+        let err = d.load_secret(&id, &cfg).unwrap_err();
+        assert!(matches!(err, DataError::SecretFile(_)), "{err}");
+        assert!(err.to_string().contains("--allow-insecure-key"), "{err}");
+        let d = d.allow_insecure_key(true);
+        assert_eq!(d.load_secret(&id, &cfg).unwrap(), secret);
     }
 
     #[test]

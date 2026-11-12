@@ -41,6 +41,7 @@ async fn bind(dir: &tempfile::TempDir, name: &str) -> Net {
     Net::bind(NetConfig {
         key_path: dir.path().join(name).join("node.key"),
         relay: RelayChoice::Disabled,
+        allow_insecure_key: false,
     })
     .await
     .unwrap()

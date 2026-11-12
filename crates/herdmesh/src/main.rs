@@ -20,6 +20,9 @@ struct Cli {
     /// Data dir (default: the platform data dir + /herdmesh, as in `doctor`).
     #[arg(long, global = true, value_name = "DIR")]
     data_dir: Option<PathBuf>,
+    /// Use node/room secret files that others can read (warn, don't refuse).
+    #[arg(long, global = true)]
+    allow_insecure_key: bool,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -142,7 +145,10 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Room { cmd } => room_main(data_dir(cli.data_dir), cmd),
+        Cmd::Room { cmd } => room_main(
+            data_dir(cli.data_dir).map(|d| d.allow_insecure_key(cli.allow_insecure_key)),
+            cmd,
+        ),
         Cmd::Daemon => not_implemented("daemon"),
         Cmd::Mcp => not_implemented("mcp"),
         Cmd::Doctor => {
