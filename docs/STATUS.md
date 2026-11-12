@@ -3,9 +3,10 @@
 Milestone: **GATE M1+M2 = FAIL (codex) → fixes in progress per ADR-002** (main c608f86)
 Updated: 2026-11-12
 
-## Roster (herdr workspace w3; names prefixed hm- to avoid clashes)
-- tab 1: lead w3:p1 · hm-agy w3:p2 (skip-permissions) · hm-impl1 w3:p3 · hm-impl2 w3:p4
-- tab hm-review: hm-codex w3:p6 (gatekeeper; blocked on folder trust by human)
+## Roster (workspace w3, tab 1; models per docs/team/model-routing.md)
+- lead w3:p1 Opus 5.5 · hm-codex w3:p6 GPT-6-Astra medium (no sandbox, user allow rule)
+- hm-agy w3:p2 Gemini 3.8 Flash high → medium at next task · hm-impl1 w3:p3 Sonnet 5.5 medium
+- hm-impl2 w3:p4 Opus 5.5 (G3 sync = security-critical) → Sonnet after G3
 
 ## Open
 - G1 hm-impl1 (impl1/gate-core): ADR-002 §1,2,4 + store side of §3. NOT committed yet; paused by usage limit (resumes ~20:50)
