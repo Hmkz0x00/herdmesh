@@ -22,6 +22,13 @@
 //! - **Twins.** For each listed author the response also carries the kept
 //!   twin of every equivocated seq (at most [`MAX_TWINS_PER_AUTHOR`]); the
 //!   client's store keeps the lowest id and records the mark.
+//! - **Prefix checks** (GATE-2 N2). Twins nobody holds both of leave no
+//!   mark, so each listed author also carries a [`PrefixCheck`] (the
+//!   client's XOR fingerprint over its contiguous prefix). A server that
+//!   disagrees replies with a [`SyncMsg::Probe`] of [`PROBE_POINTS`]
+//!   fingerprints; the client narrows the range over rounds of the same
+//!   page until it is at most [`PROBE_DIRECT`] seqs, which the server then
+//!   sends outright, putting both twins in front of one store.
 //! - Frame: `u32 BE length || SYNC_VERSION || postcard(msg)`. The server reads
 //!   requests with [`MAX_REQUEST_FRAME`]; only clients accept the larger
 //!   [`MAX_RESPONSE_FRAME`].
@@ -38,7 +45,7 @@
 //!   `concurrent_requests` streams of one connection at a time. A peer that
 //!   goes silent, drips bytes or never ends a response is cut off.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -61,7 +68,7 @@ use crate::net::SYNC_ALPN;
 use crate::ticket::RoomSecret;
 
 /// Version byte at the start of every frame payload.
-pub const SYNC_VERSION: u8 = 2;
+pub const SYNC_VERSION: u8 = 3;
 /// Largest request frame a server reads (before auth, so kept small).
 pub const MAX_REQUEST_FRAME: usize = 64 << 10;
 /// Largest response frame (one event plus framing) a client reads. Events
@@ -86,6 +93,10 @@ pub const MAX_TWINS_PER_AUTHOR: usize = 64;
 pub const HOLE_WINDOWS: usize = 8;
 /// Authors the server reads per store query while answering.
 const SERVER_AUTHOR_PAGE: usize = 64;
+/// Points per [`SyncMsg::Probe`] when bisecting a prefix mismatch.
+pub const PROBE_POINTS: u64 = 16;
+/// A mismatched range this short is answered with its events directly.
+pub const PROBE_DIRECT: u64 = 16;
 /// Stream reset code for every refused request.
 pub const ERR_REFUSED: u32 = 1;
 
@@ -135,6 +146,19 @@ pub struct AuthorWant {
     pub author: NodeId,
     pub have_hi: u64,
     pub holes: Vec<u64>,
+    /// Prefix fingerprint check (GATE-2 N2), see [`PrefixCheck`].
+    pub check: Option<PrefixCheck>,
+}
+
+/// "My prefix fingerprint (`Store::prefix_fp`) at `at` is `fp`; any
+/// difference is above `lo`." A server that disagrees answers with a
+/// [`SyncMsg::Probe`] (or, for a short range, the events themselves), so
+/// twins that no single node holds both of are still found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefixCheck {
+    pub lo: u64,
+    pub at: u64,
+    pub fp: [u8; 32],
 }
 
 /// Client request: "send me what I lack in `room`" for authors in the id
@@ -174,6 +198,7 @@ impl SyncSince {
                 self.in_range(&w.author)
                     && w.holes.len() <= MAX_HOLES_PER_AUTHOR
                     && w.holes.iter().all(|h| (1..=w.have_hi).contains(h))
+                    && w.check.is_none_or(|c| c.lo < c.at && c.at <= w.have_hi)
             })
             && match (self.from, self.to) {
                 (Some(f), Some(t)) => f < t,
@@ -221,6 +246,7 @@ pub fn request_page(
                 author: *author,
                 have_hi: s.max,
                 holes,
+                check: None,
             }
         })
         .collect();
@@ -238,13 +264,17 @@ pub fn request_page(
 
 /// Server side of one request: wire events the client lacks within `caps`,
 /// and whether more remain. Indexed per-author queries only.
-pub fn answer_request(
-    store: &Store,
-    req: &SyncSince,
-    caps: SyncCaps,
-) -> Result<(Vec<Vec<u8>>, bool), SyncError> {
+pub fn answer_request(store: &Store, req: &SyncSince, caps: SyncCaps) -> Result<Answer, SyncError> {
     let want: BTreeMap<NodeId, &AuthorWant> = req.want.iter().map(|w| (w.author, w)).collect();
     let (mut out, mut bytes) = (Vec::new(), 0usize);
+    let mut probes = Vec::new();
+    let done = |events, probes, more| {
+        Ok(Answer {
+            events,
+            probes,
+            more,
+        })
+    };
     // Authors in `(from, to]`, read a page at a time (GATE-2 N4): work is
     // bounded by the listed authors plus the response caps, since every
     // author the client lacks yields at least one event.
@@ -260,25 +290,36 @@ pub fn answer_request(
             }
             scanned += 1;
             if scanned > scan_cap {
-                return Ok((out, true));
+                return done(out, probes, true);
             }
-            let (have_hi, holes) = want
-                .get(author)
-                .map_or((0, &[][..]), |w| (w.have_hi, w.holes.as_slice()));
-            if held.max <= have_hi && holes.is_empty() {
+            let w = want.get(author);
+            let (have_hi, holes) = w.map_or((0, &[][..]), |w| (w.have_hi, w.holes.as_slice()));
+            let mut ranged = Vec::new();
+            if let Some(c) = w.and_then(|w| w.check) {
+                match check_prefix(store, author, held.hi, c)? {
+                    Some(Checked::Probe(p)) => probes.push(p),
+                    Some(Checked::Range(lo, at)) => {
+                        let n = usize::try_from(at - lo).unwrap_or(usize::MAX);
+                        ranged = store.events_for(author, lo, &[], n)?;
+                    }
+                    None => {}
+                }
+            }
+            if held.max <= have_hi && holes.is_empty() && ranged.is_empty() {
                 continue;
             }
             let left = caps.max_events.saturating_sub(out.len());
             if left == 0 {
-                return Ok((out, true));
+                return done(out, probes, true);
             }
-            for e in store.events_for(author, have_hi, holes, left)? {
+            let regular = store.events_for(author, have_hi, holes, left)?;
+            for e in ranged.into_iter().chain(regular) {
                 let wire = e.encode()?;
                 if wire.len() > MAX_EVENT_BYTES {
                     continue; // stored by an older build; never sent
                 }
                 if !out.is_empty() && bytes.saturating_add(wire.len()) > caps.max_bytes {
-                    return Ok((out, true));
+                    return done(out, probes, true);
                 }
                 bytes = bytes.saturating_add(wire.len());
                 out.push(wire);
@@ -303,7 +344,74 @@ pub fn answer_request(
             out.push(wire);
         }
     }
-    Ok((out, false))
+    done(out, probes, false)
+}
+
+/// What [`answer_request`] sends: events, prefix probes, and `more`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Answer {
+    pub events: Vec<Vec<u8>>,
+    pub probes: Vec<Probe>,
+    pub more: bool,
+}
+
+/// The server's prefix fingerprints of `author` at ascending `points`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Probe {
+    pub author: NodeId,
+    pub points: Vec<(u64, [u8; 32])>,
+}
+
+enum Checked {
+    Probe(Probe),
+    /// Prefixes differ inside `(lo, at]`, short enough to send outright.
+    Range(u64, u64),
+}
+
+/// Server side of a [`PrefixCheck`] for `author`, whose contiguous prefix
+/// here is `hi`. `None`: nothing to say (it matches, or we hold nothing
+/// above `lo`).
+fn check_prefix(
+    store: &Store,
+    author: &NodeId,
+    hi: u64,
+    c: PrefixCheck,
+) -> Result<Option<Checked>, SyncError> {
+    if hi <= c.lo {
+        return Ok(None);
+    }
+    let fp = |seq| -> Result<[u8; 32], SyncError> {
+        store
+            .prefix_fp(author, seq)?
+            .ok_or(SyncError::Protocol("prefix below hi missing"))
+    };
+    if hi < c.at {
+        // Behind the client: let it compare at our prefix end.
+        return Ok(Some(Checked::Probe(Probe {
+            author: *author,
+            points: vec![(hi, fp(hi)?)],
+        })));
+    }
+    if fp(c.at)? == c.fp {
+        return Ok(None);
+    }
+    let span = c.at - c.lo;
+    if span <= PROBE_DIRECT {
+        return Ok(Some(Checked::Range(c.lo, c.at)));
+    }
+    let mut points: Vec<(u64, [u8; 32])> = Vec::new();
+    for j in 1..=PROBE_POINTS {
+        let step = u64::try_from(u128::from(span) * u128::from(j) / u128::from(PROBE_POINTS))
+            .unwrap_or(span);
+        let seq = c.lo + step;
+        if points.last().is_none_or(|(p, _)| *p < seq) {
+            points.push((seq, fp(seq)?));
+        }
+    }
+    Ok(Some(Checked::Probe(Probe {
+        author: *author,
+        points,
+    })))
 }
 
 /// Server response frames.
@@ -316,6 +424,8 @@ pub enum SyncMsg {
     /// Sent only after a request authenticated; refusals before that are a
     /// stream reset.
     Refused(Refusal),
+    /// Prefix fingerprints answering a mismatched [`PrefixCheck`].
+    Probe(Probe),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -655,7 +765,11 @@ async fn serve_stream(
         answer_request(&*store.lock()?, &req, caps)
     })
     .await?;
-    let (mut events, mut more) = match answer {
+    let Answer {
+        mut events,
+        mut probes,
+        mut more,
+    } = match answer {
         Ok(a) => a,
         Err(e) => {
             tracing::warn!(error = %e, "sync query failed");
@@ -679,6 +793,12 @@ async fn serve_stream(
         events.truncate(fit);
         more = true;
     }
+    let probe_bytes: usize = probes.iter().map(|p| 40 + 40 * p.points.len()).sum();
+    if total.saturating_add(probe_bytes) > left {
+        probes.clear(); // the client asks again next sync
+    } else {
+        total += probe_bytes;
+    }
     if (events.is_empty() && more) || !budget.take(total) {
         tracing::debug!("sync connection byte budget too small");
         refuse(send, recv);
@@ -687,6 +807,9 @@ async fn serve_stream(
     tracing::debug!(count = events.len(), more, "sync response");
     for wire in events {
         write_frame(send, &SyncMsg::Event(wire)).await?;
+    }
+    for p in probes {
+        write_frame(send, &SyncMsg::Probe(p)).await?;
     }
     write_frame(send, &SyncMsg::End { more }).await?;
     send.finish()?;
@@ -759,6 +882,85 @@ pub struct SyncStats {
     pub equivocations: usize,
 }
 
+/// Client-side prefix-check state for one sync run (GATE-2 N2).
+///
+/// Each author is checked once per run at its prefix end. A mismatch
+/// answered by a [`Probe`] narrows to a suspect range `(lo, at]`, re-checked
+/// next round until the server sends that range's events (which exposes
+/// the twin to the store) or the prefixes agree.
+#[derive(Debug, Clone, Default)]
+pub struct PrefixChecks {
+    suspect: BTreeMap<NodeId, (u64, u64)>,
+    settled: BTreeSet<NodeId>,
+}
+
+impl PrefixChecks {
+    /// Authors still being narrowed down.
+    pub fn suspects(&self) -> usize {
+        self.suspect.len()
+    }
+
+    /// The check to send for `author`, whose prefix here ends at `hi`.
+    fn check(
+        &self,
+        store: &Store,
+        author: &NodeId,
+        hi: u64,
+    ) -> Result<Option<PrefixCheck>, SyncError> {
+        let (lo, at) = match self.suspect.get(author) {
+            Some(&(lo, at)) if at <= hi => (lo, at),
+            _ if self.settled.contains(author) || hi == 0 => return Ok(None),
+            _ => (0, hi),
+        };
+        Ok(store
+            .prefix_fp(author, at)?
+            .map(|fp| PrefixCheck { lo, at, fp }))
+    }
+
+    /// Fold one round's probes in. `asked`: the checks that were sent.
+    fn absorb(
+        &mut self,
+        store: &Store,
+        asked: &[(NodeId, PrefixCheck)],
+        probes: &[Probe],
+    ) -> Result<(), SyncError> {
+        for (author, c) in asked {
+            let Some(p) = probes.iter().find(|p| p.author == *author) else {
+                // Matched, or the range's events came back: done this run.
+                self.suspect.remove(author);
+                self.settled.insert(*author);
+                continue;
+            };
+            let mut lo = c.lo;
+            let mut narrowed = None;
+            for &(seq, theirs) in &p.points {
+                if seq <= lo || seq > c.at {
+                    return Err(SyncError::Protocol("probe point out of range"));
+                }
+                match store.prefix_fp(author, seq)? {
+                    Some(mine) if mine == theirs => lo = seq,
+                    Some(_) => {
+                        narrowed = Some((lo, seq));
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            match narrowed {
+                // Strictly narrower, so a run converges in few rounds.
+                Some(r) if r != (c.lo, c.at) || r.1 - r.0 <= PROBE_DIRECT => {
+                    self.suspect.insert(*author, r);
+                }
+                _ => {
+                    self.suspect.remove(author);
+                    self.settled.insert(*author);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Outcome of one [`sync_page`] round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageRound {
@@ -769,6 +971,8 @@ pub struct PageRound {
     pub to: Option<NodeId>,
     /// Hole windows this page needs; see [`request_page`].
     pub windows: usize,
+    /// Authors of this page with a prefix mismatch still being narrowed.
+    pub suspects: usize,
 }
 
 /// Map a stream reset/stop with [`ERR_REFUSED`] to [`SyncError::Refused`].
@@ -791,12 +995,13 @@ async fn request_round(
     req: &SyncSince,
     stats: &mut SyncStats,
     limits: &SyncLimits,
-) -> Result<(Vec<Event>, bool), SyncError> {
+) -> Result<(Vec<Event>, Vec<Probe>, bool), SyncError> {
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(&mut send, req).await.map_err(refused_or)?;
     send.finish()?;
 
     let mut events = Vec::new();
+    let mut probes = Vec::new();
     let (mut frames, mut bytes) = (0usize, 0usize);
     let more = loop {
         let msg =
@@ -823,11 +1028,27 @@ async fn request_round(
                     Err(_) => stats.rejected += 1,
                 }
             }
+            SyncMsg::Probe(p) => {
+                frames += 1;
+                let listed = req
+                    .want
+                    .iter()
+                    .any(|w| w.author == p.author && w.check.is_some());
+                if frames > MAX_RESPONSE_EVENTS
+                    || !listed
+                    || p.points.is_empty()
+                    || p.points.len() > PROBE_POINTS as usize
+                    || probes.iter().any(|q: &Probe| q.author == p.author)
+                {
+                    return Err(SyncError::Protocol("bad probe"));
+                }
+                probes.push(p);
+            }
             SyncMsg::End { more } => break more,
             SyncMsg::Refused(r) => return Err(SyncError::Refused(r)),
         }
     };
-    Ok((events, more))
+    Ok((events, probes, more))
 }
 
 /// One request/response round for the summary page after `from`, within
@@ -842,8 +1063,9 @@ pub async fn sync_page(
     limits: &SyncLimits,
     from: Option<NodeId>,
     window: usize,
+    checks: &mut PrefixChecks,
 ) -> Result<PageRound, SyncError> {
-    let (req, to, windows) = {
+    let (req, to, windows, asked) = {
         let s = store.lock()?;
         let room = s.room();
         if room != secret.room_id() {
@@ -855,7 +1077,15 @@ pub async fn sync_page(
             MAX_AUTHORS_PER_REQUEST + 1,
             MAX_HOLES_PER_AUTHOR * HOLE_WINDOWS,
         )?;
-        let page = request_page(&summary, from, window);
+        let mut page = request_page(&summary, from, window);
+        let mut asked = Vec::new();
+        for w in &mut page.want {
+            let hi = summary.get(&w.author).map_or(0, |a| a.hi);
+            w.check = checks.check(&s, &w.author, hi)?;
+            if let Some(c) = w.check {
+                asked.push((w.author, c));
+            }
+        }
         let req = SyncSince {
             room,
             from,
@@ -863,9 +1093,9 @@ pub async fn sync_page(
             want: page.want,
             auth: sync_auth(secret, local, conn.remote_id(), room),
         };
-        (req, page.to, page.windows)
+        (req, page.to, page.windows, asked)
     };
-    let (events, more) = within(
+    let (events, probes, more) = within(
         limits.request_deadline,
         "sync request",
         request_round(conn, &req, stats, limits),
@@ -874,10 +1104,16 @@ pub async fn sync_page(
     stats.rounds += 1;
 
     let store = store.clone();
-    let report = tokio::task::spawn_blocking(move || -> Result<_, SyncError> {
-        Ok(store.lock()?.append_batch(&events)?)
+    let mut state = std::mem::take(checks);
+    let (report, state) = tokio::task::spawn_blocking(move || -> Result<_, SyncError> {
+        let mut s = store.lock()?;
+        let report = s.append_batch(&events)?;
+        // After ingest, so a twin that just arrived is already reflected.
+        state.absorb(&s, &asked, &probes)?;
+        Ok((report, state))
     })
     .await??;
+    *checks = state;
     stats.inserted += report.inserted;
     stats.duplicates += report.duplicates;
     stats.rejected += report.rejected;
@@ -889,11 +1125,17 @@ pub async fn sync_page(
         more,
         "sync round"
     );
+    let suspects = req
+        .want
+        .iter()
+        .filter(|w| checks.suspect.contains_key(&w.author))
+        .count();
     Ok(PageRound {
         more,
         inserted: report.inserted,
         to,
         windows,
+        suspects,
     })
 }
 
@@ -912,8 +1154,24 @@ pub async fn sync_with(
 ) -> Result<SyncStats, SyncError> {
     let mut stats = SyncStats::default();
     let (mut from, mut window) = (None, 0);
+    let mut checks = PrefixChecks::default();
     while stats.rounds < limits.max_rounds {
-        let r = sync_page(conn, local, secret, store, &mut stats, limits, from, window).await?;
+        let r = sync_page(
+            conn,
+            local,
+            secret,
+            store,
+            &mut stats,
+            limits,
+            from,
+            window,
+            &mut checks,
+        )
+        .await?;
+        if r.suspects > 0 {
+            // Keep narrowing prefix mismatches on this page.
+            continue;
+        }
         if r.inserted > 0 {
             // Progress shifts the hole list: start its windows over.
             window = 0;

@@ -185,6 +185,7 @@ async fn raw_request(
     let out = loop {
         match read_frame::<SyncMsg>(&mut recv, MAX_RESPONSE_FRAME).await {
             Ok(SyncMsg::Event(_)) => events += 1,
+            Ok(SyncMsg::Probe(_)) => {}
             Ok(SyncMsg::End { .. }) => break Ok(()),
             Ok(SyncMsg::Refused(r)) => break Err(SyncError::Refused(r)),
             Err(e) => break Err(e),

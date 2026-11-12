@@ -269,6 +269,7 @@ async fn ask(conn: &Connection, req: &SyncSince) -> (usize, Result<(), SyncError
     loop {
         match read_frame::<SyncMsg>(&mut recv, MAX_RESPONSE_FRAME).await {
             Ok(SyncMsg::Event(_)) => events += 1,
+            Ok(SyncMsg::Probe(_)) => {}
             Ok(SyncMsg::End { .. }) => return (events, Ok(())),
             Ok(SyncMsg::Refused(r)) => return (events, Err(SyncError::Refused(r))),
             Err(e) => return (events, Err(e)),

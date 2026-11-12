@@ -2,7 +2,9 @@
 //!
 //! Tables: `events` (keyed by EventId, unique per (author node, seq)),
 //! `blobs` (bodies deduped by blake3), `authors` (contiguous seq prefix per
-//! author), `equivocations` (misbehaviour marks), `first_seen` (local arrival
+//! author), `prefix` (per author and seq `<= hi`, the XOR of
+//! [`seq_hash`] over `1..=seq`: a fingerprint sync compares to find twins
+//! no single node holds both of), `equivocations` (misbehaviour marks), `first_seen` (local arrival
 //! time per event, never read by views), `cursors` (local per-agent read
 //! cursors), `meta` (room, pinned genesis, view snapshot).
 //! Integers that take part in ordering are stored as big-endian BLOBs so
@@ -59,6 +61,12 @@ CREATE TABLE IF NOT EXISTS equivocations (
     seq     BLOB NOT NULL,
     dropped BLOB NOT NULL,
     PRIMARY KEY (node, seq, dropped)
+);
+CREATE TABLE IF NOT EXISTS prefix (
+    node BLOB NOT NULL,
+    seq  BLOB NOT NULL,
+    px   BLOB NOT NULL,
+    PRIMARY KEY (node, seq)
 );
 CREATE TABLE IF NOT EXISTS first_seen (
     id BLOB PRIMARY KEY,
@@ -402,25 +410,105 @@ fn delete_event(conn: &Connection, id: &EventId) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Move `node`'s contiguous prefix forward over newly stored seqs.
+/// Per-seq term of the prefix fingerprint: `blake3("hm-prefix-v1" || seq || id)`.
+pub fn seq_hash(seq: u64, id: &EventId) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"hm-prefix-v1");
+    h.update(&seq.to_be_bytes());
+    h.update(id.as_bytes());
+    *h.finalize().as_bytes()
+}
+
+fn xor(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+    std::array::from_fn(|i| a[i] ^ b[i])
+}
+
+fn read_hi(conn: &Connection, node: &[u8]) -> Result<u64, StoreError> {
+    let hi: Option<Vec<u8>> = conn
+        .prepare_cached("SELECT hi FROM authors WHERE node = ?1")?
+        .query_row(params![node], |r| r.get(0))
+        .optional()?;
+    Ok(hi.map(|v| u64_of(v, "hi")).transpose()?.unwrap_or(0))
+}
+
+/// Prefix fingerprint of `node` at `seq` (zero at 0); `None` above `hi`.
+fn px_at(conn: &Connection, node: &[u8], seq: u64) -> Result<Option<[u8; 32]>, StoreError> {
+    if seq == 0 {
+        return Ok(Some([0; 32]));
+    }
+    let v: Option<Vec<u8>> = conn
+        .prepare_cached("SELECT px FROM prefix WHERE node = ?1 AND seq = ?2")?
+        .query_row(params![node, be(seq)], |r| r.get(0))
+        .optional()?;
+    v.map(|v| arr(v, "prefix")).transpose()
+}
+
+/// Move `node`'s contiguous prefix forward over newly stored seqs,
+/// extending its prefix fingerprints.
 fn advance_hi(conn: &Connection, node: &NodeId) -> Result<(), StoreError> {
     let nb = node.as_bytes().to_vec();
-    let hi: Option<Vec<u8>> = conn
-        .query_row("SELECT hi FROM authors WHERE node = ?1", params![nb], |r| {
-            r.get(0)
-        })
-        .optional()?;
-    let mut hi = hi.map(|v| u64_of(v, "hi")).transpose()?.unwrap_or(0);
+    let mut hi = read_hi(conn, &nb)?;
+    let mut px = px_at(conn, &nb, hi)?.ok_or(StoreError::Corrupt("prefix"))?;
     while let Some(next) = hi.checked_add(1) {
-        if id_at(conn, node, next)?.is_none() {
+        let Some(id) = id_at(conn, node, next)? else {
             break;
-        }
+        };
+        px = xor(px, seq_hash(next, &id));
+        conn.prepare_cached("INSERT OR REPLACE INTO prefix (node, seq, px) VALUES (?1, ?2, ?3)")?
+            .execute(params![nb, be(next), px.to_vec()])?;
         hi = next;
     }
     conn.execute(
         "INSERT OR REPLACE INTO authors (node, hi) VALUES (?1, ?2)",
         params![nb, be(hi)],
     )?;
+    Ok(())
+}
+
+/// The event at `node`/`seq` changed: drop the prefix from `seq` on, so the
+/// next [`advance_hi`] recomputes it.
+fn truncate_prefix(conn: &Connection, node: &NodeId, seq: u64) -> Result<(), StoreError> {
+    let nb = node.as_bytes().to_vec();
+    let hi = read_hi(conn, &nb)?;
+    if seq > hi {
+        return Ok(());
+    }
+    // Big-endian seqs compare like numbers.
+    conn.execute(
+        "DELETE FROM prefix WHERE node = ?1 AND seq >= ?2",
+        params![nb, be(seq)],
+    )?;
+    conn.execute(
+        "UPDATE authors SET hi = ?2 WHERE node = ?1",
+        params![nb, be(seq - 1)],
+    )?;
+    Ok(())
+}
+
+/// Stores written before the `prefix` table existed: rebuild every
+/// author's prefix (and fingerprints) from seq 1, once.
+fn migrate_prefix(conn: &Connection) -> Result<(), StoreError> {
+    if get_meta(conn, "prefix_v1")?.is_some() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let nodes: Vec<Vec<u8>> = tx
+        .prepare("SELECT node FROM authors")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    tx.execute("DELETE FROM prefix", [])?;
+    for nb in nodes {
+        tx.execute(
+            "UPDATE authors SET hi = ?2 WHERE node = ?1",
+            params![nb, be(0)],
+        )?;
+        advance_hi(&tx, &NodeId::from_bytes(arr(nb, "author node")?))?;
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('prefix_v1', x'01')",
+        [],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -440,6 +528,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         check_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        migrate_prefix(&conn)?;
         match get_meta(&conn, "room")? {
             Some(r) if r.as_slice() != room.as_bytes() => return Err(StoreError::WrongRoom),
             Some(_) => {}
@@ -659,6 +748,7 @@ impl Store {
                     }
                     delete_event(&tx, &old)?;
                     insert_event(&tx, e)?;
+                    truncate_prefix(&tx, &e.author.node, e.seq)?;
                     replaced = true;
                     disp[i] = Disp::Replaced;
                 }
@@ -809,6 +899,12 @@ impl Store {
             out.insert(NodeId::from_bytes(arr(node, "author node")?), s);
         }
         Ok(out)
+    }
+
+    /// Prefix fingerprint of `node` at `seq`: XOR of [`seq_hash`] over
+    /// `1..=seq` (all zero at 0). `None` above the contiguous prefix.
+    pub fn prefix_fp(&self, node: &NodeId, seq: u64) -> Result<Option<[u8; 32]>, StoreError> {
+        px_at(&self.conn, node.as_bytes(), seq)
     }
 
     /// Events by `author` with `seq` in `holes` or `seq > after_seq`, by
