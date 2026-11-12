@@ -354,3 +354,76 @@ fn token_file_is_created_once_and_reused() {
     std::fs::write(&path, b"short").unwrap();
     assert!(ipc::load_or_create_token(&path).is_err());
 }
+
+/// A daemon whose node was made an observer by a remote owner.
+fn setup_observer() -> Env {
+    use hm_proto::{EventBody, Lamport, NodeId, Role};
+    let name = format!(
+        "herdmesh-test-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    );
+    let net = Arc::new(RecNet::default());
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let me = NodeId::from_verifying_key(&key.verifying_key());
+    let daemon = Daemon::new(key, net.clone());
+    let owner_key = SigningKey::from_bytes(&[3; 32]);
+    let owner = NodeId::from_verifying_key(&owner_key.verifying_key());
+    let room = RoomId::from_bytes([2; 32]);
+    let sign = |seq, lamport, body| {
+        Event::sign(&owner_key, room, "lead", seq, Lamport(lamport), 1, body).unwrap()
+    };
+    let genesis = sign(1, 1, EventBody::Genesis { owner });
+    let grant = sign(
+        2,
+        2,
+        EventBody::RoleGrant {
+            node: me,
+            role: Role::Observer,
+        },
+    );
+    let mut store = Store::open_in_memory(room).unwrap();
+    store.pin_genesis(genesis.id).unwrap();
+    store.append_batch(&[genesis, grant]).unwrap();
+    daemon.add_room("alpha", store);
+    let token = Token::from_bytes([9; 32]);
+    let server = Server::bind(&name, token.clone())
+        .unwrap()
+        .spawn(Arc::new(daemon));
+    Env {
+        name,
+        token,
+        net,
+        _server: server,
+    }
+}
+
+#[tokio::test]
+async fn observer_writes_are_refused_with_a_clear_error() {
+    let env = setup_observer();
+    let a = env.mcp("a");
+    for (tool, args) in [
+        ("claim", json!({"paths": ["src/x/**"], "ttl_min": 5})),
+        (
+            "decide",
+            json!({"title": "t", "rationale": "r", "refs": []}),
+        ),
+        (
+            "task_add",
+            json!({"task": "t-1", "title": "x", "paths": []}),
+        ),
+    ] {
+        let err = a.invoke(tool, args).await.unwrap_err();
+        assert!(err.message.contains("Not permitted"), "{tool}: {err:?}");
+    }
+    // Observers may still ask and read.
+    call(&a, "ask", json!({"to": "b", "question": "may I look?"})).await;
+    assert!(call(&a, "room_card", json!({})).await.contains("alpha"));
+    // Nothing the observer was refused reached the log or the network.
+    assert!(env.net.0.lock().unwrap().iter().all(|e| !matches!(
+        e.kind(),
+        hm_proto::EventKind::LeaseClaim
+            | hm_proto::EventKind::Decision
+            | hm_proto::EventKind::TaskAdd
+    )));
+}

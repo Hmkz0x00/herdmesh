@@ -86,6 +86,13 @@ enum RoomCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Owner only: set a member role (owner|member|observer).
+    Grant {
+        room: String,
+        /// Node id prefix (4+ hex chars, see `room status`).
+        node: String,
+        role: String,
+    },
     /// Show members, leases and open tasks from the local store.
     Status { room: String },
     /// Go online in the foreground until Ctrl+C.
@@ -121,6 +128,7 @@ fn room_main(data: Option<DataDir>, cmd: RoomCmd) -> ExitCode {
                 name,
             } => room::join(&data, &ticket, &agent, name.as_deref()),
             RoomCmd::Leave { room, yes } => room::leave(&data, &room, yes).await,
+            RoomCmd::Grant { room, node, role } => room::grant(&data, &room, &node, &role).await,
             RoomCmd::Status { room } => room::status(&data, &room),
             RoomCmd::Run { room } => {
                 let ctrl_c = async {

@@ -16,9 +16,14 @@ const ITEM_MAX: usize = 64;
 const TTL_MAX_MIN: u32 = 480;
 
 /// Backend failures are deliberately opaque at the MCP boundary: raw errors may contain peer text.
-#[derive(Debug, thiserror::Error)]
-#[error("backend unavailable")]
-pub struct BackendError;
+/// `NotPermitted` is the one case reported precisely: the caller's role forbids the action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BackendError {
+    #[error("backend unavailable")]
+    Unavailable,
+    #[error("not permitted")]
+    NotPermitted,
+}
 
 /// Local adapter contract, not a wire protocol. Each result is (person/agent, text).
 /// The adapter must supply verified provenance, enforce roles, redact outbound secrets,
@@ -135,9 +140,7 @@ pub fn tools_list() -> ListToolsResult {
             for field in fields.split_whitespace() {
                 let key = field.trim_end_matches('?');
                 let schema = match key {
-                    "paths" | "refs" | "next_steps" => {
-                        json!({"type":"array", "items":{"type":"string"}})
-                    }
+                    "paths" | "refs" | "next_steps" => json!({"type":"array"}),
                     "max_tokens" | "ttl_min" | "limit" => json!({"type":"integer"}),
                     "ack" => json!({"type":"boolean"}),
                     _ => json!({}),
@@ -155,7 +158,13 @@ pub fn tools_list() -> ListToolsResult {
             if !required.is_empty() {
                 schema.insert("required".into(), json!(required));
             }
-            Tool::new(*name, *description, schema)
+            let mut tool = Tool::new(*name, *description, schema);
+            // A description that only repeats the tool name costs tokens on
+            // every turn for every agent and says nothing.
+            if description.eq_ignore_ascii_case(name) {
+                tool.description = None;
+            }
+            tool
         })
         .collect();
     ListToolsResult {
@@ -355,7 +364,12 @@ impl McpServer {
             }
             _ => return Err(invalid()),
         }
-        .map_err(|_| ErrorData::internal_error("Backend unavailable", None))?;
+        .map_err(|e| match e {
+            BackendError::NotPermitted => {
+                ErrorData::invalid_request("Not permitted: your role in this room forbids it", None)
+            }
+            BackendError::Unavailable => ErrorData::internal_error("Backend unavailable", None),
+        })?;
         let cap = match name {
             "room_card" => Some(ROOM_CARD_MAX),
             "brief" => Some(number(
