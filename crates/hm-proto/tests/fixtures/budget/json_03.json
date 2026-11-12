@@ -1,0 +1,6 @@
+[
+  {"id": "ev_01JC3X8Q", "kind": "decision", "author": "lead", "ts": 1762940467, "body": "Use SQLite WAL for the event store.", "refs": ["adr:001"]},
+  {"id": "ev_01JC3XA2", "kind": "task", "author": "lead", "ts": 1762940512, "body": "M1-2 budget estimator", "status": "open", "assignee": "hm-impl2"},
+  {"id": "ev_01JC3XC9", "kind": "ping", "author": "hm-impl1", "ts": 1762940601, "body": "proto types pushed to impl1/m1-proto"},
+  {"id": "ev_01JC3XF0", "kind": "task", "author": "hm-impl2", "ts": 1762940733, "body": "M0-3 CI", "status": "done", "refs": ["git:8ca4588"]}
+]

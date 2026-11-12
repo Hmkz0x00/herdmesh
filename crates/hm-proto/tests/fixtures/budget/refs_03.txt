@@ -1,0 +1,8 @@
+E:\Codes\hm-wt-impl2\crates\hm-proto\src\budget.rs
+E:\Codes\hm-wt-impl1\crates\hm-proto\src\event.rs
+/home/dev/herdmesh/crates/hm-net/src/gossip.rs:214:17
+/home/dev/herdmesh/target/debug/deps/hm_store-3f9a1c2b7d4e5f60.d
+~/.config/herdmesh/rooms/herdmesh-dev/identity.key
+refs/heads/impl2/m1-budget
+refs/remotes/origin/main
+iroh://node/k51qzi5uqu5dgy7x0t2f8vn3mh6p4c9a1b7e2d0f5g8h3j6k9

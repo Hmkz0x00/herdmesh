@@ -1,0 +1,19 @@
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brief_respects_budget() {
+        let events = fixture_events("room_busy.json");
+        let out = build_brief(&events, BRIEF_DEFAULT_MAX);
+        assert!(estimate_tokens(&out) <= BRIEF_DEFAULT_MAX, "brief too long: {out}");
+    }
+
+    #[test]
+    fn truncation_drops_done_tasks_first() {
+        let mut events = fixture_events("room_busy.json");
+        events.retain(|e| e.kind != Kind::Chat);
+        let out = build_brief(&events, 80);
+        assert!(!out.contains("[done]"));
+    }
+}

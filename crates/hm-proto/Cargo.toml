@@ -11,3 +11,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+tiktoken-rs = "0.12.1"

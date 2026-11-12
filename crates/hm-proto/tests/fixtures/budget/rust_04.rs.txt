@@ -1,0 +1,14 @@
+async fn run(args: Args) -> anyhow::Result<()> {
+    let cfg = Config::load(args.config.as_deref()).context("loading config")?;
+    let store = Store::open(&cfg.data_dir).await?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(256);
+    let net = Net::spawn(cfg.net.clone(), tx.clone()).await?;
+    tracing::info!(room = %cfg.room, peers = net.peer_count(), "daemon started");
+    while let Some(ev) = rx.recv().await {
+        match ev.kind {
+            Kind::Ping => tracing::debug!(from = %ev.author, "ping"),
+            _ => store.append(&ev).await?,
+        }
+    }
+    Ok(())
+}
