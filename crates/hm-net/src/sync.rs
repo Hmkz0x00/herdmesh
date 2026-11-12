@@ -19,6 +19,9 @@
 //!   cycles through windows of its holes, then moves to the next page.
 //!   `have_hi` is always the client's highest seq, so new events always
 //!   flow even while some holes can't be filled by anyone.
+//! - **Twins.** For each listed author the response also carries the kept
+//!   twin of every equivocated seq (at most [`MAX_TWINS_PER_AUTHOR`]); the
+//!   client's store keeps the lowest id and records the mark.
 //! - Frame: `u32 BE length || SYNC_VERSION || postcard(msg)`. The server reads
 //!   requests with [`MAX_REQUEST_FRAME`]; only clients accept the larger
 //!   [`MAX_RESPONSE_FRAME`].
@@ -73,6 +76,8 @@ pub const MAX_SYNC_BYTES: usize = 256 << 20;
 pub const MAX_AUTHORS_PER_REQUEST: usize = 256;
 /// Holes listed per author in one request.
 pub const MAX_HOLES_PER_AUTHOR: usize = 16;
+/// Twins (kept events at equivocated seqs) served per requested author.
+pub const MAX_TWINS_PER_AUTHOR: usize = 64;
 /// Hole windows a client cycles through per page: it asks about at most
 /// `MAX_HOLES_PER_AUTHOR * HOLE_WINDOWS` holes per author per sync run, so
 /// holes no peer can fill never starve the ones behind them.
@@ -254,6 +259,21 @@ pub fn answer_request(
             let wire = e.encode()?;
             if !out.is_empty() && bytes.saturating_add(wire.len()) > caps.max_bytes {
                 return Ok((out, true));
+            }
+            bytes = bytes.saturating_add(wire.len());
+            out.push(wire);
+        }
+    }
+    // Twin serving (ADR-002 addendum): after all regular events, the kept
+    // twin of every equivocated seq of each listed author, so a client that
+    // holds a higher twin converges to the lowest id. Twins only fill spare
+    // capacity and never set `more`, so they can't starve regular events.
+    'twins: for w in &req.want {
+        for e in store.twins_for(&w.author, MAX_TWINS_PER_AUTHOR)? {
+            let left = caps.max_events.saturating_sub(out.len());
+            let wire = e.encode()?;
+            if left == 0 || bytes.saturating_add(wire.len()) > caps.max_bytes {
+                break 'twins;
             }
             bytes = bytes.saturating_add(wire.len());
             out.push(wire);
