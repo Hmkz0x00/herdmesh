@@ -36,7 +36,11 @@ enum Cmd {
         cmd: RoomCmd,
     },
     /// Run the per-machine daemon (one per user) until Ctrl+C.
-    Daemon,
+    Daemon {
+        /// Start a detached daemon only if none is running, then exit.
+        #[arg(long)]
+        ensure: bool,
+    },
     /// Run the MCP stdio server for one agent; starts the daemon if needed.
     Mcp {
         /// Agent name this server acts as.
@@ -45,6 +49,12 @@ enum Cmd {
         /// Room (local name or id) to use instead of the default room.
         #[arg(long)]
         room: Option<String>,
+    },
+    /// Live board of members, leases, tasks and inbox (herdr plugin pane).
+    Board {
+        /// Agent name used to read the inbox.
+        #[arg(long = "as", default_value = DEFAULT_AGENT)]
+        agent: String,
     },
     /// Check the local environment (herdr binary, data dir).
     Doctor,
@@ -161,6 +171,18 @@ fn block_on<E: std::fmt::Display>(
     }
 }
 
+fn ensure_main(data: Option<DataDir>) -> ExitCode {
+    let Some(data) = data else {
+        eprintln!("herdmesh daemon --ensure: no data dir; pass --data-dir");
+        return ExitCode::FAILURE;
+    };
+    block_on("daemon --ensure", async {
+        daemon::ensure_running(&daemon::default_socket(), || daemon::spawn_detached(&data))
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
 fn daemon_main(data: Option<DataDir>) -> ExitCode {
     let Some(data) = data else {
         eprintln!("herdmesh daemon: no data dir; pass --data-dir");
@@ -207,7 +229,10 @@ fn main() -> ExitCode {
             data_dir(cli.data_dir).map(|d| d.allow_insecure_key(cli.allow_insecure_key)),
             cmd,
         ),
-        Cmd::Daemon => daemon_main(
+        Cmd::Daemon { ensure: true } => ensure_main(
+            data_dir(cli.data_dir).map(|d| d.allow_insecure_key(cli.allow_insecure_key)),
+        ),
+        Cmd::Daemon { ensure: false } => daemon_main(
             data_dir(cli.data_dir).map(|d| d.allow_insecure_key(cli.allow_insecure_key)),
         ),
         Cmd::Mcp { agent, room } => mcp_main(
@@ -215,6 +240,7 @@ fn main() -> ExitCode {
             &agent,
             room.as_deref(),
         ),
+        Cmd::Board { agent } => herdmesh::board::run(data_dir(cli.data_dir), &agent),
         Cmd::Doctor => {
             let mut cfg = doctor::DoctorConfig::from_env();
             if cli.data_dir.is_some() {
