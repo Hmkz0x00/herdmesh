@@ -16,3 +16,16 @@ hm-store.workspace = true
 hm-net.workspace = true
 hm-brief.workspace = true
 hm-herdr.workspace = true
+blake3.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+interprocess = { version = "=2.4.8", features = ["tokio"] }
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
+
+[dev-dependencies]
+hm-mcp.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

@@ -1,6 +1,9 @@
 //! Stdio MCP boundary. Backends own identity, authorization, redaction and persistence.
 //! All returned text is peer-authored and is wrapped here, including author labels.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+mod daemon_backend;
+pub use daemon_backend::DaemonBackend;
+
 use async_trait::async_trait;
 use hm_proto::budget::{BRIEF_DEFAULT_MAX, RATIONALE_MAX, ROOM_CARD_MAX, estimate_tokens};
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt, model::*, service::RequestContext};
