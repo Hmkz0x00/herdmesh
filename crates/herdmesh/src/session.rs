@@ -2,20 +2,30 @@
 //!
 //! `herdmesh room run` drives a [`RoomSession`] in the foreground; tests drive
 //! two of them in-process.
+//!
+//! Catch-up: the store is registered in the endpoint's [`hm_net::SyncRooms`]
+//! so peers can pull from us, and we pull from every known peer after joining
+//! gossip and again on each gossip `NeighborUp`. Syncs run as background
+//! tasks (at most one per peer at a time); `sync_from` appends what it gets
+//! with `Store::append_batch`. Gossip events still go through `Store::append`.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 use hm_net::{
     GossipError, Net, NetConfig, NetError, RelayChoice, RoomEvent, RoomReceiver, RoomSecret,
-    RoomSender, RoomTicket, join_room, load_or_create_key,
+    RoomSender, RoomTicket, SharedStore, SyncError, SyncStats, endpoint_id_from_node, join_room,
+    load_or_create_key, node_id_from_endpoint, sync_from,
 };
 use hm_proto::{AgentRef, Event, EventBody, NodeId, ProtoError, RoomId, TaskStatus};
 use hm_store::{AppendOutcome, Store, StoreError, Views};
 use iroh::EndpointAddr;
+use tokio::sync::mpsc;
 
-use crate::data::{DataDir, DataError, RoomConfig};
+use crate::data::{DataDir, DataError, RoomConfig, SyncLog, SyncRecord};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -29,6 +39,10 @@ pub enum SessionError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Proto(#[from] ProtoError),
+    #[error("sync: {0}")]
+    Sync(#[from] SyncError),
+    #[error("store lock poisoned")]
+    Poisoned,
 }
 
 /// Unix millis now (0 if the clock is before 1970).
@@ -76,7 +90,52 @@ pub fn make_ticket(secret: RoomSecret, own: EndpointAddr, known: Vec<EndpointAdd
     RoomTicket::new(secret, bootstrap)
 }
 
+/// Result of one background sync, sent back to the session.
+struct SyncDone {
+    peer: NodeId,
+    result: Result<SyncStats, SyncError>,
+}
+
+/// Turn a finished sync into its persisted record and a console line.
+fn sync_record(
+    peer: &NodeId,
+    result: &Result<SyncStats, SyncError>,
+    at_ms: u64,
+) -> (SyncRecord, String) {
+    match result {
+        Ok(st) => (
+            SyncRecord {
+                at_ms,
+                ok: true,
+                rounds: st.rounds,
+                received: st.received,
+                inserted: st.inserted,
+                error: None,
+            },
+            format!(
+                "sync      {} +{} new ({} received, {} round(s))",
+                short_node(peer),
+                st.inserted,
+                st.received,
+                st.rounds
+            ),
+        ),
+        Err(e) => (
+            SyncRecord {
+                at_ms,
+                ok: false,
+                rounds: 0,
+                received: 0,
+                inserted: 0,
+                error: Some(e.to_string()),
+            },
+            format!("sync      {} failed: {e}", short_node(peer)),
+        ),
+    }
+}
+
 pub struct RoomSession {
+    data: DataDir,
     id: RoomId,
     cfg: RoomConfig,
     secret: RoomSecret,
@@ -84,13 +143,18 @@ pub struct RoomSession {
     known_peers: Vec<EndpointAddr>,
     key: SigningKey,
     net: Net,
-    store: Store,
+    store: SharedStore,
     tx: RoomSender,
     rx: RoomReceiver,
+    sync_tx: mpsc::UnboundedSender<SyncDone>,
+    sync_rx: mpsc::UnboundedReceiver<SyncDone>,
+    syncing: BTreeSet<NodeId>,
+    sync_log: SyncLog,
 }
 
 impl RoomSession {
-    /// Bind, open the store and subscribe to the room topic.
+    /// Bind, open the store, serve it to peers, subscribe to the room topic,
+    /// then start pulling from every known peer.
     pub async fn open(
         data: &DataDir,
         id: RoomId,
@@ -102,9 +166,13 @@ impl RoomSession {
         // Same 32 bytes iroh uses: events are signed by our node identity.
         let key = SigningKey::from_bytes(&load_or_create_key(&data.node_key())?.to_bytes());
         let net = bind_net(data, relay.clone()).await?;
-        let store = Store::open(data.events_db(&id), id)?;
+        let store: SharedStore = Arc::new(Mutex::new(Store::open(data.events_db(&id), id)?));
+        net.sync_rooms()
+            .insert(secret.clone(), Arc::clone(&store))?;
         let (tx, rx) = join_room(&net, &secret, known_peers.clone()).await?;
-        Ok(Self {
+        let (sync_tx, sync_rx) = mpsc::unbounded_channel();
+        let mut s = Self {
+            data: data.clone(),
             id,
             cfg,
             secret,
@@ -115,7 +183,54 @@ impl RoomSession {
             store,
             tx,
             rx,
-        })
+            sync_tx,
+            sync_rx,
+            syncing: BTreeSet::new(),
+            sync_log: data.load_sync(&id)?,
+        };
+        let peers: Vec<NodeId> = s
+            .known_peers
+            .iter()
+            .map(|p| node_id_from_endpoint(p.id))
+            .collect();
+        for p in peers {
+            s.spawn_sync(p);
+        }
+        Ok(s)
+    }
+
+    /// Pull from `peer` in the background unless a sync with it is running.
+    fn spawn_sync(&mut self, peer: NodeId) {
+        let Ok(id) = endpoint_id_from_node(peer) else {
+            return;
+        };
+        if id == self.net.endpoint().id() || !self.syncing.insert(peer) {
+            return;
+        }
+        let endpoint = self.net.endpoint().clone();
+        let secret = self.secret.clone();
+        let store = Arc::clone(&self.store);
+        let done = self.sync_tx.clone();
+        tokio::spawn(async move {
+            let result = sync_from(&endpoint, EndpointAddr::new(id), &secret, &store).await;
+            // A closed receiver means the session is gone; nothing to report.
+            let _ = done.send(SyncDone { peer, result });
+        });
+    }
+
+    /// Record a finished sync (memory + sync.json) and describe it.
+    fn finish_sync(&mut self, d: SyncDone) -> String {
+        self.syncing.remove(&d.peer);
+        let (rec, line) = sync_record(&d.peer, &d.result, now_ms());
+        self.sync_log.insert(d.peer.to_string(), rec);
+        if let Err(e) = self.data.save_sync(&self.id, &self.sync_log) {
+            tracing::warn!(error = %e, "saving sync.json");
+        }
+        line
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, Store>, SessionError> {
+        self.store.lock().map_err(|_| SessionError::Poisoned)
     }
 
     pub fn room_id(&self) -> RoomId {
@@ -126,8 +241,14 @@ impl RoomSession {
         &self.cfg
     }
 
-    pub fn store(&self) -> &Store {
+    /// The shared store (also served to peers via sync).
+    pub fn store(&self) -> &SharedStore {
         &self.store
+    }
+
+    /// Last sync result per peer (node id hex), as shown by `room status`.
+    pub fn sync_log(&self) -> &SyncLog {
+        &self.sync_log
     }
 
     pub fn net(&self) -> &Net {
@@ -147,39 +268,54 @@ impl RoomSession {
 
     /// Sign `body` as us, store it, broadcast it.
     pub async fn publish(&mut self, body: EventBody) -> Result<Event, SessionError> {
+        let lamport = self.lock()?.next_lamport()?;
         let ev = Event::sign(
             &self.key,
             self.id,
             self.cfg.agent_name.clone(),
-            self.store.next_lamport()?,
+            lamport,
             now_ms(),
             body,
         )?;
-        self.store.append(&ev)?;
+        self.lock()?.append(&ev)?;
         self.tx.publish(&ev).await?;
         Ok(ev)
     }
 
-    /// Handle one incoming item. `None` when the subscription ended;
-    /// `Some(Ok(line))` is a one-line, body-free description for the console.
+    /// Handle one incoming item (gossip or a finished sync). `None` when the
+    /// gossip subscription ended; `Some(Ok(line))` is a one-line, body-free
+    /// description for the console.
     pub async fn step(&mut self) -> Option<Result<String, SessionError>> {
-        let item = match self.rx.next().await? {
+        let item = tokio::select! {
+            // The session holds a sender, so recv() never yields None here.
+            Some(done) = self.sync_rx.recv() => return Some(Ok(self.finish_sync(done))),
+            item = self.rx.next() => item?,
+        };
+        let item = match item {
             Ok(item) => item,
             Err(e) => return Some(Err(e.into())),
         };
         Some(match item {
-            RoomEvent::Event(ev) => match self.store.append(&ev) {
-                Ok(AppendOutcome::Inserted) => Ok(event_line(&ev)),
-                Ok(AppendOutcome::Duplicate) => Ok(format!("{} (duplicate)", event_line(&ev))),
-                Err(e) => Err(e.into()),
-            },
-            RoomEvent::NeighborUp(n) => Ok(format!("peer up   {}", short_node(&n))),
+            RoomEvent::Event(ev) => {
+                let appended = self.lock().and_then(|mut s| Ok(s.append(&ev)?));
+                match appended {
+                    Ok(AppendOutcome::Inserted) => Ok(event_line(&ev)),
+                    Ok(AppendOutcome::Duplicate) => Ok(format!("{} (duplicate)", event_line(&ev))),
+                    Err(e) => Err(e),
+                }
+            }
+            RoomEvent::NeighborUp(n) => {
+                self.spawn_sync(n);
+                Ok(format!("peer up   {}", short_node(&n)))
+            }
             RoomEvent::NeighborDown(n) => Ok(format!("peer down {}", short_node(&n))),
             RoomEvent::Lagged => Ok("lagged: some gossip messages were missed".to_owned()),
         })
     }
 
     pub async fn close(self) {
+        // Stop serving this room before the endpoint goes away.
+        let _ = self.net.sync_rooms().remove(&self.id);
         self.net.shutdown().await;
     }
 }
@@ -195,7 +331,14 @@ pub fn event_line(ev: &Event) -> String {
 }
 
 /// Human-readable `room status`.
-pub fn render_status(id: &RoomId, cfg: &RoomConfig, views: &Views, now_ms: u64) -> String {
+pub fn render_status(
+    id: &RoomId,
+    cfg: &RoomConfig,
+    views: &Views,
+    event_count: u64,
+    sync: &SyncLog,
+    now_ms: u64,
+) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -205,6 +348,7 @@ pub fn render_status(id: &RoomId, cfg: &RoomConfig, views: &Views, now_ms: u64) 
         cfg.agent_name,
         cfg.role
     );
+    let _ = writeln!(s, "events: {event_count}");
 
     let _ = writeln!(s, "members:");
     if views.members.is_empty() {
@@ -248,6 +392,25 @@ pub fn render_status(id: &RoomId, cfg: &RoomConfig, views: &Views, now_ms: u64) 
     for (id, t) in open {
         let st = format!("{:?}", t.status).to_lowercase();
         let _ = writeln!(s, "  {} [{st}] {}", id.as_str(), t.title);
+    }
+
+    let _ = writeln!(s, "last sync per peer:");
+    if sync.is_empty() {
+        let _ = writeln!(s, "  (none yet)");
+    }
+    for (peer, r) in sync {
+        let ago = now_ms.saturating_sub(r.at_ms) / 1000;
+        let peer: String = peer.chars().take(10).collect();
+        if r.ok {
+            let _ = writeln!(
+                s,
+                "  {peer} ok, +{} new / {} received, {ago}s ago",
+                r.inserted, r.received
+            );
+        } else {
+            let err = r.error.as_deref().unwrap_or("unknown error");
+            let _ = writeln!(s, "  {peer} failed: {err}, {ago}s ago");
+        }
     }
     s
 }
@@ -317,8 +480,9 @@ mod tests {
                 },
             );
         }
-        let out = render_status(&id, &cfg, &v, 10_000);
+        let out = render_status(&id, &cfg, &v, 7, &SyncLog::new(), 10_000);
         assert!(out.contains("room alpha (abababababab)"), "{out}");
+        assert!(out.contains("events: 7"), "{out}");
         assert!(out.contains("lead@0101010101 owner present"), "{out}");
         assert!(
             out.contains("src/net/** by lead@0101010101 (60s left)"),
@@ -336,11 +500,54 @@ mod tests {
             &RoomConfig::new("x", RoleName::Member, "a"),
             &Views::default(),
             0,
+            &SyncLog::new(),
+            0,
         );
         assert!(
-            out.contains("(none seen yet)") && out.contains("(none)"),
+            out.contains("(none seen yet)") && out.contains("(none)") && out.contains("(none yet)"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn status_shows_last_sync_per_peer() {
+        let peer = NodeId::from_bytes([0xcd; 32]);
+        let mut log = SyncLog::new();
+        let ok = sync_record(
+            &peer,
+            &Ok(SyncStats {
+                rounds: 2,
+                received: 50,
+                inserted: 48,
+                duplicates: 2,
+                rejected: 0,
+            }),
+            1_000,
+        );
+        assert!(
+            ok.1.contains("+48 new (50 received, 2 round(s))"),
+            "{}",
+            ok.1
+        );
+        log.insert(peer.to_string(), ok.0);
+        let failed = NodeId::from_bytes([0xef; 32]);
+        let bad = sync_record(&failed, &Err(SyncError::RoomMismatch), 2_000);
+        assert!(!bad.0.ok && bad.0.error.is_some());
+        log.insert(failed.to_string(), bad.0);
+
+        let out = render_status(
+            &RoomId::from_bytes([1; 32]),
+            &RoomConfig::new("x", RoleName::Member, "a"),
+            &Views::default(),
+            50,
+            &log,
+            11_000,
+        );
+        assert!(
+            out.contains("cdcdcdcdcd ok, +48 new / 50 received, 10s ago"),
+            "{out}"
+        );
+        assert!(out.contains("efefefefef failed: "), "{out}");
     }
 
     #[test]

@@ -8,9 +8,11 @@
 //!     room.toml              name, role, agent_name, secret_file
 //!     secret.key             32-byte room secret (0600)
 //!     peers.json             bootstrap EndpointAddrs (not secret)
+//!     sync.json              last sync result per peer (for `room status`)
 //!     events.sqlite          hm-store event log
 //! ```
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -94,6 +96,34 @@ impl DataDir {
     }
     pub fn events_db(&self, id: &RoomId) -> PathBuf {
         self.room_dir(id).join("events.sqlite")
+    }
+    pub fn room_sync(&self, id: &RoomId) -> PathBuf {
+        self.room_dir(id).join("sync.json")
+    }
+
+    /// Last sync result per peer (node id hex). Missing file = none yet.
+    pub fn load_sync(&self, id: &RoomId) -> Result<SyncLog, DataError> {
+        let path = self.room_sync(id);
+        match std::fs::read(&path) {
+            Ok(b) => serde_json::from_slice(&b).map_err(|e| DataError::Parse {
+                path,
+                msg: e.to_string(),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SyncLog::new()),
+            Err(e) => Err(io_err(&path)(e)),
+        }
+    }
+
+    pub fn save_sync(&self, id: &RoomId, log: &SyncLog) -> Result<(), DataError> {
+        let path = self.room_sync(id);
+        let text = serde_json::to_vec_pretty(log).map_err(|e| DataError::Parse {
+            path: path.clone(),
+            msg: e.to_string(),
+        })?;
+        // Write-then-rename so a concurrent `room status` never reads half a file.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, text).map_err(io_err(&tmp))?;
+        std::fs::rename(&tmp, &path).map_err(io_err(&path))
     }
 
     pub fn load_config(&self) -> Result<Config, DataError> {
@@ -249,6 +279,21 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), DataError> {
     f.sync_all().map_err(io_err(path))
 }
 
+/// Outcome of the last sync with one peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncRecord {
+    pub at_ms: u64,
+    pub ok: bool,
+    pub rounds: usize,
+    pub received: usize,
+    pub inserted: usize,
+    /// Error text when `!ok`. Never contains secret material.
+    pub error: Option<String>,
+}
+
+/// `sync.json`: peer node id (hex) -> last result.
+pub type SyncLog = BTreeMap<String, SyncRecord>;
+
 /// `herdmesh.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -341,6 +386,7 @@ mod tests {
         assert_eq!(d.room_secret(&id), room.join("secret.key"));
         assert_eq!(d.room_peers(&id), room.join("peers.json"));
         assert_eq!(d.events_db(&id), room.join("events.sqlite"));
+        assert_eq!(d.room_sync(&id), room.join("sync.json"));
         assert_eq!(hex.len(), 64);
     }
 
@@ -425,6 +471,33 @@ mod tests {
 
         d.remove_room(&id).unwrap();
         assert!(d.list_rooms().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_log_roundtrip_and_missing_is_empty() {
+        let (_t, d) = dd();
+        let id = d
+            .create_room(
+                &RoomSecret::from_bytes([7; 32]),
+                &RoomConfig::new("s", RoleName::Member, "a"),
+                &[],
+            )
+            .unwrap();
+        assert!(d.load_sync(&id).unwrap().is_empty());
+        let mut log = SyncLog::new();
+        log.insert(
+            "ab".into(),
+            SyncRecord {
+                at_ms: 1,
+                ok: false,
+                rounds: 0,
+                received: 0,
+                inserted: 0,
+                error: Some("refused".into()),
+            },
+        );
+        d.save_sync(&id, &log).unwrap();
+        assert_eq!(d.load_sync(&id).unwrap(), log);
     }
 
     #[test]

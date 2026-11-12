@@ -121,7 +121,14 @@ pub async fn leave(data: &DataDir, room: &str, yes: bool) -> Result<String, Room
 pub fn status(data: &DataDir, room: &str) -> Result<String, RoomError> {
     let (id, cfg) = data.resolve_room(room)?;
     let store = hm_store::Store::open(data.events_db(&id), id)?;
-    Ok(render_status(&id, &cfg, store.views(), now_ms()))
+    Ok(render_status(
+        &id,
+        &cfg,
+        store.views(),
+        store.event_count()?,
+        &data.load_sync(&id)?,
+        now_ms(),
+    ))
 }
 
 /// `room run <room>`: foreground session until `shutdown` resolves.
