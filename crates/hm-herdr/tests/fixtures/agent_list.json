@@ -1,0 +1,179 @@
+{
+  "id": "cli:agent:list",
+  "result": {
+    "agents": [
+      {
+        "agent": "claude",
+        "agent_session": {
+          "agent": "claude",
+          "kind": "id",
+          "source": "herdr:claude",
+          "value": "abb8f80f-505f-42b8-915a-e3898935aa0b"
+        },
+        "agent_status": "idle",
+        "cwd": "/workspace/repo",
+        "focused": false,
+        "pane_id": "w2:p1",
+        "revision": 2,
+        "state_change_seq": 4,
+        "tab_id": "w2:t1",
+        "terminal_id": "term_66011bc6925ba2",
+        "terminal_title": "Claude Code",
+        "terminal_title_stripped": "Claude Code",
+        "workspace_id": "w2"
+      },
+      {
+        "agent": "codex",
+        "agent_session": {
+          "agent": "codex",
+          "kind": "id",
+          "source": "herdr:codex",
+          "value": "01a1cfed-2b15-7422-b7a2-2f80c1daac64"
+        },
+        "agent_status": "idle",
+        "cwd": "/workspace/veil-messenger",
+        "focused": false,
+        "pane_id": "w2:p5",
+        "revision": 7,
+        "state_change_seq": 16,
+        "tab_id": "w2:t1",
+        "terminal_id": "term_66011bc69260a3",
+        "terminal_title": "Audit Vivo MDM QR enrollment",
+        "terminal_title_stripped": "Audit Vivo MDM QR enrollment",
+        "workspace_id": "w2"
+      },
+      {
+        "agent": "agy",
+        "agent_session": {
+          "agent": "agy",
+          "kind": "id",
+          "source": "herdr:antigravity_cli",
+          "value": "79c3c8b4-6cc9-4e9c-8ece-e175441e670e"
+        },
+        "agent_status": "idle",
+        "cwd": "/workspace/veil-messenger",
+        "focused": false,
+        "interactive_ready": true,
+        "name": "agy",
+        "pane_id": "w2:p6",
+        "revision": 0,
+        "state_change_seq": 5,
+        "tab_id": "w2:t1",
+        "terminal_id": "term_66011bc69261c4",
+        "workspace_id": "w2"
+      },
+      {
+        "agent": "claude",
+        "agent_session": {
+          "agent": "claude",
+          "kind": "id",
+          "source": "herdr:claude",
+          "value": "f499f16d-29b4-4c9c-9286-15e9c5468bc7"
+        },
+        "agent_status": "done",
+        "completion_seq": 136,
+        "cwd": "/workspace/task-archive",
+        "focused": false,
+        "pane_id": "w3:p1",
+        "revision": 4,
+        "state_change_seq": 136,
+        "tab_id": "w3:t1",
+        "terminal_id": "term_66011cf7420b85",
+        "terminal_title": "Herdmesh master prompt architecture",
+        "terminal_title_stripped": "Herdmesh master prompt architecture",
+        "workspace_id": "w3"
+      },
+      {
+        "agent": "codex",
+        "agent_session": {
+          "agent": "codex",
+          "kind": "id",
+          "source": "herdr:codex",
+          "value": "01a1d065-9139-76a2-be97-92ed8341c096"
+        },
+        "agent_status": "idle",
+        "completion_seq": 134,
+        "cwd": "/workspace/hm-wt-codex",
+        "focused": true,
+        "interactive_ready": true,
+        "name": "hm-codex",
+        "pane_id": "w3:p6",
+        "revision": 6,
+        "state_change_seq": 134,
+        "tab_id": "w3:t1",
+        "terminal_id": "term_660123beb6fd5a",
+        "terminal_title": "Implement M4-1 MCP stdio server",
+        "terminal_title_stripped": "Implement M4-1 MCP stdio server",
+        "workspace_id": "w3"
+      },
+      {
+        "agent": "agy",
+        "agent_session": {
+          "agent": "agy",
+          "kind": "id",
+          "source": "herdr:antigravity_cli",
+          "value": "64419020-eade-4795-8290-c573e14e88e8"
+        },
+        "agent_status": "working",
+        "cwd": "/workspace/hm-wt-agy",
+        "focused": false,
+        "interactive_ready": true,
+        "name": "hm-agy",
+        "pane_id": "w3:p2",
+        "revision": 1,
+        "state_change_seq": 135,
+        "tab_id": "w3:t1",
+        "terminal_id": "term_66011f24014ed6",
+        "terminal_title": "powershell",
+        "terminal_title_stripped": "powershell",
+        "workspace_id": "w3"
+      },
+      {
+        "agent": "claude",
+        "agent_session": {
+          "agent": "claude",
+          "kind": "id",
+          "source": "herdr:claude",
+          "value": "23e73c9e-1ecc-42fe-89e1-e72aae346350"
+        },
+        "agent_status": "working",
+        "cwd": "/workspace/hm-wt-impl1",
+        "focused": false,
+        "interactive_ready": true,
+        "name": "hm-impl1",
+        "pane_id": "w3:p3",
+        "revision": 3,
+        "state_change_seq": 125,
+        "tab_id": "w3:t1",
+        "terminal_id": "term_66011f66c778b7",
+        "terminal_title": "Cargo workspace skeleton",
+        "terminal_title_stripped": "Cargo workspace skeleton",
+        "workspace_id": "w3"
+      },
+      {
+        "agent": "claude",
+        "agent_session": {
+          "agent": "claude",
+          "kind": "id",
+          "source": "herdr:claude",
+          "value": "26bcf300-5227-48cd-8c17-15931d10706c"
+        },
+        "agent_status": "idle",
+        "completion_seq": 129,
+        "cwd": "/workspace/hm-wt-impl2",
+        "focused": false,
+        "interactive_ready": true,
+        "name": "hm-impl2",
+        "pane_id": "w3:p4",
+        "revision": 3,
+        "state_change_seq": 129,
+        "tab_id": "w3:t1",
+        "terminal_id": "term_66011fd8639e88",
+        "terminal_title": "M0-3 GitHub Actions CI",
+        "terminal_title_stripped": "M0-3 GitHub Actions CI",
+        "workspace_id": "w3"
+      }
+    ],
+    "type": "agent_list"
+  }
+}

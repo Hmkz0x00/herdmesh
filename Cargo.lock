@@ -1120,6 +1120,10 @@ name = "hm-herdr"
 version = "0.1.0"
 dependencies = [
  "hm-proto",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
