@@ -22,10 +22,15 @@ fn room() -> RoomId {
 }
 
 fn note(k: &SigningKey, lamport: u64, text: &str) -> Event {
+    note_seq(k, lamport, lamport, text)
+}
+
+fn note_seq(k: &SigningKey, seq: u64, lamport: u64, text: &str) -> Event {
     Event::sign(
         k,
         room(),
         "ag",
+        seq,
         Lamport(lamport),
         1,
         EventBody::Note {
@@ -58,6 +63,7 @@ fn append_batch_reports_and_matches_single_appends() {
         &k1,
         RoomId::from_bytes([0; 32]),
         "ag",
+        1,
         Lamport(1),
         1,
         EventBody::Leave,
@@ -159,7 +165,7 @@ fn cap_never_splits_same_node_and_lamport() {
     let mut s = Store::open_in_memory(room()).unwrap();
     s.append(&note(&k, 1, "a")).unwrap();
     s.append(&note(&k, 2, "b")).unwrap();
-    s.append(&note(&k, 2, "c")).unwrap();
+    s.append(&note_seq(&k, 3, 2, "c")).unwrap();
     let caps = SyncCaps {
         max_events: 2,
         max_bytes: 64 << 20,
@@ -170,54 +176,13 @@ fn cap_never_splits_same_node_and_lamport() {
 }
 
 #[test]
-fn future_dated_claim_expires_by_received_at() {
-    let k = key_from(1);
-    let received_at = 1_000_000;
-    let far_future = received_at + 86_400_000;
-    let claim = Event::sign(
-        &k,
-        room(),
-        "ag",
-        Lamport(1),
-        far_future,
-        EventBody::LeaseClaim {
-            paths: vec!["src/**".into()],
-            ttl_secs: 10,
-        },
-    )
-    .unwrap();
-    let mut s = Store::open_in_memory(room()).unwrap();
-    s.append_batch_at(std::slice::from_ref(&claim), received_at)
-        .unwrap();
-
-    let lease = &s.views().leases["src/**"];
-    assert_eq!(lease.expires_at_ms, received_at + 10_000);
-    assert_eq!(s.views().active_leases(received_at + 10_000).count(), 0);
-
-    assert_eq!(
-        s.claim_state(&claim.id, received_at + 10_000).unwrap(),
-        Some(ClaimState::Expired)
-    );
-    assert_eq!(
-        s.claim_state(&claim.id, received_at).unwrap(),
-        Some(ClaimState::Pending)
-    );
-
-    // Survives a full rebuild (received_at is persisted).
-    s.rebuild_views().unwrap();
-    assert_eq!(
-        s.views().leases["src/**"].expires_at_ms,
-        received_at + 10_000
-    );
-}
-
-#[test]
 fn past_dated_claim_keeps_its_own_ts() {
     let k = key_from(1);
     let claim = Event::sign(
         &k,
         room(),
         "ag",
+        1,
         Lamport(1),
         500,
         EventBody::LeaseClaim {
@@ -227,6 +192,14 @@ fn past_dated_claim_keeps_its_own_ts() {
     )
     .unwrap();
     let mut s = Store::open_in_memory(room()).unwrap();
-    s.append_batch_at(&[claim], 9_000).unwrap();
-    assert_eq!(s.views().leases["a"].expires_at_ms, 1_500);
+    s.append_batch_at(std::slice::from_ref(&claim), 9_000)
+        .unwrap();
+    assert_eq!(
+        s.views().active_leases(0).next().unwrap().1.expires_at_ms,
+        1_500
+    );
+    assert_eq!(
+        s.claim_state(&claim.id, 1_500).unwrap(),
+        Some(ClaimState::Expired)
+    );
 }

@@ -7,6 +7,7 @@ pub mod budget;
 mod error;
 mod event;
 mod ids;
+pub mod limits;
 mod refs;
 
 pub use error::{ProtoError, RefParseError};

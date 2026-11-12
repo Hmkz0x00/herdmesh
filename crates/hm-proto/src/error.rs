@@ -17,6 +17,8 @@ pub enum ProtoError {
     BadAuthorKey,
     #[error("bad signature")]
     BadSignature,
+    #[error("event seq must start at 1")]
+    ZeroSeq,
 }
 
 /// Errors from parsing a [`crate::Ref`] or one of its parts.
