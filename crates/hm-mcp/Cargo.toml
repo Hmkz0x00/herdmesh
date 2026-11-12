@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 hm-proto.workspace = true
+hm-daemon.workspace = true
 async-trait.workspace = true
 rmcp.workspace = true
 serde.workspace = true
