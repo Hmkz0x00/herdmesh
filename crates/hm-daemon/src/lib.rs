@@ -8,7 +8,7 @@
 mod core;
 pub mod ipc;
 
-pub use core::{DAEMON_AUTHOR, Daemon, NetHandle, NullNet, Ping, wrapped_cost};
+pub use core::{DAEMON_AUTHOR, Daemon, NetHandle, NullNet, Ping, redact_body, wrapped_cost};
 
 /// Crate name, used by `herdmesh doctor` and tests to prove linkage.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

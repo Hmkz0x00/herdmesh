@@ -8,20 +8,33 @@
 //! [`MAX_FRAME`]. A frame with a wrong version or an oversize length is
 //! refused before its body is read.
 //!
-//! Same-user only: the first frame must be a [`Hello`] carrying the secret
-//! [`Token`], which lives in a private file (see [`load_or_create_token`]).
-//! Other users cannot read that file, so they cannot talk to the daemon.
+//! Same-user only, in three layers:
+//! 1. OS access control on the endpoint: Windows pipe with an owner-only
+//!    DACL that rejects remote clients; Unix socket (0600) inside a
+//!    verified 0700 directory owned by us, with the peer's uid checked on
+//!    every connection where the OS reports it.
+//! 2. The first frame must be a [`Hello`] carrying the secret [`Token`],
+//!    which lives in a private file (see [`load_or_create_token`]).
+//! 3. Frame limits and a per-connection deadline.
 
 use std::io;
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hm_proto::RoomId;
 use interprocess::local_socket::tokio::{Listener, Stream, prelude::*};
-use interprocess::local_socket::{
-    GenericFilePath, GenericNamespaced, ListenerOptions, Name, ToFsName, ToNsName,
-};
+#[cfg(unix)]
+use interprocess::local_socket::{GenericFilePath, ToFsName};
+#[cfg(not(unix))]
+use interprocess::local_socket::{GenericNamespaced, ToNsName};
+use interprocess::local_socket::{ListenerOptions, Name};
+#[cfg(unix)]
+use interprocess::os::unix::local_socket::ListenerOptionsExt as _;
+#[cfg(windows)]
+use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
@@ -262,13 +275,94 @@ pub fn current_user() -> String {
         .unwrap_or_else(|_| "user".to_owned())
 }
 
-fn to_name(name: &str) -> io::Result<Name<'static>> {
-    if GenericNamespaced::is_supported() {
-        name.to_owned().to_ns_name::<GenericNamespaced>()
-    } else {
-        let p = std::env::temp_dir().join(format!("{name}.sock"));
-        p.to_fs_name::<GenericFilePath>()
+/// Directory holding the Unix socket: `$XDG_RUNTIME_DIR/herdmesh` (already
+/// per-user and 0700 on systemd hosts), else a per-user dir under the temp
+/// dir. [`ensure_private_dir`] verifies it before the daemon binds.
+#[cfg(unix)]
+pub fn socket_dir() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(d) if !d.is_empty() => PathBuf::from(d).join("herdmesh"),
+        _ => std::env::temp_dir().join(format!("herdmesh-{}", socket_name(&current_user()))),
     }
+}
+
+/// Create `dir` (0700) if missing, then insist it is a real directory, not
+/// accessible by group/other, and owned by us. Returns our uid.
+///
+/// Ownership is proved without libc: a file we create in the directory gets
+/// our uid, and must match the directory's owner (we could not create it in
+/// someone else's 0700 directory at all).
+#[cfg(unix)]
+pub fn ensure_private_dir(dir: &Path) -> io::Result<u32> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+    let denied = |why: &str| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{}: {why}", dir.display()),
+        )
+    };
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+        }
+        Err(e) => return Err(e),
+    }
+    let md = std::fs::symlink_metadata(dir)?;
+    if !md.is_dir() {
+        return Err(denied("not a real directory"));
+    }
+    if md.mode() & 0o077 != 0 {
+        return Err(denied("accessible by group/other (want 0700)"));
+    }
+    let probe = dir.join(format!(".probe-{}", std::process::id()));
+    let _ = std::fs::remove_file(&probe);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&probe)
+        .map_err(|_| denied("cannot write here: not our directory"))?;
+    let uid = f.metadata()?.uid();
+    drop(f);
+    let _ = std::fs::remove_file(&probe);
+    if uid != md.uid() {
+        return Err(denied("owned by another user"));
+    }
+    Ok(uid)
+}
+
+fn to_name(name: &str) -> io::Result<Name<'static>> {
+    if name.is_empty() || name.contains(['/', '\\', '\0']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bad socket name",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        socket_dir()
+            .join(format!("{name}.sock"))
+            .to_fs_name::<GenericFilePath>()
+    }
+    #[cfg(not(unix))]
+    {
+        name.to_owned().to_ns_name::<GenericNamespaced>()
+    }
+}
+
+/// Windows: a DACL with a single full-access ACE for the current user, so
+/// no other local user (or service) can open the pipe.
+#[cfg(windows)]
+fn owner_only_descriptor()
+-> io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
+    let sid = hm_net::secure_file::current_user_sid()?;
+    let sddl = widestring::U16CString::from_str(format!("D:P(A;;GA;;;{sid})"))
+        .map_err(io::Error::other)?;
+    interprocess::os::windows::security_descriptor::SecurityDescriptor::deserialize(&sddl)
 }
 
 /// Open a raw connection (no handshake). For tests and tooling that send
@@ -327,6 +421,8 @@ pub trait Handler: Send + Sync + 'static {
 pub struct Server {
     listener: Listener,
     token: Token,
+    /// Unix: uid every peer must have (our own). `None` elsewhere.
+    owner_uid: Option<u32>,
 }
 
 /// Aborts the accept loop on drop.
@@ -341,19 +437,45 @@ impl Drop for ServerHandle {
 
 impl Server {
     pub fn bind(name: &str, token: Token) -> Result<Self, IpcError> {
-        let listener = ListenerOptions::new().name(to_name(name)?).create_tokio()?;
-        Ok(Self { listener, token })
+        let opts = ListenerOptions::new().name(to_name(name)?);
+        // Remote pipe clients are rejected by interprocess's default
+        // (`accept_remote == false` => PIPE_REJECT_REMOTE_CLIENTS).
+        #[cfg(windows)]
+        let opts = opts.security_descriptor(owner_only_descriptor()?);
+        #[cfg(unix)]
+        let (opts, owner_uid) = {
+            let uid = ensure_private_dir(&socket_dir())?;
+            // Callers probe that nothing serves the name: replace a stale file.
+            (opts.try_overwrite(true).mode(0o600), Some(uid))
+        };
+        #[cfg(not(unix))]
+        let owner_uid = None;
+        let listener = opts.create_tokio()?;
+        Ok(Self {
+            listener,
+            token,
+            owner_uid,
+        })
     }
 
     /// Serve until the returned handle is dropped.
     pub fn spawn(self, handler: Arc<dyn Handler>) -> ServerHandle {
-        let Self { listener, token } = self;
+        let Self {
+            listener,
+            token,
+            owner_uid,
+        } = self;
         let token = Arc::new(token);
         ServerHandle(tokio::spawn(async move {
             loop {
                 let Ok(conn) = listener.accept().await else {
                     continue;
                 };
+                if let Some(uid) = owner_uid
+                    && !peer_is_owner(&conn, uid)
+                {
+                    continue; // dropped: wrong user, or credentials unreadable
+                }
                 let (h, t) = (handler.clone(), token.clone());
                 tokio::spawn(async move {
                     // Errors end the connection; there is nobody to tell.
@@ -362,6 +484,21 @@ impl Server {
             }
         }))
     }
+}
+
+/// Unix: the peer's effective uid must be ours. Platforms that cannot report
+/// it (`euid() == None`) rely on the directory mode and the token.
+#[cfg(unix)]
+fn peer_is_owner(conn: &Stream, uid: u32) -> bool {
+    match conn.peer_creds() {
+        Ok(c) => c.euid().is_none_or(|peer| peer == uid),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn peer_is_owner(_: &Stream, _: u32) -> bool {
+    true
 }
 
 async fn serve_conn(mut conn: Stream, token: &Token, h: &dyn Handler) -> Result<(), IpcError> {

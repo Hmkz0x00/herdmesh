@@ -23,7 +23,11 @@ interprocess = { version = "=2.4.8", features = ["tokio"] }
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+widestring = "1.2.1"
 
 [dev-dependencies]
 hm-mcp.workspace = true

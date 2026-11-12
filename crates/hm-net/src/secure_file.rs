@@ -43,6 +43,13 @@ pub fn check_private(path: &Path) -> Result<Option<String>, SecureFileError> {
     sys::check_private(path).map_err(io_err(path))
 }
 
+/// The current user's SID as `S-1-5-...` text, for owner-only security
+/// descriptors (e.g. the IPC named pipe).
+#[cfg(windows)]
+pub fn current_user_sid() -> std::io::Result<String> {
+    sys::current_user_sid()
+}
+
 /// Read a secret file, refusing one others can access unless
 /// `allow_insecure` (then only warn).
 pub fn read_private(path: &Path, allow_insecure: bool) -> Result<Vec<u8>, SecureFileError> {
@@ -217,6 +224,10 @@ mod sys {
         // SAFETY: `n` u16s were just read from `out`.
         let s = unsafe { std::slice::from_raw_parts(out, n) };
         Ok(String::from_utf16_lossy(s))
+    }
+
+    pub fn current_user_sid() -> io::Result<String> {
+        sid_string(Sid::current_user()?.ptr())
     }
 
     pub fn create_private(path: &Path) -> io::Result<File> {
