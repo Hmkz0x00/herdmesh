@@ -7,8 +7,15 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-[lints]
-workspace = true
+# Workspace lints, except unsafe_code is `deny` instead of `forbid` so the
+# one Windows FFI module (`peer_owner::sys`: pipe server's user SID) can
+# `allow` it.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
 
 [dependencies]
 hm-proto.workspace = true
@@ -28,6 +35,12 @@ tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 widestring = "1.2.1"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 hm-mcp.workspace = true
