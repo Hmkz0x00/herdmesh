@@ -238,11 +238,10 @@ async fn wrong_secret_gets_no_events() {
     let b = bind(&dir, "b").await;
     // Right room id (public), but the tag is made with a guessed secret.
     let wrong = RoomSecret::from_bytes([7; 32]);
-    let req = SyncSince {
-        room: room(),
-        have: vec![],
-        auth: sync_auth(&wrong, b.endpoint().id(), a.endpoint().id(), room()),
-    };
+    let req = SyncSince::everything(
+        room(),
+        sync_auth(&wrong, b.endpoint().id(), a.endpoint().id(), room()),
+    );
     let (events, out) = tokio::time::timeout(T, raw_request(&b, a.local_addr(), &req))
         .await
         .unwrap();
@@ -265,11 +264,10 @@ async fn replayed_request_from_other_endpoint_is_rejected() {
     let a = serving(&dir, 20).await;
     let (b, c) = (bind(&dir, "b").await, bind(&dir, "c").await);
     // A valid request captured from b...
-    let req = SyncSince {
-        room: room(),
-        have: vec![],
-        auth: sync_auth(&secret(), b.endpoint().id(), a.endpoint().id(), room()),
-    };
+    let req = SyncSince::everything(
+        room(),
+        sync_auth(&secret(), b.endpoint().id(), a.endpoint().id(), room()),
+    );
     // ...works for b,
     let (events, out) = raw_request(&b, a.local_addr(), &req).await;
     assert!(out.is_ok(), "{out:?}");
@@ -462,9 +460,12 @@ async fn tampered_event_from_malicious_server_is_rejected_others_kept() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(stats.received, 7);
+    // The fake answers every round alike; after the inserting round the
+    // client asks once more, gets only duplicates, and stops.
+    assert_eq!(stats.rounds, 2, "{stats:?}");
+    assert_eq!(stats.received, 7 * stats.rounds);
     assert_eq!(stats.inserted, 5);
-    assert_eq!(stats.rejected, 2);
+    assert_eq!(stats.rejected, 2 * stats.rounds);
     assert_eq!(count(&sb), 5);
     router.shutdown().await.unwrap();
     b.shutdown().await;

@@ -18,9 +18,11 @@ pub use gossip::{
 pub use id::{endpoint_id_from_node, node_id_from_endpoint};
 pub use net::{Net, NetConfig, NetError, RelayChoice, SYNC_ALPN, load_or_create_key};
 pub use sync::{
-    ERR_REFUSED, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME, MAX_SYNC_BYTES, Refusal, SharedStore,
-    SyncError, SyncHandler, SyncLimits, SyncMsg, SyncRooms, SyncSince, SyncStats, read_frame,
-    read_frame_within, sync_auth, sync_from, sync_from_with, sync_once, sync_with, write_frame,
+    AuthorWant, ERR_REFUSED, MAX_AUTHORS_PER_REQUEST, MAX_HOLES_PER_AUTHOR, MAX_REQUEST_FRAME,
+    MAX_RESPONSE_FRAME, MAX_SYNC_BYTES, PageRound, Refusal, SharedStore, SyncError, SyncHandler,
+    SyncLimits, SyncMsg, SyncRooms, SyncSince, SyncStats, answer_request, read_frame,
+    read_frame_within, request_page, sync_auth, sync_from, sync_from_with, sync_page, sync_with,
+    write_frame,
 };
 pub use ticket::{RandomError, RoomSecret, RoomTicket, TICKET_PREFIX, TICKET_VERSION, TicketError};
 

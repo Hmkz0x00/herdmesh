@@ -2,7 +2,8 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 
-use hm_net::{RoomSecret, RoomTicket, TICKET_PREFIX, TicketError};
+use hm_net::{RoomSecret, RoomTicket, TICKET_PREFIX, TICKET_VERSION, TicketError};
+use hm_proto::EventId;
 use iroh::{EndpointAddr, SecretKey};
 
 fn addr(seed: u8, port: u16) -> EndpointAddr {
@@ -14,6 +15,7 @@ fn addr(seed: u8, port: u16) -> EndpointAddr {
 fn ticket() -> RoomTicket {
     RoomTicket::new(
         RoomSecret::from_bytes([9; 32]),
+        EventId::from_bytes([3; 32]),
         vec![addr(1, 4001), addr(2, 4002)],
     )
 }
@@ -27,11 +29,16 @@ fn roundtrip() {
     let back: RoomTicket = s.parse().unwrap();
     assert_eq!(back, t);
     assert_eq!(back.room_id, t.secret.room_id());
+    assert_eq!(back.genesis, EventId::from_bytes([3; 32]));
 }
 
 #[test]
 fn roundtrip_empty_bootstrap() {
-    let t = RoomTicket::new(RoomSecret::generate().unwrap(), vec![]);
+    let t = RoomTicket::new(
+        RoomSecret::generate().unwrap(),
+        EventId::from_bytes([4; 32]),
+        vec![],
+    );
     assert_eq!(t.to_string().parse::<RoomTicket>().unwrap(), t);
 }
 
@@ -83,11 +90,15 @@ fn rejects_truncation() {
 
 #[test]
 fn rejects_unknown_version() {
-    let s = RoomTicket::encode_with_version(&ticket(), 2);
-    assert!(matches!(
-        s.parse::<RoomTicket>(),
-        Err(TicketError::Version { found: 2 })
-    ));
+    // v1 tickets (no genesis id) are no longer accepted.
+    assert_eq!(TICKET_VERSION, 2);
+    for v in [1, 3] {
+        let s = RoomTicket::encode_with_version(&ticket(), v);
+        assert!(
+            matches!(s.parse::<RoomTicket>(), Err(TicketError::Version { found }) if found == v),
+            "v{v}"
+        );
+    }
 }
 
 #[test]

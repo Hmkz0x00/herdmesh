@@ -9,7 +9,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use data_encoding::BASE32_NOPAD;
-use hm_proto::RoomId;
+use hm_proto::{EventId, RoomId};
 use iroh::EndpointAddr;
 use iroh_gossip::TopicId;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// Text prefix of every ticket; the trailing `1` is the text-format version.
 pub const TICKET_PREFIX: &str = "hmroom1";
 /// Payload version inside the encoded ticket.
-pub const TICKET_VERSION: u8 = 1;
+pub const TICKET_VERSION: u8 = 2;
 
 const CHECKSUM_LEN: usize = 4;
 const TOPIC_DOMAIN: &[u8] = b"herdmesh/topic";
@@ -92,6 +92,9 @@ pub struct RoomTicket {
     pub secret: RoomSecret,
     /// Must equal `secret.room_id()`; checked on decode.
     pub room_id: RoomId,
+    /// Id of the room's signed `Genesis` event; joiners pin it so roles are
+    /// anchored to the creator (ADR-002 §4).
+    pub genesis: EventId,
     pub bootstrap: Vec<EndpointAddr>,
 }
 
@@ -100,15 +103,17 @@ struct TicketWire {
     v: u8,
     secret: RoomSecret,
     room_id: RoomId,
+    genesis: EventId,
     bootstrap: Vec<EndpointAddr>,
 }
 
 impl RoomTicket {
-    pub fn new(secret: RoomSecret, bootstrap: Vec<EndpointAddr>) -> Self {
+    pub fn new(secret: RoomSecret, genesis: EventId, bootstrap: Vec<EndpointAddr>) -> Self {
         let room_id = secret.room_id();
         Self {
             secret,
             room_id,
+            genesis,
             bootstrap,
         }
     }
@@ -120,6 +125,7 @@ impl RoomTicket {
             v,
             secret: self.secret.clone(),
             room_id: self.room_id,
+            genesis: self.genesis,
             bootstrap: self.bootstrap.clone(),
         };
         // Serializing owned plain data into a Vec cannot fail in practice;
@@ -167,6 +173,7 @@ impl FromStr for RoomTicket {
         Ok(Self {
             secret: wire.secret,
             room_id: wire.room_id,
+            genesis: wire.genesis,
             bootstrap: wire.bootstrap,
         })
     }

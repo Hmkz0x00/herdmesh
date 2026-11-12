@@ -21,7 +21,7 @@ use hm_net::{
     RoomSender, RoomTicket, SharedStore, SyncError, SyncStats, endpoint_id_from_node, join_room,
     load_or_create_key, node_id_from_endpoint, sync_from,
 };
-use hm_proto::{AgentRef, Event, EventBody, NodeId, ProtoError, RoomId, TaskStatus};
+use hm_proto::{AgentRef, Event, EventBody, EventId, NodeId, ProtoError, RoomId, TaskStatus};
 use hm_store::{AppendOutcome, Store, StoreError, Views};
 use iroh::EndpointAddr;
 use tokio::sync::mpsc;
@@ -46,6 +46,8 @@ pub enum SessionError {
     Sync(#[from] SyncError),
     #[error("store lock poisoned")]
     Poisoned,
+    #[error("room has no genesis event; recreate it with this version")]
+    NoGenesis,
 }
 
 /// Unix millis now (0 if the clock is before 1970).
@@ -96,11 +98,59 @@ pub async fn own_addr(net: &Net, relay: &RelayChoice, wait: Duration) -> Endpoin
     net.addr()
 }
 
-/// Ticket: room secret + our address + peers we already know.
-pub fn make_ticket(secret: RoomSecret, own: EndpointAddr, known: Vec<EndpointAddr>) -> RoomTicket {
+/// Ticket: room secret + genesis id + our address + peers we already know.
+pub fn make_ticket(
+    secret: RoomSecret,
+    genesis: EventId,
+    own: EndpointAddr,
+    known: Vec<EndpointAddr>,
+) -> RoomTicket {
     let mut bootstrap = vec![own.clone()];
     bootstrap.extend(known.into_iter().filter(|p| p.id != own.id));
-    RoomTicket::new(secret, bootstrap)
+    RoomTicket::new(secret, genesis, bootstrap)
+}
+
+fn node_key(data: &DataDir) -> Result<SigningKey, SessionError> {
+    // Same 32 bytes iroh uses: events are signed by our node identity.
+    let key = load_or_create_key(&data.node_key(), data.insecure_key_allowed())?;
+    Ok(SigningKey::from_bytes(&key.to_bytes()))
+}
+
+/// Room creation (ADR-002 §4): sign `Genesis { owner: us }` as the room's
+/// first event and pin it. Idempotent: returns the pinned id if there is one.
+pub fn init_genesis(data: &DataDir, id: RoomId, agent: &str) -> Result<EventId, SessionError> {
+    let key = node_key(data)?;
+    let mut store = Store::open(data.events_db(&id), id)?;
+    if let Some(g) = store.genesis() {
+        return Ok(g);
+    }
+    let me = NodeId::from_verifying_key(&key.verifying_key());
+    let ev = Event::sign(
+        &key,
+        id,
+        agent,
+        store.next_seq(&me)?,
+        store.next_lamport()?,
+        now_ms(),
+        EventBody::Genesis { owner: me },
+    )?;
+    store.append(&ev)?;
+    store.pin_genesis(ev.id)?;
+    Ok(ev.id)
+}
+
+/// Joining: pin the ticket's genesis id, so only that Genesis (when it
+/// arrives by sync) anchors roles. A different, already pinned id is an
+/// error.
+pub fn pin_genesis(data: &DataDir, id: RoomId, genesis: EventId) -> Result<(), SessionError> {
+    Ok(Store::open(data.events_db(&id), id)?.pin_genesis(genesis)?)
+}
+
+/// The room's pinned genesis id.
+pub fn room_genesis(data: &DataDir, id: RoomId) -> Result<EventId, SessionError> {
+    Store::open(data.events_db(&id), id)?
+        .genesis()
+        .ok_or(SessionError::NoGenesis)
 }
 
 /// Result of one background sync, sent back to the session.
@@ -184,10 +234,7 @@ impl RoomSession {
         let cfg = data.load_room(&id)?;
         let secret = data.load_secret(&id, &cfg)?;
         let known_peers = data.load_peers(&id)?;
-        // Same 32 bytes iroh uses: events are signed by our node identity.
-        let key = SigningKey::from_bytes(
-            &load_or_create_key(&data.node_key(), data.insecure_key_allowed())?.to_bytes(),
-        );
+        let key = node_key(data)?;
         let net = bind_net(data, relay.clone()).await?;
         let store: SharedStore = Arc::new(Mutex::new(Store::open(data.events_db(&id), id)?));
         net.sync_rooms()
@@ -286,9 +333,15 @@ impl RoomSession {
     }
 
     /// Ticket inviting someone into this room via us.
-    pub async fn ticket(&self) -> RoomTicket {
+    pub async fn ticket(&self) -> Result<RoomTicket, SessionError> {
+        let genesis = self.lock()?.genesis().ok_or(SessionError::NoGenesis)?;
         let own = own_addr(&self.net, &self.relay, Duration::from_secs(5)).await;
-        make_ticket(self.secret.clone(), own, self.known_peers.clone())
+        Ok(make_ticket(
+            self.secret.clone(),
+            genesis,
+            own,
+            self.known_peers.clone(),
+        ))
     }
 
     /// Wait until at least one gossip neighbor is connected.
@@ -416,6 +469,15 @@ pub fn render_status(
         cfg.role
     );
     let _ = writeln!(s, "events: {event_count}");
+    let _ = match (views.owner, views.genesis) {
+        (Some(o), _) => writeln!(s, "owner: {} (genesis verified)", short_node(&o)),
+        (None, Some(g)) => writeln!(
+            s,
+            "owner: unverified (genesis {} not received yet)",
+            g.to_string().chars().take(10).collect::<String>()
+        ),
+        (None, None) => writeln!(s, "owner: unknown (no genesis pinned)"),
+    };
 
     let _ = writeln!(s, "members:");
     if views.members.is_empty() {
@@ -705,6 +767,7 @@ mod tests {
         let other = EndpointAddr::new(iroh::SecretKey::from_bytes(&[2; 32]).public());
         let t = make_ticket(
             RoomSecret::from_bytes([9; 32]),
+            hm_proto::EventId::from_bytes([1; 32]),
             me.clone(),
             vec![me.clone(), other.clone()],
         );
