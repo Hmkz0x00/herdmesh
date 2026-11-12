@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+globset = "0.4.19"
 hm-proto.workspace = true
 blake3.workspace = true
 postcard.workspace = true

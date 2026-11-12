@@ -5,6 +5,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod error;
+pub mod settle;
 mod store;
 mod views;
 
