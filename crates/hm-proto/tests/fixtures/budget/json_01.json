@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "room": "herdmesh-dev",
+  "members": [
+    {"id": "lead", "provider": "claude", "host": "desk-a"},
+    {"id": "hm-impl1", "provider": "claude", "host": "desk-a"},
+    {"id": "hm-impl2", "provider": "codex", "host": "laptop-b"}
+  ],
+  "goal": "M1: proto types and budget estimator",
+  "open_tasks": ["M1-1", "M1-2", "M1-3"],
+  "updated": "2026-11-12T09:41:07Z"
+}

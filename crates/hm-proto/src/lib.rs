@@ -3,6 +3,7 @@
 //! Event model and signing: see [`Event`]. Wire format: [`WIRE_VERSION`].
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod budget;
 mod error;
 mod event;
 mod ids;

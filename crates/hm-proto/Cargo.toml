@@ -21,3 +21,4 @@ thiserror.workspace = true
 [dev-dependencies]
 getrandom.workspace = true
 proptest.workspace = true
+tiktoken-rs = "0.12.1"

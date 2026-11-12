@@ -1,0 +1,26 @@
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("database error: {0}")]
+    Db(#[from] rusqlite::Error),
+    #[error("event {id} not found in room {room}")]
+    NotFound { id: EventId, room: RoomId },
+    #[error("schema version {found} is newer than supported {max}")]
+    SchemaTooNew { found: u32, max: u32 },
+}
+
+pub fn load_event(conn: &Connection, room: &RoomId, id: &EventId) -> Result<Event, StoreError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT kind, author, body, ts FROM events WHERE room = ?1 AND id = ?2",
+    )?;
+    stmt.query_row(params![room.as_str(), id.as_str()], |row| {
+        Ok(Event {
+            id: id.clone(),
+            kind: row.get(0)?,
+            author: row.get(1)?,
+            body: row.get(2)?,
+            ts: row.get(3)?,
+        })
+    })
+    .optional()?
+    .ok_or_else(|| StoreError::NotFound { id: id.clone(), room: room.clone() })
+}

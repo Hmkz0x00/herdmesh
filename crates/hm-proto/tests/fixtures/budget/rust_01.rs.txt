@@ -1,0 +1,22 @@
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Room {
+    pub id: RoomId,
+    pub members: Vec<MemberId>,
+    pub topics: HashMap<String, TopicState>,
+}
+
+impl Room {
+    pub fn new(id: RoomId) -> Self {
+        Self { id, members: Vec::new(), topics: HashMap::new() }
+    }
+
+    pub fn join(&mut self, member: MemberId) -> bool {
+        if self.members.contains(&member) {
+            return false;
+        }
+        self.members.push(member);
+        true
+    }
+}

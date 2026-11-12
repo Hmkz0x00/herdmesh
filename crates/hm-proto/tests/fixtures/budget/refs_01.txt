@@ -1,0 +1,10 @@
+git:8ca4588:.github/workflows/ci.yml#L1-42
+git:b3d9187:crates/hm-proto/src/lib.rs#L1-20
+git:b3d9187:crates/herdmesh/src/main.rs#L12-88
+git:6fb926c:Cargo.toml#L1-35
+event:ev_01JC3X8Q
+event:ev_01JC3XA2
+adr:001
+docs/plans/M0-M2.md#m1
+docs/research/libs.md#iroh-gossip
+crates/hm-store/src/sqlite.rs#L40-112
