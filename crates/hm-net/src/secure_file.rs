@@ -4,7 +4,7 @@
 //!   0600 on Unix; on Windows a protected (non-inherited) DACL with a single
 //!   full-access ACE for the current user, applied atomically at creation.
 //! - [`check_private`] reports whether an existing file is broader than that:
-//!   Unix group/other mode bits; Windows any allow-ACE for a SID other than
+//!   Unix group/other mode bits; Windows an owner, or any allow-ACE for a SID, other than
 //!   the current user, `SYSTEM` or `BUILTIN\Administrators` (those two can
 //!   bypass a DACL anyway), or a null DACL.
 //! - [`read_private`] reads a secret file and refuses (with a warning) when
@@ -108,9 +108,10 @@ mod sys {
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CopySid, CreateWellKnownSid,
-        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, GetTokenInformation, PSID,
-        SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser, WELL_KNOWN_SID_TYPE,
-        WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorOwner, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -273,34 +274,72 @@ mod sys {
     }
 
     pub fn check_private(path: &Path) -> io::Result<Option<String>> {
+        let wpath = wide(path.as_os_str());
+        let mut sd = null_mut();
+        // SAFETY: out-params are ours; `sd` is LocalAlloc'ed by the API.
+        let err = unsafe {
+            GetNamedSecurityInfoW(
+                wpath.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &raw mut sd,
+            )
+        };
+        let sd = Local(sd);
+        if err != 0 {
+            #[allow(clippy::cast_possible_wrap)]
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+        check_descriptor(sd.0)
+    }
+
+    /// [`check_descriptor`] over a descriptor parsed from SDDL (tests).
+    #[cfg(test)]
+    pub fn check_sddl(sddl: &str) -> io::Result<Option<String>> {
+        let w = wide(std::ffi::OsStr::new(sddl));
+        let mut sd = null_mut();
+        // SAFETY: NUL-terminated SDDL; `sd` receives a LocalAlloc pointer.
+        check(unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                w.as_ptr(),
+                SDDL_REVISION_1,
+                &raw mut sd,
+                null_mut(),
+            )
+        })?;
+        let sd = Local(sd);
+        check_descriptor(sd.0)
+    }
+
+    /// Why `sd` is not owner-only, if it isn't.
+    fn check_descriptor(sd: PSECURITY_DESCRIPTOR) -> io::Result<Option<String>> {
         let allowed = [
             Sid::current_user()?,
             Sid::well_known(WinLocalSystemSid)?,
             Sid::well_known(WinBuiltinAdministratorsSid)?,
         ];
-        let wpath = wide(path.as_os_str());
+        let (mut present, mut defaulted) = (0, 0);
         let mut dacl: *mut ACL = null_mut();
-        let mut sd = null_mut();
-        // SAFETY: out-params are ours; `sd` is LocalAlloc'ed and owns `dacl`.
-        let err = unsafe {
-            GetNamedSecurityInfoW(
-                wpath.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                null_mut(),
-                null_mut(),
-                &raw mut dacl,
-                null_mut(),
-                &raw mut sd,
-            )
-        };
-        let _sd = Local(sd);
-        if err != 0 {
-            #[allow(clippy::cast_possible_wrap)]
-            return Err(io::Error::from_raw_os_error(err as i32));
-        }
-        if dacl.is_null() {
+        // SAFETY: `sd` is a valid descriptor owned by the caller.
+        check(unsafe {
+            GetSecurityDescriptorDacl(sd, &raw mut present, &raw mut dacl, &raw mut defaulted)
+        })?;
+        if present == 0 || dacl.is_null() {
             return Ok(Some("no DACL: everyone has access".into()));
+        }
+        // The owner can always rewrite the DACL, so it must be trusted too.
+        let mut owner: PSID = null_mut();
+        // SAFETY: `sd` is valid; `owner` points into it while `sd` lives.
+        check(unsafe { GetSecurityDescriptorOwner(sd, &raw mut owner, &raw mut defaulted) })?;
+        if owner.is_null() {
+            return Ok(Some("no owner".into()));
+        }
+        if !allowed.iter().any(|a| a.eq(owner)) {
+            return Ok(Some(format!("owner is {}", sid_string(owner)?)));
         }
         // SAFETY: non-null DACL inside the live descriptor.
         let count = unsafe { (*dacl).AceCount };
@@ -410,5 +449,32 @@ mod tests {
         assert!(st.status.success());
         let reason = check_private(&p).unwrap().expect("not flagged");
         assert!(reason.contains("S-1-5-32-545"), "{reason}");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod owner_tests {
+    //! GATE-1 #11 nit: a file owned by another account passes a DACL-only
+    //! check (the owner can always rewrite the DACL), so the owner is checked.
+    use super::sys::check_sddl;
+
+    #[test]
+    fn foreign_owner_is_flagged_even_with_owner_only_dacl() {
+        let me = super::current_user_sid().unwrap();
+        let other = "S-1-5-21-1000000001-1000000002-1000000003-1001";
+        let reason = check_sddl(&format!("O:{other}D:P(A;;FA;;;{me})"))
+            .unwrap()
+            .expect("foreign owner not flagged");
+        assert!(reason.contains("owner"), "{reason}");
+        assert!(reason.contains(other), "{reason}");
+    }
+
+    #[test]
+    fn own_file_with_owner_only_dacl_passes() {
+        let me = super::current_user_sid().unwrap();
+        assert_eq!(
+            check_sddl(&format!("O:{me}D:P(A;;FA;;;{me})")).unwrap(),
+            None
+        );
     }
 }

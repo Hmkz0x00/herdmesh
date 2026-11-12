@@ -386,6 +386,7 @@ async fn malformed_requests_are_refused() {
         author,
         have_hi: 100,
         holes,
+        check: None,
     };
     let bad = [
         // Too many holes.
@@ -409,6 +410,30 @@ async fn malformed_requests_are_refused() {
             want: vec![want(n(1), vec![])],
             ..SyncSince::everything(room(), auth)
         },
+        // Prefix check with an empty range.
+        SyncSince {
+            want: vec![AuthorWant {
+                check: Some(hm_net::PrefixCheck {
+                    lo: 7,
+                    at: 7,
+                    fp: [0; 32],
+                }),
+                ..want(n(1), vec![])
+            }],
+            ..SyncSince::everything(room(), auth)
+        },
+        // Prefix check above have_hi.
+        SyncSince {
+            want: vec![AuthorWant {
+                check: Some(hm_net::PrefixCheck {
+                    lo: 0,
+                    at: 101,
+                    fp: [0; 32],
+                }),
+                ..want(n(1), vec![])
+            }],
+            ..SyncSince::everything(room(), auth)
+        },
     ];
     let conn = b
         .endpoint()
@@ -425,7 +450,40 @@ async fn malformed_requests_are_refused() {
         assert!(is_reset_refused(&out), "{req:?} -> {out:?}");
     }
     conn.close(0u32.into(), b"done");
-    assert_eq!(SYNC_VERSION, 2);
+    assert_eq!(SYNC_VERSION, 3);
     a.shutdown().await;
     b.shutdown().await;
+}
+
+#[test]
+fn answer_pages_through_many_authors_within_the_requested_range() {
+    // GATE-2 N4: the server reads authors a page at a time instead of a
+    // whole-room summary; results must not change across page boundaries.
+    let s = store();
+    let evs: Vec<Event> = (0..150u32).map(|n| ev(&key(n), 1, 1, "x")).collect();
+    fill(&s, &evs);
+    let st = s.lock().unwrap();
+    let caps = hm_store::SyncCaps::DEFAULT;
+    let all = SyncSince::everything(room(), [0; 32]);
+    let hm_net::Answer {
+        events: out, more, ..
+    } = hm_net::answer_request(&st, &all, caps).unwrap();
+    assert_eq!((out.len(), more), (150, false));
+
+    let mut nodes: Vec<NodeId> = evs.iter().map(|e| e.author.node).collect();
+    nodes.sort();
+    let mid = SyncSince {
+        from: Some(nodes[9]),
+        to: Some(nodes[109]),
+        ..all
+    };
+    let hm_net::Answer {
+        events: out, more, ..
+    } = hm_net::answer_request(&st, &mid, caps).unwrap();
+    assert!(!more);
+    let got: Vec<NodeId> = out
+        .iter()
+        .map(|w| Event::decode(w).unwrap().author.node)
+        .collect();
+    assert_eq!(got, nodes[10..=109]);
 }

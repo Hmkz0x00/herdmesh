@@ -107,3 +107,66 @@ async fn holder_of_higher_twin_converges_to_lowest_and_marks_author() {
     a.shutdown().await;
     b.shutdown().await;
 }
+
+/// GATE-2 N2: A and B each hold a *different* twin and neither has ever
+/// seen both, so no node has an equivocation mark. Sync must still find the
+/// mismatch (deep in a long chain, with B also behind A) and converge both
+/// on the lowest id, with the author marked on both sides.
+#[tokio::test(flavor = "multi_thread")]
+async fn split_twins_with_no_marks_are_detected_and_converge() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = SigningKey::from_bytes(&[31; 32]);
+    let (t1, t2) = (note(&k, 237, "twin one"), note(&k, 237, "twin two"));
+    let (low, high) = if t1.id < t2.id { (t1, t2) } else { (t2, t1) };
+    let chain = |n: u64| -> Vec<Event> {
+        (1..=n)
+            .filter(|&i| i != 237)
+            .map(|i| note(&k, i, &format!("e{i}")))
+            .collect()
+    };
+
+    let sa = store();
+    fill(&sa, &chain(600));
+    fill(&sa, std::slice::from_ref(&high));
+    let sb = store();
+    fill(&sb, &chain(400));
+    fill(&sb, std::slice::from_ref(&low));
+    for s in [&sa, &sb] {
+        assert!(s.lock().unwrap().equivocations().unwrap().is_empty());
+    }
+
+    let (a, b) = (bind(&dir, "a").await, bind(&dir, "b").await);
+    a.sync_rooms().insert(secret(), sa.clone()).unwrap();
+    b.sync_rooms().insert(secret(), sb.clone()).unwrap();
+    for _ in 0..2 {
+        tokio::time::timeout(T, sync_from(a.endpoint(), b.local_addr(), &secret(), &sa))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(T, sync_from(b.endpoint(), a.local_addr(), &secret(), &sb))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    for (name, s) in [("A", &sa), ("B", &sb)] {
+        let s = s.lock().unwrap();
+        let at = s.events_for(&low.author.node, 236, &[], 1).unwrap();
+        assert_eq!(at[0].id, low.id, "{name} kept the higher twin");
+        assert_eq!(s.event_count().unwrap(), 600, "{name}");
+    }
+    // A saw both twins, so it holds the evidence. (B only ever saw the lower
+    // one: once A converged their prefixes agree and B has nothing to mark.)
+    let marks = sa.lock().unwrap().equivocations().unwrap();
+    assert_eq!(marks.len(), 1, "{marks:?}");
+    assert_eq!(
+        (marks[0].seq, marks[0].kept, marks[0].dropped),
+        (237, low.id, high.id)
+    );
+    assert_eq!(
+        sa.lock().unwrap().views().clone(),
+        sb.lock().unwrap().views().clone()
+    );
+    a.shutdown().await;
+    b.shutdown().await;
+}

@@ -2,14 +2,17 @@
 //!
 //! Tables: `events` (keyed by EventId, unique per (author node, seq)),
 //! `blobs` (bodies deduped by blake3), `authors` (contiguous seq prefix per
-//! author), `equivocations` (misbehaviour marks), `first_seen` (local arrival
+//! author), `prefix` (per author and seq `<= hi`, the XOR of
+//! [`seq_hash`] over `1..=seq`: a fingerprint sync compares to find twins
+//! no single node holds both of), `equivocations` (misbehaviour marks), `first_seen` (local arrival
 //! time per event, never read by views), `cursors` (local per-agent read
 //! cursors), `meta` (room, pinned genesis, view snapshot).
 //! Integers that take part in ordering are stored as big-endian BLOBs so
 //! SQLite's memcmp order equals numeric order for the full u64 range.
 //!
 //! Ingestion (ADR-002 §1-3), for every append path:
-//! 1. wrong room / bad signature / seq 0 → rejected;
+//! 1. wrong room / bad signature / seq 0 / encoded size above
+//!    `MAX_EVENT_BYTES` → rejected;
 //! 2. `ts > now + MAX_FUTURE_SKEW` → not stored, parked in a bounded
 //!    in-memory pending queue that every later append retries;
 //! 3. `lamport > local max + MAX_LAMPORT_JUMP` → rejected;
@@ -20,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hm_proto::limits::{MAX_FUTURE_SKEW_MS, MAX_LAMPORT_JUMP};
+use hm_proto::limits::{MAX_EVENT_BYTES, MAX_FUTURE_SKEW_MS, MAX_LAMPORT_JUMP};
 use hm_proto::{AgentRef, Event, EventBody, EventId, EventSig, Lamport, NodeId, RoomId};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -59,6 +62,12 @@ CREATE TABLE IF NOT EXISTS equivocations (
     dropped BLOB NOT NULL,
     PRIMARY KEY (node, seq, dropped)
 );
+CREATE TABLE IF NOT EXISTS prefix (
+    node BLOB NOT NULL,
+    seq  BLOB NOT NULL,
+    px   BLOB NOT NULL,
+    PRIMARY KEY (node, seq)
+);
 CREATE TABLE IF NOT EXISTS first_seen (
     id BLOB PRIMARY KEY,
     at BLOB NOT NULL
@@ -79,6 +88,10 @@ const VIEW_SNAPSHOT_VERSION: u8 = 3;
 
 /// Max events parked because their `ts` is too far in the future.
 pub const PENDING_CAP: usize = 1000;
+
+/// Most stored seqs above an author's prefix that one summary reads to list
+/// holes (GATE-2 N4). Holes past it are listed once earlier ones fill.
+pub const SUMMARY_TAIL_ROWS: usize = 1024;
 
 /// Result of [`Store::append`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,6 +361,11 @@ fn id_at(conn: &Connection, node: &NodeId, seq: u64) -> Result<Option<EventId>, 
         .transpose()
 }
 
+/// Size of `e` in wire form (`Event::encode`).
+fn encoded_len(e: &Event) -> Result<usize, StoreError> {
+    Ok(e.encode()?.len())
+}
+
 /// Insert one already-verified event whose (author, seq) is free.
 fn insert_event(conn: &Connection, e: &Event) -> Result<(), StoreError> {
     let body = postcard::to_allocvec(&e.body)?;
@@ -392,25 +410,105 @@ fn delete_event(conn: &Connection, id: &EventId) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Move `node`'s contiguous prefix forward over newly stored seqs.
+/// Per-seq term of the prefix fingerprint: `blake3("hm-prefix-v1" || seq || id)`.
+pub fn seq_hash(seq: u64, id: &EventId) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"hm-prefix-v1");
+    h.update(&seq.to_be_bytes());
+    h.update(id.as_bytes());
+    *h.finalize().as_bytes()
+}
+
+fn xor(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+    std::array::from_fn(|i| a[i] ^ b[i])
+}
+
+fn read_hi(conn: &Connection, node: &[u8]) -> Result<u64, StoreError> {
+    let hi: Option<Vec<u8>> = conn
+        .prepare_cached("SELECT hi FROM authors WHERE node = ?1")?
+        .query_row(params![node], |r| r.get(0))
+        .optional()?;
+    Ok(hi.map(|v| u64_of(v, "hi")).transpose()?.unwrap_or(0))
+}
+
+/// Prefix fingerprint of `node` at `seq` (zero at 0); `None` above `hi`.
+fn px_at(conn: &Connection, node: &[u8], seq: u64) -> Result<Option<[u8; 32]>, StoreError> {
+    if seq == 0 {
+        return Ok(Some([0; 32]));
+    }
+    let v: Option<Vec<u8>> = conn
+        .prepare_cached("SELECT px FROM prefix WHERE node = ?1 AND seq = ?2")?
+        .query_row(params![node, be(seq)], |r| r.get(0))
+        .optional()?;
+    v.map(|v| arr(v, "prefix")).transpose()
+}
+
+/// Move `node`'s contiguous prefix forward over newly stored seqs,
+/// extending its prefix fingerprints.
 fn advance_hi(conn: &Connection, node: &NodeId) -> Result<(), StoreError> {
     let nb = node.as_bytes().to_vec();
-    let hi: Option<Vec<u8>> = conn
-        .query_row("SELECT hi FROM authors WHERE node = ?1", params![nb], |r| {
-            r.get(0)
-        })
-        .optional()?;
-    let mut hi = hi.map(|v| u64_of(v, "hi")).transpose()?.unwrap_or(0);
+    let mut hi = read_hi(conn, &nb)?;
+    let mut px = px_at(conn, &nb, hi)?.ok_or(StoreError::Corrupt("prefix"))?;
     while let Some(next) = hi.checked_add(1) {
-        if id_at(conn, node, next)?.is_none() {
+        let Some(id) = id_at(conn, node, next)? else {
             break;
-        }
+        };
+        px = xor(px, seq_hash(next, &id));
+        conn.prepare_cached("INSERT OR REPLACE INTO prefix (node, seq, px) VALUES (?1, ?2, ?3)")?
+            .execute(params![nb, be(next), px.to_vec()])?;
         hi = next;
     }
     conn.execute(
         "INSERT OR REPLACE INTO authors (node, hi) VALUES (?1, ?2)",
         params![nb, be(hi)],
     )?;
+    Ok(())
+}
+
+/// The event at `node`/`seq` changed: drop the prefix from `seq` on, so the
+/// next [`advance_hi`] recomputes it.
+fn truncate_prefix(conn: &Connection, node: &NodeId, seq: u64) -> Result<(), StoreError> {
+    let nb = node.as_bytes().to_vec();
+    let hi = read_hi(conn, &nb)?;
+    if seq > hi {
+        return Ok(());
+    }
+    // Big-endian seqs compare like numbers.
+    conn.execute(
+        "DELETE FROM prefix WHERE node = ?1 AND seq >= ?2",
+        params![nb, be(seq)],
+    )?;
+    conn.execute(
+        "UPDATE authors SET hi = ?2 WHERE node = ?1",
+        params![nb, be(seq - 1)],
+    )?;
+    Ok(())
+}
+
+/// Stores written before the `prefix` table existed: rebuild every
+/// author's prefix (and fingerprints) from seq 1, once.
+fn migrate_prefix(conn: &Connection) -> Result<(), StoreError> {
+    if get_meta(conn, "prefix_v1")?.is_some() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let nodes: Vec<Vec<u8>> = tx
+        .prepare("SELECT node FROM authors")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    tx.execute("DELETE FROM prefix", [])?;
+    for nb in nodes {
+        tx.execute(
+            "UPDATE authors SET hi = ?2 WHERE node = ?1",
+            params![nb, be(0)],
+        )?;
+        advance_hi(&tx, &NodeId::from_bytes(arr(nb, "author node")?))?;
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('prefix_v1', x'01')",
+        [],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -430,6 +528,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         check_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        migrate_prefix(&conn)?;
         match get_meta(&conn, "room")? {
             Some(r) if r.as_slice() != room.as_bytes() => return Err(StoreError::WrongRoom),
             Some(_) => {}
@@ -505,6 +604,10 @@ impl Store {
             return Err(StoreError::WrongRoom);
         }
         e.verify()?;
+        let size = encoded_len(e)?;
+        if size > MAX_EVENT_BYTES {
+            return Err(StoreError::Oversized(size));
+        }
         match self.ingest(vec![e.clone()], now)?.first() {
             Some(Disp::Inserted | Disp::Replaced) => Ok(AppendOutcome::Inserted),
             Some(Disp::Duplicate | Disp::Dropped) => Ok(AppendOutcome::Duplicate),
@@ -595,7 +698,11 @@ impl Store {
         let mut todo = Vec::with_capacity(all.len());
         for (i, e) in all.iter().enumerate() {
             // Pending events were verified when first offered.
-            if i < fresh && (e.room != self.room || e.verify().is_err()) {
+            if i < fresh
+                && (e.room != self.room
+                    || e.verify().is_err()
+                    || encoded_len(e).map_or(true, |n| n > MAX_EVENT_BYTES))
+            {
                 continue;
             }
             if e.ts > horizon {
@@ -641,6 +748,7 @@ impl Store {
                     }
                     delete_event(&tx, &old)?;
                     insert_event(&tx, e)?;
+                    truncate_prefix(&tx, &e.author.node, e.seq)?;
                     replaced = true;
                     disp[i] = Disp::Replaced;
                 }
@@ -726,43 +834,77 @@ impl Store {
     }
 
     /// Per author: contiguous prefix, highest seq, and up to `max_holes`
-    /// missing seqs above the prefix. Reads only the sparse tail of each
-    /// author (indexed), never the whole log.
+    /// missing seqs above the prefix. See [`Store::seq_summary_page`]; this
+    /// covers every author, so it is for tests and small rooms.
     pub fn seq_summary(
         &self,
         max_holes: usize,
     ) -> Result<BTreeMap<NodeId, AuthorSeqs>, StoreError> {
+        self.seq_summary_page(None, usize::MAX, max_holes)
+    }
+
+    /// [`Store::seq_summary`] for at most `max_authors` authors after
+    /// `after`, in node order. Bounded work per author: one prefix lookup,
+    /// one indexed `MAX(seq)`, and at most [`SUMMARY_TAIL_ROWS`] tail seqs
+    /// (none when `max_holes == 0`). Never reads the whole log.
+    pub fn seq_summary_page(
+        &self,
+        after: Option<NodeId>,
+        max_authors: usize,
+        max_holes: usize,
+    ) -> Result<BTreeMap<NodeId, AuthorSeqs>, StoreError> {
+        let after = after.map_or_else(Vec::new, |n| n.as_bytes().to_vec());
+        let limit = i64::try_from(max_authors).unwrap_or(i64::MAX);
         let authors: Vec<(Vec<u8>, Vec<u8>)> = self
             .conn
-            .prepare_cached("SELECT node, hi FROM authors")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .prepare_cached("SELECT node, hi FROM authors WHERE node > ?1 ORDER BY node LIMIT ?2")?
+            .query_map(params![after, limit], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
+        let mut top = self
+            .conn
+            .prepare_cached("SELECT MAX(seq) FROM events WHERE author_node = ?1")?;
         let mut tail = self.conn.prepare_cached(
-            "SELECT seq FROM events WHERE author_node = ?1 AND seq > ?2 ORDER BY seq",
+            "SELECT seq FROM events WHERE author_node = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
         )?;
+        let rows = i64::try_from(SUMMARY_TAIL_ROWS).unwrap_or(i64::MAX);
         let mut out = BTreeMap::new();
         for (node, hi) in authors {
             let hi = u64_of(hi, "hi")?;
-            let seqs: Vec<Vec<u8>> = tail
-                .query_map(params![node, be(hi)], |r| r.get(0))?
-                .collect::<Result<_, _>>()?;
+            let max: Option<Vec<u8>> = top.query_row(params![node], |r| r.get(0))?;
+            let max = max
+                .map(|m| u64_of(m, "seq"))
+                .transpose()?
+                .unwrap_or(hi)
+                .max(hi);
             let mut s = AuthorSeqs {
                 hi,
-                max: hi,
+                max,
                 holes: Vec::new(),
             };
-            for seq in seqs {
-                let seq = u64_of(seq, "seq")?;
-                let mut gap = s.max.saturating_add(1);
-                while gap < seq && s.holes.len() < max_holes {
-                    s.holes.push(gap);
-                    gap += 1;
+            if max_holes > 0 && max > hi {
+                let seqs: Vec<Vec<u8>> = tail
+                    .query_map(params![node, be(hi), rows], |r| r.get(0))?
+                    .collect::<Result<_, _>>()?;
+                let mut last = hi;
+                for seq in seqs {
+                    let seq = u64_of(seq, "seq")?;
+                    let mut gap = last.saturating_add(1);
+                    while gap < seq && s.holes.len() < max_holes {
+                        s.holes.push(gap);
+                        gap += 1;
+                    }
+                    last = seq;
                 }
-                s.max = seq;
             }
             out.insert(NodeId::from_bytes(arr(node, "author node")?), s);
         }
         Ok(out)
+    }
+
+    /// Prefix fingerprint of `node` at `seq`: XOR of [`seq_hash`] over
+    /// `1..=seq` (all zero at 0). `None` above the contiguous prefix.
+    pub fn prefix_fp(&self, node: &NodeId, seq: u64) -> Result<Option<[u8; 32]>, StoreError> {
+        px_at(&self.conn, node.as_bytes(), seq)
     }
 
     /// Events by `author` with `seq` in `holes` or `seq > after_seq`, by

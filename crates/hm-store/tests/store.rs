@@ -353,3 +353,27 @@ proptest! {
         prop_assert_eq!(incremental, snapshot(s.views()));
     }
 }
+
+// ---- GATE-2 N5: per-event size cap ----
+
+#[test]
+fn oversized_event_is_rejected_on_every_append_path() {
+    let k = key_from(1);
+    let big = |n: u64| {
+        ev(
+            &k,
+            "a",
+            n,
+            0,
+            EventBody::Note {
+                scope: "s".into(),
+                text: "x".repeat(hm_proto::limits::MAX_EVENT_BYTES),
+            },
+        )
+    };
+    let mut s = Store::open_in_memory(room()).unwrap();
+    assert!(matches!(s.append(&big(1)), Err(StoreError::Oversized(_))));
+    let r = s.append_batch(&[big(2)]).unwrap();
+    assert_eq!((r.inserted, r.rejected), (0, 1));
+    assert_eq!(s.event_count().unwrap(), 0);
+}

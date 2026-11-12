@@ -23,8 +23,8 @@ use crate::id::node_id_from_endpoint;
 use crate::net::Net;
 use crate::ticket::RoomSecret;
 
-/// Largest encoded event we accept or send.
-pub const MAX_EVENT_BYTES: usize = 64 * 1024;
+/// Largest encoded event we accept or send (shared with sync and the store).
+pub use hm_proto::limits::MAX_EVENT_BYTES;
 /// iroh-gossip frame cap: our event cap plus headroom for gossip framing.
 /// (iroh-gossip's own default is 4096, too small for our events.)
 pub(crate) const GOSSIP_MAX_MESSAGE_BYTES: usize = MAX_EVENT_BYTES + 4 * 1024;

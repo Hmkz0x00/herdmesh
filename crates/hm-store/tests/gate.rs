@@ -9,7 +9,9 @@ use ed25519_dalek::SigningKey;
 use hm_proto::limits::{MAX_FUTURE_SKEW_MS, MAX_LAMPORT_JUMP};
 use hm_proto::{Event, EventBody, EventId, Lamport, NodeId, Role, RoomId, TaskId};
 use hm_store::settle::{self, ClaimState, SETTLE_MS};
-use hm_store::{AppendOutcome, AuthorSeqs, PENDING_CAP, Store, StoreError, Views};
+use hm_store::{
+    AppendOutcome, AuthorSeqs, PENDING_CAP, SUMMARY_TAIL_ROWS, Store, StoreError, Views,
+};
 use proptest::prelude::*;
 
 const NOW: u64 = 10_000_000;
@@ -437,6 +439,45 @@ fn seq_summary_tracks_prefix_and_holes() {
 }
 
 #[test]
+fn seq_summary_reads_a_bounded_tail_per_author() {
+    // GATE-2 N4: an author that never publishes seq 1 keeps hi = 0; its
+    // whole sparse tail must not be read on every summary.
+    let mut s = store();
+    let n = 2 * SUMMARY_TAIL_ROWS as u64;
+    let evs: Vec<Event> = (1..=n).map(|i| note(1, 2 * i, i, "x")).collect();
+    s.append_batch_at(&evs, NOW).unwrap();
+    let a = s.seq_summary(usize::MAX).unwrap()[&node(1)].clone();
+    assert_eq!((a.hi, a.max), (0, 2 * n));
+    assert!(a.holes.len() <= SUMMARY_TAIL_ROWS, "{}", a.holes.len());
+    assert_eq!(a.holes[..3], [1, 3, 5]);
+}
+
+#[test]
+fn seq_summary_page_lists_authors_after_cursor_with_limit() {
+    let mut s = store();
+    for k in 1..=5 {
+        s.append_at(&note(k, 1, 1, "x"), NOW).unwrap();
+    }
+    let mut all: Vec<NodeId> = (1..=5).map(node).collect();
+    all.sort();
+    let keys = |m: BTreeMap<NodeId, AuthorSeqs>| m.into_keys().collect::<Vec<_>>();
+    assert_eq!(keys(s.seq_summary_page(None, 2, 0).unwrap()), all[..2]);
+    assert_eq!(
+        keys(s.seq_summary_page(Some(all[1]), 10, 0).unwrap()),
+        all[2..]
+    );
+    let p = s.seq_summary_page(Some(all[0]), 1, 0).unwrap();
+    assert_eq!(
+        p[&all[1]],
+        AuthorSeqs {
+            hi: 1,
+            max: 1,
+            holes: vec![]
+        }
+    );
+}
+
+#[test]
 fn events_for_serves_holes_then_range_with_limit() {
     let mut s = store();
     for seq in 1..=10 {
@@ -595,4 +636,69 @@ proptest! {
         s.rebuild_views().unwrap();
         prop_assert_eq!(inc, snapshot(s.views()));
     }
+}
+
+// ---- GATE-2 N2: prefix fingerprints for twin detection ----
+
+#[test]
+fn prefix_fingerprints_follow_content_and_twin_replacement() {
+    let (t1, t2) = (note(1, 2, 2, "twin a"), note(1, 2, 2, "twin b"));
+    let (low, high) = if t1.id < t2.id { (t1, t2) } else { (t2, t1) };
+    let (e1, e3) = (note(1, 1, 1, "x"), note(1, 3, 3, "y"));
+    let build = |evs: &[&Event]| {
+        let mut s = store();
+        for e in evs {
+            s.append_at(e, NOW).unwrap();
+        }
+        s
+    };
+    let n = node(1);
+    let with_high = build(&[&e3, &high, &e1]);
+    let with_low = build(&[&e1, &low, &e3]);
+    assert_eq!(with_high.prefix_fp(&n, 0).unwrap(), Some([0; 32]));
+    assert_eq!(
+        with_high.prefix_fp(&n, 4).unwrap(),
+        None,
+        "beyond the prefix"
+    );
+    // Same events up to seq 1, different twin at seq 2.
+    assert_eq!(
+        with_high.prefix_fp(&n, 1).unwrap(),
+        with_low.prefix_fp(&n, 1).unwrap()
+    );
+    assert_ne!(
+        with_high.prefix_fp(&n, 3).unwrap(),
+        with_low.prefix_fp(&n, 3).unwrap()
+    );
+    // Seeing the lower twin replaces the higher one: fingerprints follow.
+    let mut s = with_high;
+    s.append_at(&low, NOW).unwrap();
+    for seq in 1..=3 {
+        assert_eq!(
+            s.prefix_fp(&n, seq).unwrap(),
+            with_low.prefix_fp(&n, seq).unwrap()
+        );
+    }
+}
+
+#[test]
+fn store_written_before_prefix_table_is_migrated_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.db");
+    let want = {
+        let mut s = Store::open(&path, room()).unwrap();
+        for seq in 1..=3 {
+            s.append_at(&note(1, seq, seq, "x"), NOW).unwrap();
+        }
+        s.prefix_fp(&node(1), 3).unwrap()
+    };
+    // Simulate the old layout: no fingerprints, no migration marker.
+    let c = rusqlite::Connection::open(&path).unwrap();
+    c.execute_batch("DELETE FROM prefix; DELETE FROM meta WHERE key = 'prefix_v1';")
+        .unwrap();
+    drop(c);
+    let s = Store::open(&path, room()).unwrap();
+    assert!(want.is_some());
+    assert_eq!(s.prefix_fp(&node(1), 3).unwrap(), want);
+    assert_eq!(s.seq_summary(0).unwrap()[&node(1)].hi, 3);
 }
