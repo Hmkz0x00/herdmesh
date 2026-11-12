@@ -121,7 +121,9 @@ impl Net {
             }
         };
         let endpoint = builder.secret_key(key).bind().await?;
-        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let gossip = Gossip::builder()
+            .max_message_size(crate::gossip::GOSSIP_MAX_MESSAGE_BYTES)
+            .spawn(endpoint.clone());
         let router = Router::builder(endpoint)
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(SYNC_ALPN, SyncStub)

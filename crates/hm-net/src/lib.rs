@@ -4,10 +4,15 @@
 //! endpoint with gossip and the reserved [`SYNC_ALPN`].
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod gossip;
 mod id;
 mod net;
 mod ticket;
 
+pub use gossip::{
+    DropReason, DropStats, GossipError, MAX_EVENT_BYTES, RoomEvent, RoomReceiver, RoomSender,
+    SEEN_CAPACITY, SeenSet, join_room, screen_event,
+};
 pub use id::{endpoint_id_from_node, node_id_from_endpoint};
 pub use net::{Net, NetConfig, NetError, RelayChoice, SYNC_ALPN, load_or_create_key};
 pub use ticket::{RandomError, RoomSecret, RoomTicket, TICKET_PREFIX, TICKET_VERSION, TicketError};
