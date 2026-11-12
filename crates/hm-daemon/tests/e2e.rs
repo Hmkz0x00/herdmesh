@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ed25519_dalek::SigningKey;
 use hm_daemon::ipc::{
-    self, Call, ErrCode, Hello, MAX_FRAME, Request, Response, Server, ServerHandle, Token,
+    self, Call, ErrCode, MAX_FRAME, Request, Response, Server, ServerHandle, Token,
 };
 use hm_daemon::{DAEMON_AUTHOR, Daemon, NetHandle, wrapped_cost};
 use hm_mcp::{DaemonBackend, McpServer, wrap_peer};
@@ -239,10 +239,7 @@ async fn raw(env: &Env) -> Stream {
 }
 
 async fn hello(s: &mut Stream, env: &Env) {
-    let h = Hello {
-        token: *env.token.as_bytes(),
-    };
-    ipc::write_frame(s, &h).await.unwrap();
+    ipc::client_handshake(s, &env.token).await.unwrap();
 }
 
 /// The daemon answered BadRequest or hung up; never anything else.
@@ -298,10 +295,11 @@ async fn malformed_and_wrong_version_frames_are_rejected() {
 #[tokio::test]
 async fn wrong_token_and_bad_agent_names_are_refused() {
     let env = setup();
+    // A client without the token cannot even finish the handshake: the
+    // server's proof does not verify under the wrong key.
     let mut s = raw(&env).await;
-    ipc::write_frame(&mut s, &Hello { token: [0; 32] })
-        .await
-        .unwrap();
+    let r = ipc::client_handshake(&mut s, &Token::from_bytes([0; 32])).await;
+    assert!(matches!(r, Err(ipc::IpcError::Refused)), "{r:?}");
     let req = Request {
         agent: "a".into(),
         room: None,

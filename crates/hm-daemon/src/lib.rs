@@ -1,12 +1,13 @@
 //! Per-machine daemon: owns the node key and the room stores, serves local
 //! agent adapters over a same-user local socket, publishes via [`NetHandle`].
 //!
-//! - [`ipc`]: socket, framing, token handshake, client.
+//! - [`ipc`]: socket, framing, challenge-response handshake, client.
 //! - [`Daemon`]: the implementation of every call (events, cards, briefs).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod core;
 pub mod ipc;
+mod peer_owner;
 
 pub use core::{
     DAEMON_AUTHOR, Daemon, NetHandle, NullNet, PING_SCAN_MAX, Ping, redact_body, wrapped_cost,

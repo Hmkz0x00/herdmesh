@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use hm_daemon::ipc::{self, IpcError, Server, Token};
+use hm_daemon::ipc::{self, IpcError, Probe, Server, Token};
 use hm_daemon::{Daemon, NetHandle};
 use hm_herdr::{HerdrCli, SystemHerdrCli};
 use hm_net::{RelayChoice, SharedStore};
@@ -33,6 +33,10 @@ pub enum DaemonError {
     AlreadyRunning(String),
     #[error("daemon did not start serving {0} in time")]
     StartTimeout(String),
+    #[error(
+        "socket {0} is served by another user or by a daemon with a different token; refusing to use it"
+    )]
+    Foreign(String),
     #[error(transparent)]
     Data(#[from] DataError),
     #[error(transparent)]
@@ -77,9 +81,22 @@ pub fn token_path(data: &DataDir) -> PathBuf {
     data.root().join("ipc.token")
 }
 
-/// True if something already serves `socket`.
+/// True if a process of the current user serves `socket`. Sends nothing.
 pub async fn is_serving(socket: &str) -> bool {
-    ipc::connect_raw(socket).await.is_ok()
+    ipc::probe_owner(socket).await == Probe::Ours
+}
+
+/// Who serves `socket`: nobody, our daemon (current user, proves it holds
+/// `token`), or something we must not talk to (another user, or a daemon
+/// with a different token). Neither the token nor a request is sent.
+pub async fn serving(socket: &str, token: &Token) -> Probe {
+    match ipc::probe_owner(socket).await {
+        Probe::Ours => match ipc::Client::new(socket, token.clone()).probe().await {
+            Ok(()) => Probe::Ours,
+            Err(_) => Probe::Foreign,
+        },
+        p => p,
+    }
 }
 
 /// Locally authored events go to the room's task, which broadcasts them.
@@ -147,10 +164,12 @@ pub async fn run(
     shutdown: impl Future<Output = ()>,
     mut out: impl FnMut(&str),
 ) -> Result<(), DaemonError> {
-    if is_serving(&opts.socket).await {
-        return Err(DaemonError::AlreadyRunning(opts.socket));
-    }
     let token = ipc::load_or_create_token(&token_path(data))?;
+    match serving(&opts.socket, &token).await {
+        Probe::Free => {}
+        Probe::Ours => return Err(DaemonError::AlreadyRunning(opts.socket)),
+        Probe::Foreign => return Err(DaemonError::Foreign(opts.socket)),
+    }
     let key = node_key(data)?;
     let rooms = data.list_rooms()?;
 
@@ -265,19 +284,25 @@ async fn room_loop(
     s.detach();
 }
 
-/// Make sure a daemon serves `socket`, starting one with `start` if not.
+/// Make sure a daemon of the current user serves `socket`, starting one
+/// with `start` if nothing does. A listener run by someone else is an
+/// error, never "running".
 pub async fn ensure_running(
     socket: &str,
     start: impl FnOnce() -> io::Result<()>,
 ) -> Result<(), DaemonError> {
-    if is_serving(socket).await {
-        return Ok(());
+    match ipc::probe_owner(socket).await {
+        Probe::Ours => return Ok(()),
+        Probe::Foreign => return Err(DaemonError::Foreign(socket.to_owned())),
+        Probe::Free => {}
     }
     start()?;
     let deadline = tokio::time::Instant::now() + START_WAIT;
     while tokio::time::Instant::now() < deadline {
-        if is_serving(socket).await {
-            return Ok(());
+        match ipc::probe_owner(socket).await {
+            Probe::Ours => return Ok(()),
+            Probe::Foreign => return Err(DaemonError::Foreign(socket.to_owned())),
+            Probe::Free => {}
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -319,9 +344,65 @@ pub async fn mcp_backend(
     // The token must exist before a daemon is started, so both agree on it.
     let token: Token = ipc::load_or_create_token(&token_path(data))?;
     ensure_running(socket, start).await?;
+    // Fail loudly now (wrong token, e.g. another data dir) rather than
+    // answering every tool call with "unavailable".
+    if serving(socket, &token).await != Probe::Ours {
+        return Err(DaemonError::Foreign(socket.to_owned()));
+    }
     let b = hm_mcp::DaemonBackend::new(socket, token, agent);
     Ok(match room {
         Some((id, _)) => b.in_room(id),
         None => b,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use ed25519_dalek::SigningKey;
+    use hm_daemon::NullNet;
+
+    use super::*;
+
+    static N: AtomicUsize = AtomicUsize::new(0);
+
+    fn name() -> String {
+        format!(
+            "herdmesh-dm-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        )
+    }
+
+    fn serve(n: &str, token: Token) -> ipc::ServerHandle {
+        let d = Daemon::new(SigningKey::from_bytes(&[2; 32]), Arc::new(NullNet));
+        Server::bind(n, token).unwrap().spawn(Arc::new(d))
+    }
+
+    /// N1: "something listens" is not "our daemon serves".
+    #[tokio::test]
+    async fn serving_needs_our_user_and_our_token() {
+        let n = name();
+        let t = Token::from_bytes([4; 32]);
+        assert_eq!(serving(&n, &t).await, Probe::Free);
+        assert!(!is_serving(&n).await);
+        let _srv = serve(&n, t.clone());
+        assert_eq!(serving(&n, &t).await, Probe::Ours);
+        assert!(is_serving(&n).await);
+        // Same user, other token (another data dir): not ours to talk to.
+        assert_eq!(
+            serving(&n, &Token::from_bytes([5; 32])).await,
+            Probe::Foreign
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_running_accepts_our_daemon_without_starting_another() {
+        let n = name();
+        let _srv = serve(&n, Token::from_bytes([4; 32]));
+        ensure_running(&n, || Err(io::Error::other("must not start")))
+            .await
+            .unwrap();
+    }
 }

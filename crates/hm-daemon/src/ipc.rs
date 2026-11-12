@@ -8,14 +8,21 @@
 //! [`MAX_FRAME`]. A frame with a wrong version or an oversize length is
 //! refused before its body is read.
 //!
-//! Same-user only, in three layers:
-//! 1. OS access control on the endpoint: Windows pipe with an owner-only
-//!    DACL that rejects remote clients; Unix socket (0600) inside a
-//!    verified 0700 directory owned by us, with the peer's uid checked on
-//!    every connection where the OS reports it.
-//! 2. The first frame must be a [`Hello`] carrying the secret [`Token`],
-//!    which lives in a private file (see [`load_or_create_token`]).
-//! 3. Frame limits and a per-connection deadline.
+//! Same-user only, in four layers:
+//! 1. OS access control on the endpoint: Windows pipe (first instance
+//!    only) with an owner-only DACL that rejects remote clients; Unix
+//!    socket (0600) inside a verified 0700 directory owned by us, never
+//!    replacing a live socket, with the peer's uid checked on every
+//!    connection where the OS reports it.
+//! 2. The client checks who serves the name before writing anything
+//!    ([`OwnerId`]): a listener run by another user is refused.
+//! 3. Mutual challenge-response keyed by the secret [`Token`] (a private
+//!    file, see [`load_or_create_token`]). The token never crosses the
+//!    socket, and the client sends its request only after the server has
+//!    proved it holds the token:
+//!    `C→S ClientHello{nc}`, `S→C ServerHello{ns, mac(server, nc, ns)}`,
+//!    `C→S ClientProof{mac(client, nc, ns)}`, `C→S Request`, `S→C Response`.
+//! 4. Frame limits and a per-connection deadline.
 
 use std::io;
 use std::path::Path;
@@ -40,14 +47,26 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-/// IPC protocol version (first byte of every frame).
-pub const IPC_VERSION: u8 = 1;
+/// IPC protocol version (first byte of every frame). 2: challenge-response.
+pub const IPC_VERSION: u8 = 2;
 /// Largest accepted frame payload.
 pub const MAX_FRAME: usize = 1 << 20;
 /// Whole-connection deadline (handshake, request, handler, response).
 pub const CONN_DEADLINE: Duration = Duration::from_secs(10);
 /// Secret length in bytes.
 pub const TOKEN_LEN: usize = 32;
+/// Handshake nonce length in bytes.
+pub const NONCE_LEN: usize = 32;
+
+/// Handshake nonce.
+pub type Nonce = [u8; NONCE_LEN];
+/// Handshake proof: `blake3::keyed_hash(token, role ‖ nc ‖ ns)`.
+pub type Proof = [u8; 32];
+
+const SERVER_ROLE: &[u8] = b"herdmesh-ipc-v2 server proof";
+const CLIENT_ROLE: &[u8] = b"herdmesh-ipc-v2 client proof";
+
+pub use crate::peer_owner::OwnerId;
 
 /// Shared secret proving the client can read the user's private token file.
 #[derive(Clone, PartialEq, Eq)]
@@ -65,10 +84,35 @@ impl Token {
     pub fn as_bytes(&self) -> &[u8; TOKEN_LEN] {
         &self.0
     }
-    /// Constant-time comparison (blake3 hash equality).
-    fn matches(&self, other: &[u8; TOKEN_LEN]) -> bool {
-        blake3::hash(&self.0) == blake3::hash(other)
+
+    fn mac(&self, role: &[u8], client: &Nonce, server: &Nonce) -> Proof {
+        let mut h = blake3::Hasher::new_keyed(&self.0);
+        h.update(role);
+        h.update(client);
+        h.update(server);
+        *h.finalize().as_bytes()
     }
+
+    /// What the server sends to prove it holds the token.
+    pub fn server_proof(&self, client: &Nonce, server: &Nonce) -> Proof {
+        self.mac(SERVER_ROLE, client, server)
+    }
+
+    /// What the client sends to prove it holds the token.
+    pub fn client_proof(&self, client: &Nonce, server: &Nonce) -> Proof {
+        self.mac(CLIENT_ROLE, client, server)
+    }
+}
+
+/// Constant-time proof comparison (`blake3::Hash` equality is).
+fn proof_eq(a: &Proof, b: &Proof) -> bool {
+    blake3::Hash::from(*a) == blake3::Hash::from(*b)
+}
+
+fn nonce() -> Result<Nonce, IpcError> {
+    let mut n = [0u8; NONCE_LEN];
+    getrandom::fill(&mut n).map_err(|_| IpcError::Random)?;
+    Ok(n)
 }
 
 impl std::fmt::Debug for Token {
@@ -117,6 +161,8 @@ pub enum IpcError {
     Deadline,
     #[error("refused")]
     Refused,
+    #[error("socket is served by another user; refusing to talk to it")]
+    NotOwner,
     #[error("random source unavailable")]
     Random,
     #[error("token file is not {TOKEN_LEN} bytes")]
@@ -125,10 +171,67 @@ pub enum IpcError {
     InsecureToken(String),
 }
 
-/// First frame on every connection.
-#[derive(Serialize, Deserialize)]
-pub struct Hello {
-    pub token: [u8; TOKEN_LEN],
+/// First frame on every connection (client → server).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClientHello {
+    pub nonce: Nonce,
+}
+
+/// Server's reply: its nonce and proof it holds the token.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ServerHello {
+    pub nonce: Nonce,
+    pub proof: Proof,
+}
+
+/// Client's proof it holds the token; the request follows.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClientProof {
+    pub proof: Proof,
+}
+
+/// Client half of the handshake. Returns only after the server proved it
+/// holds `token`; the token itself is never written.
+pub async fn client_handshake<S>(s: &mut S, token: &Token) -> Result<(), IpcError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let nc = nonce()?;
+    write_frame(s, &ClientHello { nonce: nc }).await?;
+    let sh: ServerHello = read_frame(s).await?;
+    if !proof_eq(&sh.proof, &token.server_proof(&nc, &sh.nonce)) {
+        return Err(IpcError::Refused);
+    }
+    write_frame(
+        s,
+        &ClientProof {
+            proof: token.client_proof(&nc, &sh.nonce),
+        },
+    )
+    .await
+}
+
+/// Server half of the handshake: `Ok` once the client proved it holds
+/// `token`.
+pub async fn server_handshake<S>(s: &mut S, token: &Token) -> Result<(), IpcError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let ch: ClientHello = read_frame(s).await?;
+    let ns = nonce()?;
+    write_frame(
+        s,
+        &ServerHello {
+            nonce: ns,
+            proof: token.server_proof(&ch.nonce, &ns),
+        },
+    )
+    .await?;
+    let cp: ClientProof = read_frame(s).await?;
+    if !proof_eq(&cp.proof, &token.client_proof(&ch.nonce, &ns)) {
+        return Err(IpcError::Refused);
+    }
+    Ok(())
 }
 
 /// Why a request failed. Never carries peer text.
@@ -374,11 +477,46 @@ fn owner_only_descriptor()
     interprocess::os::windows::security_descriptor::SecurityDescriptor::deserialize(&sddl)
 }
 
-/// Open a raw connection (no handshake). For tests and tooling that send
-/// hand-made frames.
+/// Open a raw connection (no owner check, no handshake). For tests and
+/// tooling that send hand-made frames.
 #[doc(hidden)]
 pub async fn connect_raw(name: &str) -> io::Result<Stream> {
     Stream::connect(to_name(name)?).await
+}
+
+/// Bind a bare listener on `name` (no DACL, no handshake), e.g. to play a
+/// squatter in tests.
+#[doc(hidden)]
+pub fn bind_raw(name: &str) -> io::Result<Listener> {
+    let opts = ListenerOptions::new().name(to_name(name)?);
+    #[cfg(unix)]
+    let opts = {
+        ensure_private_dir(&socket_dir())?;
+        opts.try_overwrite(true)
+    };
+    opts.create_tokio()
+}
+
+/// Who serves a socket name, judged without sending anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// Nothing accepts connections there.
+    Free,
+    /// A process of the current user.
+    Ours,
+    /// Another user, or an owner we could not establish: do not talk to it.
+    Foreign,
+}
+
+/// Connect to `name` and check who serves it; writes nothing.
+pub async fn probe_owner(name: &str) -> Probe {
+    let Ok(s) = connect_raw(name).await else {
+        return Probe::Free;
+    };
+    match (OwnerId::current(), crate::peer_owner::server_owner(&s)) {
+        (Ok(me), Ok(them)) if me == them => Probe::Ours,
+        _ => Probe::Foreign,
+    }
 }
 
 // ---- client ----
@@ -388,6 +526,8 @@ pub async fn connect_raw(name: &str) -> io::Result<Stream> {
 pub struct Client {
     name: String,
     token: Token,
+    /// Who must serve the name; `None` = the current user.
+    owner: Option<OwnerId>,
 }
 
 impl Client {
@@ -395,6 +535,48 @@ impl Client {
         Self {
             name: name.into(),
             token,
+            owner: None,
+        }
+    }
+
+    /// Require a specific server identity instead of the current user's
+    /// (tests simulate a foreign server this way).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn expect_owner(mut self, owner: OwnerId) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
+    /// Check that our daemon (right user, same token) serves the name,
+    /// without sending a request or our proof.
+    pub async fn probe(&self) -> Result<(), IpcError> {
+        timeout(CONN_DEADLINE, async {
+            let mut s = self.connect_verified().await?;
+            let nc = nonce()?;
+            write_frame(&mut s, &ClientHello { nonce: nc }).await?;
+            let sh: ServerHello = read_frame(&mut s).await?;
+            if proof_eq(&sh.proof, &self.token.server_proof(&nc, &sh.nonce)) {
+                Ok(())
+            } else {
+                Err(IpcError::Refused)
+            }
+        })
+        .await
+        .map_err(|_| IpcError::Deadline)?
+    }
+
+    /// Connect, and refuse (before writing anything) a server run by
+    /// someone else.
+    async fn connect_verified(&self) -> Result<Stream, IpcError> {
+        let s = Stream::connect(to_name(&self.name)?).await?;
+        let want = match &self.owner {
+            Some(o) => o.clone(),
+            None => OwnerId::current()?,
+        };
+        match crate::peer_owner::server_owner(&s) {
+            Ok(got) if got == want => Ok(s),
+            _ => Err(IpcError::NotOwner),
         }
     }
 
@@ -406,14 +588,8 @@ impl Client {
     }
 
     async fn request_inner(&self, req: &Request) -> Result<Response, IpcError> {
-        let mut s = Stream::connect(to_name(&self.name)?).await?;
-        write_frame(
-            &mut s,
-            &Hello {
-                token: self.token.0,
-            },
-        )
-        .await?;
+        let mut s = self.connect_verified().await?;
+        client_handshake(&mut s, &self.token).await?;
         write_frame(&mut s, req).await?;
         read_frame(&mut s).await
     }
@@ -454,7 +630,15 @@ impl Server {
         #[cfg(unix)]
         let (opts, owner_uid) = {
             let uid = ensure_private_dir(&socket_dir())?;
-            // Callers probe that nothing serves the name: replace a stale file.
+            // First instance only: never replace a socket someone serves;
+            // a stale file (nobody accepting) is replaced.
+            let path = socket_dir().join(format!("{name}.sock"));
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                return Err(IpcError::Io(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "socket is already served",
+                )));
+            }
             (opts.try_overwrite(true).mode(0o600), Some(uid))
         };
         #[cfg(not(unix))]
@@ -511,10 +695,7 @@ fn peer_is_owner(_: &Stream, _: u32) -> bool {
 }
 
 async fn serve_conn(mut conn: Stream, token: &Token, h: &dyn Handler) -> Result<(), IpcError> {
-    let hello: Hello = read_frame(&mut conn).await?;
-    if !token.matches(&hello.token) {
-        return Err(IpcError::Refused);
-    }
+    server_handshake(&mut conn, token).await?;
     let resp = match read_frame::<_, Request>(&mut conn).await {
         Ok(req) => h.handle(req),
         Err(IpcError::Io(e)) => return Err(e.into()),
