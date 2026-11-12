@@ -26,6 +26,7 @@ ed25519-dalek.workspace = true
 iroh.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["signal"] }
+ratatui = "0.30"
 toml = "1.2.1"
 serde_json = "1.0.154"
 

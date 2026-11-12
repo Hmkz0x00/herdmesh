@@ -1,0 +1,51 @@
+# herdr plugin manifest for herdmesh (format: docs/research/herdr-plugin.md, herdr 0.9.5).
+id = "herdmesh"
+name = "Herdmesh"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Shared project room for agents from different people, machines and providers"
+platforms = ["linux", "macos", "windows"]
+
+[[panes]]
+id = "board"
+title = "Herdmesh Board"
+placement = "popup"
+width = "85%"
+height = 24
+command = ["herdmesh", "board"]
+
+[[actions]]
+id = "room.create"
+title = "Herdmesh: Create Room"
+contexts = ["global", "workspace"]
+command = ["herdmesh", "room", "create", "main"]
+
+[[actions]]
+id = "room.join"
+title = "Herdmesh: Join Room"
+contexts = ["global", "workspace"]
+command = ["herdmesh", "room", "join"]
+
+[[actions]]
+id = "room.invite"
+title = "Herdmesh: Copy Room Invite"
+contexts = ["global", "workspace"]
+command = ["herdmesh", "room", "invite", "main"]
+
+[[actions]]
+id = "room.leave"
+title = "Herdmesh: Leave Room"
+contexts = ["global", "workspace"]
+command = ["herdmesh", "room", "leave", "main"]
+
+[[actions]]
+id = "board.open"
+title = "Herdmesh: Open Board"
+contexts = ["global", "workspace", "pane"]
+command = ["herdr", "plugin", "pane", "open", "--plugin", "herdmesh", "--entrypoint", "board"]
+
+[[startup]]
+command = ["herdmesh", "daemon", "--ensure"]
+
+[[build]]
+command = ["cargo", "build", "--release", "-p", "herdmesh"]

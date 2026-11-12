@@ -38,6 +38,12 @@ enum Cmd {
     Daemon,
     /// Run the MCP stdio server for one agent (not yet implemented).
     Mcp,
+    /// Live board of members, leases, tasks and inbox (herdr plugin pane).
+    Board {
+        /// Agent name used to read the inbox.
+        #[arg(long = "as", default_value = DEFAULT_AGENT)]
+        agent: String,
+    },
     /// Check the local environment (herdr binary, data dir).
     Doctor,
 }
@@ -151,6 +157,7 @@ fn main() -> ExitCode {
         ),
         Cmd::Daemon => not_implemented("daemon"),
         Cmd::Mcp => not_implemented("mcp"),
+        Cmd::Board { agent } => herdmesh::board::run(data_dir(cli.data_dir), &agent),
         Cmd::Doctor => {
             let mut cfg = doctor::DoctorConfig::from_env();
             if cli.data_dir.is_some() {
