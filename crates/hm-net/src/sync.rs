@@ -84,6 +84,8 @@ pub const MAX_TWINS_PER_AUTHOR: usize = 64;
 /// `MAX_HOLES_PER_AUTHOR * HOLE_WINDOWS` holes per author per sync run, so
 /// holes no peer can fill never starve the ones behind them.
 pub const HOLE_WINDOWS: usize = 8;
+/// Authors the server reads per store query while answering.
+const SERVER_AUTHOR_PAGE: usize = 64;
 /// Stream reset code for every refused request.
 pub const ERR_REFUSED: u32 = 1;
 
@@ -242,31 +244,48 @@ pub fn answer_request(
     caps: SyncCaps,
 ) -> Result<(Vec<Vec<u8>>, bool), SyncError> {
     let want: BTreeMap<NodeId, &AuthorWant> = req.want.iter().map(|w| (w.author, w)).collect();
-    let lo = req.from.map_or(Bound::Unbounded, Bound::Excluded);
-    let hi = req.to.map_or(Bound::Unbounded, Bound::Included);
-    let summary = store.seq_summary(0)?;
     let (mut out, mut bytes) = (Vec::new(), 0usize);
-    for (author, held) in summary.range((lo, hi)) {
-        let (have_hi, holes) = want
-            .get(author)
-            .map_or((0, &[][..]), |w| (w.have_hi, w.holes.as_slice()));
-        if held.max <= have_hi && holes.is_empty() {
-            continue;
-        }
-        let left = caps.max_events.saturating_sub(out.len());
-        if left == 0 {
-            return Ok((out, true));
-        }
-        for e in store.events_for(author, have_hi, holes, left)? {
-            let wire = e.encode()?;
-            if wire.len() > MAX_EVENT_BYTES {
-                continue; // stored by an older build; never sent
+    // Authors in `(from, to]`, read a page at a time (GATE-2 N4): work is
+    // bounded by the listed authors plus the response caps, since every
+    // author the client lacks yields at least one event.
+    let scan_cap = MAX_AUTHORS_PER_REQUEST.saturating_add(caps.max_events);
+    let (mut cursor, mut scanned) = (req.from, 0usize);
+    'authors: loop {
+        let page = store.seq_summary_page(cursor, SERVER_AUTHOR_PAGE, 0)?;
+        let full = page.len() == SERVER_AUTHOR_PAGE;
+        for (author, held) in &page {
+            cursor = Some(*author);
+            if req.to.is_some_and(|t| *author > t) {
+                break 'authors;
             }
-            if !out.is_empty() && bytes.saturating_add(wire.len()) > caps.max_bytes {
+            scanned += 1;
+            if scanned > scan_cap {
                 return Ok((out, true));
             }
-            bytes = bytes.saturating_add(wire.len());
-            out.push(wire);
+            let (have_hi, holes) = want
+                .get(author)
+                .map_or((0, &[][..]), |w| (w.have_hi, w.holes.as_slice()));
+            if held.max <= have_hi && holes.is_empty() {
+                continue;
+            }
+            let left = caps.max_events.saturating_sub(out.len());
+            if left == 0 {
+                return Ok((out, true));
+            }
+            for e in store.events_for(author, have_hi, holes, left)? {
+                let wire = e.encode()?;
+                if wire.len() > MAX_EVENT_BYTES {
+                    continue; // stored by an older build; never sent
+                }
+                if !out.is_empty() && bytes.saturating_add(wire.len()) > caps.max_bytes {
+                    return Ok((out, true));
+                }
+                bytes = bytes.saturating_add(wire.len());
+                out.push(wire);
+            }
+        }
+        if !full {
+            break;
         }
     }
     // Twin serving (ADR-002 addendum): after all regular events, the kept
@@ -830,7 +849,12 @@ pub async fn sync_page(
         if room != secret.room_id() {
             return Err(SyncError::RoomMismatch);
         }
-        let summary = s.seq_summary(MAX_HOLES_PER_AUTHOR * HOLE_WINDOWS)?;
+        // One page plus one author, so `request_page` knows if more follow.
+        let summary = s.seq_summary_page(
+            from,
+            MAX_AUTHORS_PER_REQUEST + 1,
+            MAX_HOLES_PER_AUTHOR * HOLE_WINDOWS,
+        )?;
         let page = request_page(&summary, from, window);
         let req = SyncSince {
             room,

@@ -12,7 +12,8 @@ mod views;
 pub use error::StoreError;
 pub use settle::{ClaimRec, ClaimState, Lease, LeaseBook};
 pub use store::{
-    AppendOutcome, AuthorSeqs, BatchReport, Equivocation, PENDING_CAP, Store, SyncCaps, now_ms,
+    AppendOutcome, AuthorSeqs, BatchReport, Equivocation, PENDING_CAP, SUMMARY_TAIL_ROWS, Store,
+    SyncCaps, now_ms,
 };
 pub use views::{DecisionRec, Member, OrderKey, Task, Views, next_lamport, order_key};
 

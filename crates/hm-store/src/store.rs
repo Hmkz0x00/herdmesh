@@ -81,6 +81,10 @@ const VIEW_SNAPSHOT_VERSION: u8 = 3;
 /// Max events parked because their `ts` is too far in the future.
 pub const PENDING_CAP: usize = 1000;
 
+/// Most stored seqs above an author's prefix that one summary reads to list
+/// holes (GATE-2 N4). Holes past it are listed once earlier ones fill.
+pub const SUMMARY_TAIL_ROWS: usize = 1024;
+
 /// Result of [`Store::append`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendOutcome {
@@ -740,39 +744,67 @@ impl Store {
     }
 
     /// Per author: contiguous prefix, highest seq, and up to `max_holes`
-    /// missing seqs above the prefix. Reads only the sparse tail of each
-    /// author (indexed), never the whole log.
+    /// missing seqs above the prefix. See [`Store::seq_summary_page`]; this
+    /// covers every author, so it is for tests and small rooms.
     pub fn seq_summary(
         &self,
         max_holes: usize,
     ) -> Result<BTreeMap<NodeId, AuthorSeqs>, StoreError> {
+        self.seq_summary_page(None, usize::MAX, max_holes)
+    }
+
+    /// [`Store::seq_summary`] for at most `max_authors` authors after
+    /// `after`, in node order. Bounded work per author: one prefix lookup,
+    /// one indexed `MAX(seq)`, and at most [`SUMMARY_TAIL_ROWS`] tail seqs
+    /// (none when `max_holes == 0`). Never reads the whole log.
+    pub fn seq_summary_page(
+        &self,
+        after: Option<NodeId>,
+        max_authors: usize,
+        max_holes: usize,
+    ) -> Result<BTreeMap<NodeId, AuthorSeqs>, StoreError> {
+        let after = after.map_or_else(Vec::new, |n| n.as_bytes().to_vec());
+        let limit = i64::try_from(max_authors).unwrap_or(i64::MAX);
         let authors: Vec<(Vec<u8>, Vec<u8>)> = self
             .conn
-            .prepare_cached("SELECT node, hi FROM authors")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .prepare_cached("SELECT node, hi FROM authors WHERE node > ?1 ORDER BY node LIMIT ?2")?
+            .query_map(params![after, limit], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
+        let mut top = self
+            .conn
+            .prepare_cached("SELECT MAX(seq) FROM events WHERE author_node = ?1")?;
         let mut tail = self.conn.prepare_cached(
-            "SELECT seq FROM events WHERE author_node = ?1 AND seq > ?2 ORDER BY seq",
+            "SELECT seq FROM events WHERE author_node = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
         )?;
+        let rows = i64::try_from(SUMMARY_TAIL_ROWS).unwrap_or(i64::MAX);
         let mut out = BTreeMap::new();
         for (node, hi) in authors {
             let hi = u64_of(hi, "hi")?;
-            let seqs: Vec<Vec<u8>> = tail
-                .query_map(params![node, be(hi)], |r| r.get(0))?
-                .collect::<Result<_, _>>()?;
+            let max: Option<Vec<u8>> = top.query_row(params![node], |r| r.get(0))?;
+            let max = max
+                .map(|m| u64_of(m, "seq"))
+                .transpose()?
+                .unwrap_or(hi)
+                .max(hi);
             let mut s = AuthorSeqs {
                 hi,
-                max: hi,
+                max,
                 holes: Vec::new(),
             };
-            for seq in seqs {
-                let seq = u64_of(seq, "seq")?;
-                let mut gap = s.max.saturating_add(1);
-                while gap < seq && s.holes.len() < max_holes {
-                    s.holes.push(gap);
-                    gap += 1;
+            if max_holes > 0 && max > hi {
+                let seqs: Vec<Vec<u8>> = tail
+                    .query_map(params![node, be(hi), rows], |r| r.get(0))?
+                    .collect::<Result<_, _>>()?;
+                let mut last = hi;
+                for seq in seqs {
+                    let seq = u64_of(seq, "seq")?;
+                    let mut gap = last.saturating_add(1);
+                    while gap < seq && s.holes.len() < max_holes {
+                        s.holes.push(gap);
+                        gap += 1;
+                    }
+                    last = seq;
                 }
-                s.max = seq;
             }
             out.insert(NodeId::from_bytes(arr(node, "author node")?), s);
         }
