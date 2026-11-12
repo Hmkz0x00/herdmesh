@@ -364,7 +364,11 @@ impl RoomSession {
     }
 
     /// Sign `body` as us, store it, broadcast it.
-    pub async fn publish(&mut self, body: EventBody) -> Result<Event, SessionError> {
+    pub async fn publish(&mut self, mut body: EventBody) -> Result<Event, SessionError> {
+        // Same rule as the daemon: secrets never leave the machine.
+        if !hm_daemon::redact_body(&mut body).is_empty() {
+            tracing::warn!(room = %self.id, "redacted secret-like text before signing");
+        }
         let me = NodeId::from_verifying_key(&self.key.verifying_key());
         let (seq, lamport) = {
             let s = self.lock()?;

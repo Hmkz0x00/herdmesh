@@ -5,6 +5,7 @@
 //! the author's role first, then handed to the [`NetHandle`] for gossip.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ed25519_dalek::SigningKey;
@@ -92,7 +93,7 @@ pub struct Ping {
     pub kind: &'static str,
     /// Sanitised `node6/name` label of the sender.
     pub from: String,
-    /// First ref of a handoff (e.g. `task#12`), if any.
+    /// Task id of a handoff (e.g. `task:t9`), if any. Never free text.
     pub re: Option<String>,
 }
 
@@ -108,6 +109,7 @@ pub struct Daemon {
     net: Arc<dyn NetHandle>,
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
     rooms: Mutex<Rooms>,
+    redactions: AtomicU64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -180,6 +182,46 @@ fn body_text(e: &Event) -> Option<String> {
     })
 }
 
+/// Redact secrets in every free-text field of `body` (in place). Returns the
+/// kinds found, never the secrets. Safe to run twice: markers are stable.
+pub fn redact_body(body: &mut EventBody) -> Vec<hm_proto::redact::Kind> {
+    let mut hits = Vec::new();
+    let mut scrub = |text: &mut String| {
+        let r = hm_proto::redact::redact(text);
+        if !r.hits.is_empty() {
+            *text = r.text;
+            hits.extend(r.hits);
+        }
+    };
+    match body {
+        EventBody::Ask { q, .. } => scrub(q),
+        EventBody::Answer { a, .. } => scrub(a),
+        EventBody::Note { scope, text } => {
+            scrub(scope);
+            scrub(text);
+        }
+        EventBody::Digest { text, .. } => scrub(text),
+        EventBody::Decision {
+            title, rationale, ..
+        } => {
+            scrub(title);
+            scrub(rationale);
+        }
+        EventBody::Handoff {
+            summary,
+            next_steps,
+            ..
+        } => {
+            scrub(summary);
+            next_steps.iter_mut().for_each(scrub);
+        }
+        EventBody::TaskAdd { title, .. } => scrub(title),
+        EventBody::TaskUpdate { note: Some(n), .. } => scrub(n),
+        _ => {}
+    }
+    hits
+}
+
 impl Daemon {
     pub fn new(key: SigningKey, net: Arc<dyn NetHandle>) -> Self {
         Self::with_clock(key, net, Box::new(now_ms))
@@ -197,6 +239,7 @@ impl Daemon {
             node,
             net,
             clock,
+            redactions: AtomicU64::new(0),
             rooms: Mutex::new(Rooms {
                 by_id: BTreeMap::new(),
                 default: None,
@@ -314,7 +357,13 @@ impl Daemon {
                         EventBody::Ask { to: Some(t), .. } if t == me => ("Ask", None),
                         EventBody::Handoff {
                             to: Some(t), refs, ..
-                        } if t == me => ("Handoff", refs.first().map(ToString::to_string)),
+                        } if t == me => (
+                            "Handoff",
+                            // Only a task id: git refs carry free-form paths.
+                            refs.iter()
+                                .find(|r| matches!(r, hm_proto::Ref::Task(_)))
+                                .map(ToString::to_string),
+                        ),
                         _ => continue,
                     };
                     out.push(Ping {
@@ -350,7 +399,25 @@ impl Daemon {
         Ok(self.add_room(name, store))
     }
 
-    fn emit(&self, st: &mut RoomState<'_>, agent: &str, body: EventBody) -> Res<Event> {
+    /// Secrets never leave the machine: scrub, count, warn (kinds only).
+    fn scrub(&self, room: RoomId, agent: &str, body: &mut EventBody) {
+        let hits = redact_body(body);
+        if hits.is_empty() {
+            return;
+        }
+        self.redactions
+            .fetch_add(hits.len() as u64, Ordering::Relaxed);
+        let kinds: Vec<&str> = hits.iter().map(|k| k.as_str()).collect();
+        tracing::warn!(%room, agent, ?kinds, "redacted secret-like text before signing");
+    }
+
+    /// Secret-like spans redacted from locally authored events so far.
+    pub fn redaction_count(&self) -> u64 {
+        self.redactions.load(Ordering::Relaxed)
+    }
+
+    fn emit(&self, st: &mut RoomState<'_>, agent: &str, mut body: EventBody) -> Res<Event> {
+        self.scrub(st.store.room(), agent, &mut body);
         let now = (self.clock)();
         if !st.store.views().role_of(&self.node).may(body.kind()) {
             return Err(ErrCode::Forbidden);
