@@ -11,4 +11,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+globset = "0.4.19"
 hm-proto.workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
+proptest.workspace = true

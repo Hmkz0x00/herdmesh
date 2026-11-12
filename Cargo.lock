@@ -395,6 +395,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "globset"
+version = "0.4.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e47d37d2ae4464254884b60ab7071be2b876a9c35b696bd018ddcc76847309cd"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -475,7 +488,10 @@ dependencies = [
 name = "hm-store"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
+ "globset",
  "hm-proto",
+ "proptest",
 ]
 
 [[package]]
