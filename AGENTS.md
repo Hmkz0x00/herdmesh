@@ -11,7 +11,7 @@ herdmesh: a Rust herdr plugin + daemon that lets agents from different people, m
 
 ## Hard rules
 1. Stay inside the SCOPE and LEASE of your task card. Need another path? Ask the lead and don't touch it.
-2. Work in your own git worktree/branch. Never `git push`, never force-push, never rewrite others' branches.
+2. Work in your own git worktree/branch. Never `git push`, never force-push, never rewrite others' branches. Never `git rebase`/`git merge`: only `lead` integrates.
 3. Write tests first for logic (proto, store, brief). Golden/fixture tests for anything with a token budget.
 4. When done, reply with ONE `HANDOFF` block (skill: `herd-handoff`). No code dumps, no full-file pastes.
 5. Read code surgically: grep/LSP/ranges. Do not cat whole large files.
