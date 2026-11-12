@@ -80,6 +80,7 @@ pub async fn bind_net(data: &DataDir, relay: RelayChoice) -> Result<Net, Session
     Ok(Net::bind(NetConfig {
         key_path: data.node_key(),
         relay,
+        allow_insecure_key: data.insecure_key_allowed(),
     })
     .await?)
 }
@@ -184,7 +185,9 @@ impl RoomSession {
         let secret = data.load_secret(&id, &cfg)?;
         let known_peers = data.load_peers(&id)?;
         // Same 32 bytes iroh uses: events are signed by our node identity.
-        let key = SigningKey::from_bytes(&load_or_create_key(&data.node_key())?.to_bytes());
+        let key = SigningKey::from_bytes(
+            &load_or_create_key(&data.node_key(), data.insecure_key_allowed())?.to_bytes(),
+        );
         let net = bind_net(data, relay.clone()).await?;
         let store: SharedStore = Arc::new(Mutex::new(Store::open(data.events_db(&id), id)?));
         net.sync_rooms()

@@ -7,6 +7,7 @@
 mod gossip;
 mod id;
 mod net;
+pub mod secure_file;
 pub mod sync;
 mod ticket;
 

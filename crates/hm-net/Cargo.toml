@@ -7,8 +7,14 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-[lints]
-workspace = true
+# Workspace lints, except unsafe_code is `deny` instead of `forbid` so the
+# one Windows ACL FFI module (`secure_file::sys`) can `allow` it.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
 
 [dependencies]
 blake3.workspace = true
@@ -25,6 +31,15 @@ serde_bytes.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 ed25519-dalek.workspace = true

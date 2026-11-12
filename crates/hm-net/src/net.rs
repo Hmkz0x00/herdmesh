@@ -34,6 +34,8 @@ pub struct NetConfig {
     /// File holding the 32-byte node secret key; created if missing.
     pub key_path: PathBuf,
     pub relay: RelayChoice,
+    /// Use a key file others can read (warns instead of refusing).
+    pub allow_insecure_key: bool,
 }
 
 /// Errors from [`Net`].
@@ -46,6 +48,8 @@ pub enum NetError {
     },
     #[error("key file {path} is not a 32-byte key")]
     KeyFormat { path: PathBuf },
+    #[error(transparent)]
+    KeyFile(#[from] crate::secure_file::SecureFileError),
     #[error("binding endpoint: {0}")]
     Bind(#[from] iroh::endpoint::BindError),
 }
@@ -53,38 +57,34 @@ pub enum NetError {
 /// Load the node secret key from `path`, generating and saving one if absent.
 ///
 /// The file is created with `create_new`, so an existing key is never
-/// overwritten. On Unix it is mode 0600.
-pub fn load_or_create_key(path: &Path) -> Result<SecretKey, NetError> {
+/// overwritten, and owner-only ([`crate::secure_file`]). An existing key that
+/// others can access is refused unless `allow_insecure`.
+pub fn load_or_create_key(path: &Path, allow_insecure: bool) -> Result<SecretKey, NetError> {
     let io = |source| NetError::KeyIo {
         path: path.to_owned(),
         source,
     };
-    match std::fs::read(path) {
+    match crate::secure_file::read_private(path, allow_insecure) {
         Ok(bytes) => {
             let arr: [u8; 32] = bytes.try_into().map_err(|_| NetError::KeyFormat {
                 path: path.to_owned(),
             })?;
             Ok(SecretKey::from_bytes(&arr))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(crate::secure_file::SecureFileError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(io)?;
             }
             let key = SecretKey::generate();
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                opts.mode(0o600);
-            }
-            let mut f = opts.open(path).map_err(io)?;
+            let mut f = crate::secure_file::create_private(path)?;
             f.write_all(&key.to_bytes()).map_err(io)?;
             f.sync_all().map_err(io)?;
             tracing::info!(path = %path.display(), "generated node key");
             Ok(key)
         }
-        Err(e) => Err(io(e)),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -98,7 +98,7 @@ pub struct Net {
 
 impl Net {
     pub async fn bind(cfg: NetConfig) -> Result<Self, NetError> {
-        let key = load_or_create_key(&cfg.key_path)?;
+        let key = load_or_create_key(&cfg.key_path, cfg.allow_insecure_key)?;
         let builder = match cfg.relay {
             RelayChoice::N0 => Endpoint::builder(presets::N0),
             RelayChoice::Custom(url) => {
