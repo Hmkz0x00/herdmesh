@@ -805,6 +805,20 @@ impl Store {
         Ok(out)
     }
 
+    /// Stored events of `author` at seqs with a recorded equivocation (the
+    /// kept, lowest-id twin of each), by ascending seq, at most `limit`.
+    /// Served by sync so peers holding a higher twin converge (ADR-002
+    /// addendum). Indexed lookups on both tables' (node, seq) keys.
+    pub fn twins_for(&self, author: &NodeId, limit: usize) -> Result<Vec<Event>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        query_events(
+            &self.conn,
+            self.room,
+            "WHERE e.author_node = ?1 AND e.seq IN              (SELECT seq FROM equivocations WHERE node = ?1) ORDER BY e.seq LIMIT ?2",
+            params![author.as_bytes().to_vec(), limit],
+        )
+    }
+
     /// Recorded equivocations, by (node, seq).
     pub fn equivocations(&self) -> Result<Vec<Equivocation>, StoreError> {
         let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = self
