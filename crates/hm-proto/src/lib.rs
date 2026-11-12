@@ -8,6 +8,7 @@ mod error;
 mod event;
 mod ids;
 pub mod limits;
+pub mod redact;
 mod refs;
 
 pub use error::{ProtoError, RefParseError};
