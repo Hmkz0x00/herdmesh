@@ -132,6 +132,8 @@ fn valid_agent(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        // Names are signed into every event and shown to peers (N7).
+        && !hm_proto::redact::contains_secret(name)
 }
 
 fn parse_status(s: &str) -> Res<TaskStatus> {
@@ -182,8 +184,9 @@ fn body_text(e: &Event) -> Option<String> {
     })
 }
 
-/// Redact secrets in every free-text field of `body` (in place). Returns the
-/// kinds found, never the secrets. Safe to run twice: markers are stable.
+/// Redact secrets in every string of `body` (in place): free text, paths,
+/// git ref paths, task ids and addressee names. Returns the kinds found,
+/// never the secrets. Safe to run twice: markers are stable.
 pub fn redact_body(body: &mut EventBody) -> Vec<hm_proto::redact::Kind> {
     let mut hits = Vec::new();
     let mut scrub = |text: &mut String| {
@@ -194,7 +197,10 @@ pub fn redact_body(body: &mut EventBody) -> Vec<hm_proto::redact::Kind> {
         }
     };
     match body {
-        EventBody::Ask { q, .. } => scrub(q),
+        EventBody::Ask { to, q } => {
+            scrub_to(to, &mut scrub);
+            scrub(q);
+        }
         EventBody::Answer { a, .. } => scrub(a),
         EventBody::Note { scope, text } => {
             scrub(scope);
@@ -202,24 +208,85 @@ pub fn redact_body(body: &mut EventBody) -> Vec<hm_proto::redact::Kind> {
         }
         EventBody::Digest { text, .. } => scrub(text),
         EventBody::Decision {
-            title, rationale, ..
+            title,
+            rationale,
+            refs,
         } => {
             scrub(title);
             scrub(rationale);
+            scrub_refs(refs, &mut scrub);
         }
         EventBody::Handoff {
+            to,
             summary,
+            refs,
             next_steps,
-            ..
         } => {
+            scrub_to(to, &mut scrub);
             scrub(summary);
-            next_steps.iter_mut().for_each(scrub);
+            scrub_refs(refs, &mut scrub);
+            next_steps.iter_mut().for_each(&mut scrub);
         }
-        EventBody::TaskAdd { title, .. } => scrub(title),
-        EventBody::TaskUpdate { note: Some(n), .. } => scrub(n),
+        EventBody::TaskAdd { task, title, paths } => {
+            scrub_task(task, &mut scrub);
+            scrub(title);
+            paths.iter_mut().for_each(&mut scrub);
+        }
+        EventBody::TaskUpdate { task, note, .. } => {
+            scrub_task(task, &mut scrub);
+            if let Some(n) = note {
+                scrub(n);
+            }
+        }
+        EventBody::LeaseClaim { paths, .. } => paths.iter_mut().for_each(&mut scrub),
         _ => {}
     }
     hits
+}
+
+fn scrub_to(to: &mut Option<AgentRef>, scrub: &mut impl FnMut(&mut String)) {
+    if let Some(t) = to {
+        scrub(&mut t.agent_name);
+    }
+}
+
+/// A secret-like task id becomes `redacted-<hash>`: still a valid id, and
+/// the same secret maps to the same placeholder, so updates keep matching.
+fn scrub_task(task: &mut TaskId, scrub: &mut impl FnMut(&mut String)) {
+    let mut s = task.as_str().to_owned();
+    scrub(&mut s);
+    if s != task.as_str() {
+        let h = blake3::hash(task.as_str().as_bytes()).to_hex();
+        if let Ok(t) = TaskId::new(format!("redacted-{}", &h[..16])) {
+            *task = t;
+        }
+    }
+}
+
+/// Git ref paths are free-form; task refs get the task-id treatment. A git
+/// ref whose redacted path is no longer valid is dropped.
+fn scrub_refs(refs: &mut Vec<Ref>, scrub: &mut impl FnMut(&mut String)) {
+    refs.retain_mut(|r| match r {
+        Ref::Git(g) => {
+            let mut p = g.path().to_owned();
+            scrub(&mut p);
+            if p == g.path() {
+                return true;
+            }
+            match hm_proto::GitRef::new(g.sha(), p, g.lines()) {
+                Ok(n) => {
+                    *g = n;
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        Ref::Task(t) => {
+            scrub_task(t, scrub);
+            true
+        }
+        Ref::Event(_) => true,
+    });
 }
 
 impl Daemon {
