@@ -11,4 +11,18 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+blake3.workspace = true
+data-encoding.workspace = true
+getrandom.workspace = true
 hm-proto.workspace = true
+iroh.workspace = true
+iroh-gossip.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
