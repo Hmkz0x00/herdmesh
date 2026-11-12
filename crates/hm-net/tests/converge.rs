@@ -62,15 +62,16 @@ fn make_event(key: &SigningKey, room: RoomId, author: &str, lamport: u64, i: u64
             paths: vec![format!("src/{author}_{i}.rs")],
             ttl_secs: 120,
         },
+        // Releases the claim made by the previous event (same author).
         2 => EventBody::LeaseRelease {
-            paths: vec![format!("src/{author}_{i}.rs")],
+            claim: make_event(key, room, author, lamport - 1, i - 1).id,
         },
         _ => EventBody::Note {
             scope: "converge".into(),
             text: format!("Note {i} from {author}"),
         },
     };
-    Event::sign(key, room, author, Lamport(lamport), 1_000 + i, body).unwrap()
+    Event::sign(key, room, author, i + 1, Lamport(lamport), 1_000 + i, body).unwrap()
 }
 
 async fn publish_event(tx: &RoomSender, store: &SharedStore, ev: &Event) {

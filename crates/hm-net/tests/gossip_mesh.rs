@@ -26,6 +26,7 @@ fn note(seed: u8, room: RoomId, text: &str) -> Event {
         &SigningKey::from_bytes(&[seed; 32]),
         room,
         format!("agent{seed}"),
+        1,
         Lamport(1),
         1,
         EventBody::Note {
