@@ -1133,6 +1133,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "hm-daemon",
+ "hm-herdr",
  "hm-mcp",
  "hm-net",
  "hm-proto",
