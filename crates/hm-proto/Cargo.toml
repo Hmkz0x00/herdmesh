@@ -11,3 +11,13 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+blake3.workspace = true
+ed25519-dalek.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+getrandom.workspace = true
+proptest.workspace = true

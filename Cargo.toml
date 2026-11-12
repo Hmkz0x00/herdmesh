@@ -20,9 +20,16 @@ hm-herdr = { path = "crates/hm-herdr" }
 hm-daemon = { path = "crates/hm-daemon" }
 # external
 anyhow = "1"
+blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+# Match iroh-base 1.x (ed25519-dalek >=3, <4).
+ed25519-dalek = "3"
+getrandom = "0.4"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+proptest = "1"
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 tempfile = "3"
 thiserror = "2"
 tracing = "0.1"
