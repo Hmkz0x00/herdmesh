@@ -355,6 +355,32 @@ fn token_file_is_created_once_and_reused() {
     assert!(ipc::load_or_create_token(&path).is_err());
 }
 
+/// N8: a token file others can read is refused, not used.
+#[test]
+fn token_file_open_to_others_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ipc.token");
+    ipc::load_or_create_token(&path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let st = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/grant", "*S-1-1-0:R"])
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "{st:?}");
+    }
+    assert!(matches!(
+        ipc::load_or_create_token(&path),
+        Err(ipc::IpcError::InsecureToken(_))
+    ));
+}
+
 /// A daemon whose node was made an observer by a remote owner.
 fn setup_observer() -> Env {
     use hm_proto::{EventBody, Lamport, NodeId, Role};

@@ -78,9 +78,16 @@ impl std::fmt::Debug for Token {
 }
 
 /// Read the token at `path`, creating it (random, owner-only) if absent.
+/// An existing file that others can access is refused.
 pub fn load_or_create_token(path: &Path) -> Result<Token, IpcError> {
     match std::fs::read(path) {
         Ok(b) => {
+            use hm_net::secure_file::check_private;
+            match check_private(path) {
+                Ok(None) => {}
+                Ok(Some(why)) => return Err(IpcError::InsecureToken(why)),
+                Err(e) => return Err(IpcError::InsecureToken(e.to_string())),
+            }
             let a: [u8; TOKEN_LEN] = b.try_into().map_err(|_| IpcError::BadToken)?;
             Ok(Token(a))
         }
@@ -114,6 +121,8 @@ pub enum IpcError {
     Random,
     #[error("token file is not {TOKEN_LEN} bytes")]
     BadToken,
+    #[error("token file is not owner-only: {0}")]
+    InsecureToken(String),
 }
 
 /// First frame on every connection.
