@@ -7,6 +7,7 @@
 mod gossip;
 mod id;
 mod net;
+pub mod sync;
 mod ticket;
 
 pub use gossip::{
@@ -15,6 +16,11 @@ pub use gossip::{
 };
 pub use id::{endpoint_id_from_node, node_id_from_endpoint};
 pub use net::{Net, NetConfig, NetError, RelayChoice, SYNC_ALPN, load_or_create_key};
+pub use sync::{
+    ERR_REFUSED, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME, Refusal, SharedStore, SyncError,
+    SyncHandler, SyncMsg, SyncRooms, SyncSince, SyncStats, read_frame, sync_auth, sync_from,
+    sync_once, sync_with, write_frame,
+};
 pub use ticket::{RandomError, RoomSecret, RoomTicket, TICKET_PREFIX, TICKET_VERSION, TicketError};
 
 /// Crate name, used by `herdmesh doctor` and tests to prove linkage.

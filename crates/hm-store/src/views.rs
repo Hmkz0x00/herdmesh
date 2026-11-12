@@ -16,6 +16,12 @@ pub fn order_key(e: &Event) -> OrderKey {
     (e.lamport, e.author.node, e.id)
 }
 
+/// Time used for lease TTL/settle: the author's `ts`, but never later than
+/// when this node received the event. `None` (unknown) falls back to `ts`.
+pub fn effective_ts(ts: u64, received_at: Option<u64>) -> u64 {
+    received_at.map_or(ts, |r| ts.min(r))
+}
+
 /// Next Lamport value after everything seen: `max(seen) + 1`, or 1 if none.
 pub fn next_lamport(seen: impl IntoIterator<Item = Lamport>) -> Lamport {
     let max = seen.into_iter().map(|l| l.0).max().unwrap_or(0);
@@ -38,8 +44,8 @@ pub struct Lease {
     pub holder: AgentRef,
     pub claim: EventId,
     pub lamport: Lamport,
-    /// Claim `ts` + ttl. Informational wall clock, compared only against claim `ts`
-    /// during reduction so views stay deterministic.
+    /// Effective claim time + ttl. Compared only against other claims' effective
+    /// time during reduction, so views depend on stored data, not on "now".
     pub expires_at_ms: u64,
 }
 
@@ -103,7 +109,11 @@ impl Views {
     }
 
     /// Apply one event. Callers must apply events in ascending [`OrderKey`].
-    pub fn apply(&mut self, e: &Event, policy: ClaimPolicy) {
+    ///
+    /// `effective_ts` is the time used for lease TTLs and conflicts:
+    /// `min(e.ts, received_at)` (see [`effective_ts`]), so a future-dated
+    /// claim cannot hold a lease past its TTL.
+    pub fn apply(&mut self, e: &Event, effective_ts: u64, policy: ClaimPolicy) {
         let member = self
             .members
             .entry(e.author.clone())
@@ -148,10 +158,10 @@ impl Views {
                     holder: e.author.clone(),
                     claim: e.id,
                     lamport: e.lamport,
-                    expires_at_ms: e.ts.saturating_add(u64::from(*ttl_secs) * 1000),
+                    expires_at_ms: effective_ts.saturating_add(u64::from(*ttl_secs) * 1000),
                 };
                 for p in paths {
-                    if policy(self.leases.get(p), &claim, e.ts) == ClaimOutcome::Granted {
+                    if policy(self.leases.get(p), &claim, effective_ts) == ClaimOutcome::Granted {
                         self.leases.insert(p.clone(), claim.clone());
                     }
                 }

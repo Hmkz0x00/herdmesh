@@ -5,14 +5,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use hm_proto::NodeId;
-use iroh::endpoint::{Connection, presets};
-use iroh::protocol::{AcceptError, ProtocolHandler, Router};
+use iroh::endpoint::presets;
+use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey};
 use iroh_gossip::Gossip;
 
 use crate::id::node_id_from_endpoint;
+use crate::sync::{SyncHandler, SyncRooms};
 
-/// ALPN for request/response sync between members (handler lands in M2-x).
+/// ALPN for anti-entropy sync between members; see [`crate::sync`].
 pub const SYNC_ALPN: &[u8] = b"herdmesh/sync/1";
 
 /// Which relay servers to use.
@@ -87,24 +88,12 @@ pub fn load_or_create_key(path: &Path) -> Result<SecretKey, NetError> {
     }
 }
 
-/// Stub for the reserved sync ALPN: refuses every connection for now.
-#[derive(Debug, Clone)]
-struct SyncStub;
-
-impl ProtocolHandler for SyncStub {
-    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        conn.close(1u32.into(), b"herdmesh/sync/1 unimplemented");
-        Err(AcceptError::from_err(std::io::Error::other(
-            "herdmesh/sync/1 unimplemented",
-        )))
-    }
-}
-
 /// A bound iroh endpoint with gossip and the sync ALPN mounted.
 #[derive(Debug, Clone)]
 pub struct Net {
     router: Router,
     gossip: Gossip,
+    sync_rooms: SyncRooms,
 }
 
 impl Net {
@@ -124,12 +113,18 @@ impl Net {
         let gossip = Gossip::builder()
             .max_message_size(crate::gossip::GOSSIP_MAX_MESSAGE_BYTES)
             .spawn(endpoint.clone());
+        let sync_rooms = SyncRooms::default();
+        let local = endpoint.id();
         let router = Router::builder(endpoint)
             .accept(iroh_gossip::ALPN, gossip.clone())
-            .accept(SYNC_ALPN, SyncStub)
+            .accept(SYNC_ALPN, SyncHandler::new(sync_rooms.clone(), local))
             .spawn();
         tracing::info!(node = %router.endpoint().id(), "endpoint bound");
-        Ok(Self { router, gossip })
+        Ok(Self {
+            router,
+            gossip,
+            sync_rooms,
+        })
     }
 
     pub fn endpoint(&self) -> &Endpoint {
@@ -138,6 +133,11 @@ impl Net {
 
     pub fn gossip(&self) -> &Gossip {
         &self.gossip
+    }
+
+    /// Rooms served on [`SYNC_ALPN`]; register a room's store here.
+    pub fn sync_rooms(&self) -> &SyncRooms {
+        &self.sync_rooms
     }
 
     pub fn node_id(&self) -> NodeId {
