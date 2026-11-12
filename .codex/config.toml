@@ -1,0 +1,12 @@
+# Codex is the low-quota GATEKEEPER: keep it cheap.
+# Codex reads AGENTS.md automatically. Skills come from .agents/skills/.
+model_reasoning_effort = "medium"
+
+[mcp_servers.context7]
+url = "https://mcp.context7.com/mcp"
+http_headers = { "Authorization" = "Bearer YOUR_CONTEXT7_API_KEY" }
+
+# From milestone M4 on, uncomment to let Codex join herdmesh rooms (dogfooding):
+# [mcp_servers.herdmesh]
+# command = "herdmesh"
+# args = ["mcp", "--agent", "codex"]
