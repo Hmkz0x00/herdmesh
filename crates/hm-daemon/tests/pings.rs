@@ -85,7 +85,14 @@ fn pings_cover_unread_asks_until_inbox_ack() {
     // Offered once (the notify queue keeps it until delivered).
     assert!(d.pending_pings().is_empty());
     // An ask already acked before the scan is never offered.
-    req(&d, "a", Call::Ask { to: "b".into(), question: "2?".into() });
+    req(
+        &d,
+        "a",
+        Call::Ask {
+            to: "b".into(),
+            question: "2?".into(),
+        },
+    );
     req(&d, "b", Call::Inbox { ack: true });
     assert!(d.pending_pings().is_empty());
 }
@@ -193,10 +200,7 @@ fn late_event_filling_a_hole_is_pinged() {
     };
     let (seq, lam) = {
         let s = store.lock().unwrap();
-        (
-            s.next_seq(&b.node).unwrap(),
-            s.next_lamport().unwrap().0,
-        )
+        (s.next_seq(&b.node).unwrap(), s.next_lamport().unwrap().0)
     };
     let late = mk(seq, lam);
     store.lock().unwrap().append(&mk(seq + 1, lam + 1)).unwrap();
