@@ -15,31 +15,31 @@ height = 24
 command = ["herdmesh", "board"]
 
 [[actions]]
-id = "room.create"
+id = "room-create"
 title = "Herdmesh: Create Room"
 contexts = ["global", "workspace"]
 command = ["herdmesh", "room", "create", "main"]
 
 [[actions]]
-id = "room.join"
+id = "room-join"
 title = "Herdmesh: Join Room"
 contexts = ["global", "workspace"]
 command = ["herdmesh", "room", "join"]
 
 [[actions]]
-id = "room.invite"
+id = "room-invite"
 title = "Herdmesh: Copy Room Invite"
 contexts = ["global", "workspace"]
 command = ["herdmesh", "room", "invite", "main"]
 
 [[actions]]
-id = "room.leave"
+id = "room-leave"
 title = "Herdmesh: Leave Room"
 contexts = ["global", "workspace"]
 command = ["herdmesh", "room", "leave", "main"]
 
 [[actions]]
-id = "board.open"
+id = "board-open"
 title = "Herdmesh: Open Board"
 contexts = ["global", "workspace", "pane"]
 command = ["herdr", "plugin", "pane", "open", "--plugin", "herdmesh", "--entrypoint", "board"]

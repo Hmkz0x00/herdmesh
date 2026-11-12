@@ -374,11 +374,11 @@ mod tests {
         };
         let actions = ids("actions");
         for want in [
-            "room.create",
-            "room.join",
-            "room.invite",
-            "room.leave",
-            "board.open",
+            "room-create",
+            "room-join",
+            "room-invite",
+            "room-leave",
+            "board-open",
         ] {
             assert!(actions.iter().any(|a| a == want), "action {want}");
         }
