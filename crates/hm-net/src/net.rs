@@ -112,9 +112,10 @@ impl Net {
         let endpoint = builder.secret_key(key).bind().await?;
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let sync_rooms = SyncRooms::default();
+        let local = endpoint.id();
         let router = Router::builder(endpoint)
             .accept(iroh_gossip::ALPN, gossip.clone())
-            .accept(SYNC_ALPN, SyncHandler::new(sync_rooms.clone()))
+            .accept(SYNC_ALPN, SyncHandler::new(sync_rooms.clone(), local))
             .spawn();
         tracing::info!(node = %router.endpoint().id(), "endpoint bound");
         Ok(Self {
