@@ -4,7 +4,7 @@
 //! write is a signed event with the next seq and lamport, checked against
 //! the author's role first, then handed to the [`NetHandle`] for gossip.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -27,6 +27,8 @@ const INBOX_MAX: usize = 50;
 const SEARCH_WINDOW: u64 = 1000;
 const SEARCH_MAX: usize = 100;
 const TEXT_CHARS: usize = 1000;
+/// Most events one author contributes to one [`Daemon::pending_pings`] scan.
+pub const PING_SCAN_MAX: usize = 128;
 
 /// Outbound side of the network, so tests run without sockets.
 pub trait NetHandle: Send + Sync + 'static {
@@ -110,6 +112,9 @@ pub struct Daemon {
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
     rooms: Mutex<Rooms>,
     redactions: AtomicU64,
+    ping_scanned: AtomicU64,
+    /// Ping scan position per (room, author node); see `pending_pings`.
+    ping_pos: Mutex<HashMap<(RoomId, NodeId), ScanPos>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -124,6 +129,70 @@ fn internal<E>(_: E) -> ErrCode {
 
 fn ok(text: String) -> Res<Items> {
     Ok(vec![(DAEMON_AUTHOR.to_owned(), text)])
+}
+
+/// Most missing seqs remembered per author for the ping scan.
+const PING_HOLES_MAX: usize = 64;
+
+/// How far the ping scan has read one author's log in one room.
+#[derive(Debug, Default)]
+struct ScanPos {
+    /// Highest seq scanned.
+    after: u64,
+    /// Seqs below `after` that were missing when scanned past.
+    holes: BTreeSet<u64>,
+}
+
+impl ScanPos {
+    fn advance(&mut self, seq: u64) {
+        if seq <= self.after {
+            self.holes.remove(&seq);
+            return;
+        }
+        for gap in self.after.saturating_add(1)..seq {
+            if self.holes.len() >= PING_HOLES_MAX {
+                break;
+            }
+            self.holes.insert(gap);
+        }
+        self.after = seq;
+    }
+}
+
+/// A ping if `e` is an Ask/Handoff to a local agent, past its inbox cursor,
+/// from someone else whose role allows it.
+fn ping_for(
+    room: RoomId,
+    e: &Event,
+    views: &hm_store::Views,
+    inbox: &BTreeMap<&AgentRef, Lamport>,
+) -> Option<Ping> {
+    let (to, kind, re) = match &e.body {
+        EventBody::Ask { to: Some(t), .. } => (t, "Ask", None),
+        EventBody::Handoff {
+            to: Some(t), refs, ..
+        } => (
+            t,
+            "Handoff",
+            // Only a task id: git refs carry free-form paths.
+            refs.iter()
+                .find(|r| matches!(r, Ref::Task(_)))
+                .map(ToString::to_string),
+        ),
+        _ => return None,
+    };
+    let cursor = inbox.get(to)?;
+    if e.author == *to || e.lamport <= *cursor || !views.role_of(&e.author.node).may(e.kind()) {
+        return None;
+    }
+    Some(Ping {
+        room,
+        event: e.id,
+        agent: to.agent_name.clone(),
+        kind,
+        from: agent_label(&e.author),
+        re,
+    })
 }
 
 fn valid_agent(name: &str) -> bool {
@@ -307,6 +376,8 @@ impl Daemon {
             net,
             clock,
             redactions: AtomicU64::new(0),
+            ping_scanned: AtomicU64::new(0),
+            ping_pos: Mutex::new(HashMap::new()),
             rooms: Mutex::new(Rooms {
                 by_id: BTreeMap::new(),
                 default: None,
@@ -400,8 +471,13 @@ impl Daemon {
             .map(|_| ())
     }
 
-    /// Unread Asks and Handoffs addressed to local agents (past their inbox
-    /// cursor). The caller dedupes; an agent clears them with `inbox ack`.
+    /// New unread Asks and Handoffs addressed to local agents, i.e. events
+    /// not offered by an earlier call and past the addressee's inbox cursor.
+    /// The caller keeps them until delivered.
+    ///
+    /// Incremental (N6): each author's log is read from a per-room seq
+    /// cursor (indexed), at most [`PING_SCAN_MAX`] events per author per
+    /// call; seqs skipped as missing are re-checked by point lookup.
     pub fn pending_pings(&self) -> Vec<Ping> {
         let mut out = Vec::new();
         for room in self.room_ids() {
@@ -409,38 +485,37 @@ impl Daemon {
                 continue;
             };
             let store = lock(&store);
+            let Ok(summary) = store.seq_summary(0) else {
+                continue;
+            };
             let views = store.views();
-            for me in views.members.keys().filter(|a| a.node == self.node) {
-                let key = AgentRef::new(me.node, format!("inbox:{}", me.agent_name));
-                let cursor = store.cursor(&key).ok().flatten().unwrap_or(Lamport(0));
-                let Ok(events) = store.events_since(cursor) else {
+            let inbox: BTreeMap<&AgentRef, Lamport> = views
+                .members
+                .keys()
+                .filter(|a| a.node == self.node)
+                .map(|me| {
+                    let key = AgentRef::new(me.node, format!("inbox:{}", me.agent_name));
+                    let c = store.cursor(&key).ok().flatten().unwrap_or(Lamport(0));
+                    (me, c)
+                })
+                .collect();
+            let mut pos = lock(&self.ping_pos);
+            for (author, seqs) in &summary {
+                let p = pos.entry((room, *author)).or_default();
+                if seqs.max <= p.after && p.holes.is_empty() {
+                    continue;
+                }
+                let holes: Vec<u64> = p.holes.iter().copied().collect();
+                let Ok(events) = store.events_for(author, p.after, &holes, PING_SCAN_MAX) else {
                     continue;
                 };
-                for e in events
-                    .iter()
-                    .filter(|e| e.author != *me && views.role_of(&e.author.node).may(e.kind()))
-                {
-                    let (kind, re) = match &e.body {
-                        EventBody::Ask { to: Some(t), .. } if t == me => ("Ask", None),
-                        EventBody::Handoff {
-                            to: Some(t), refs, ..
-                        } if t == me => (
-                            "Handoff",
-                            // Only a task id: git refs carry free-form paths.
-                            refs.iter()
-                                .find(|r| matches!(r, hm_proto::Ref::Task(_)))
-                                .map(ToString::to_string),
-                        ),
-                        _ => continue,
-                    };
-                    out.push(Ping {
-                        room,
-                        event: e.id,
-                        agent: me.agent_name.clone(),
-                        kind,
-                        from: agent_label(&e.author),
-                        re,
-                    });
+                self.ping_scanned
+                    .fetch_add(events.len() as u64, Ordering::Relaxed);
+                for e in &events {
+                    p.advance(e.seq);
+                    if let Some(ping) = ping_for(room, e, views, &inbox) {
+                        out.push(ping);
+                    }
                 }
             }
         }
@@ -476,6 +551,12 @@ impl Daemon {
             .fetch_add(hits.len() as u64, Ordering::Relaxed);
         let kinds: Vec<&str> = hits.iter().map(|k| k.as_str()).collect();
         tracing::warn!(%room, agent, ?kinds, "redacted secret-like text before signing");
+    }
+
+    /// Events decoded by [`Daemon::pending_pings`] so far (cost probe).
+    #[doc(hidden)]
+    pub fn ping_scanned(&self) -> u64 {
+        self.ping_scanned.load(Ordering::Relaxed)
     }
 
     /// Secret-like spans redacted from locally authored events so far.
