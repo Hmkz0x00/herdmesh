@@ -8,7 +8,7 @@
           "agent": "claude",
           "kind": "id",
           "source": "herdr:claude",
-          "value": "abb8f80f-505f-42b8-915a-e3898935aa0b"
+          "value": "00000000-0000-4000-8000-000000000001"
         },
         "agent_status": "idle",
         "cwd": "/workspace/repo",
@@ -17,7 +17,7 @@
         "revision": 2,
         "state_change_seq": 4,
         "tab_id": "w2:t1",
-        "terminal_id": "term_66011bc6925ba2",
+        "terminal_id": "term_00000000000001",
         "terminal_title": "Claude Code",
         "terminal_title_stripped": "Claude Code",
         "workspace_id": "w2"
@@ -28,18 +28,18 @@
           "agent": "codex",
           "kind": "id",
           "source": "herdr:codex",
-          "value": "01a1cfed-2b15-7422-b7a2-2f80c1daac64"
+          "value": "00000000-0000-4000-8000-000000000002"
         },
         "agent_status": "idle",
-        "cwd": "/workspace/veil-messenger",
+        "cwd": "/workspace/other-project",
         "focused": false,
         "pane_id": "w2:p5",
         "revision": 7,
         "state_change_seq": 16,
         "tab_id": "w2:t1",
-        "terminal_id": "term_66011bc69260a3",
-        "terminal_title": "Audit Vivo MDM QR enrollment",
-        "terminal_title_stripped": "Audit Vivo MDM QR enrollment",
+        "terminal_id": "term_00000000000002",
+        "terminal_title": "Example task",
+        "terminal_title_stripped": "Example task",
         "workspace_id": "w2"
       },
       {
@@ -48,10 +48,10 @@
           "agent": "agy",
           "kind": "id",
           "source": "herdr:antigravity_cli",
-          "value": "79c3c8b4-6cc9-4e9c-8ece-e175441e670e"
+          "value": "00000000-0000-4000-8000-000000000003"
         },
         "agent_status": "idle",
-        "cwd": "/workspace/veil-messenger",
+        "cwd": "/workspace/other-project",
         "focused": false,
         "interactive_ready": true,
         "name": "agy",
@@ -59,7 +59,7 @@
         "revision": 0,
         "state_change_seq": 5,
         "tab_id": "w2:t1",
-        "terminal_id": "term_66011bc69261c4",
+        "terminal_id": "term_00000000000003",
         "workspace_id": "w2"
       },
       {
@@ -68,7 +68,7 @@
           "agent": "claude",
           "kind": "id",
           "source": "herdr:claude",
-          "value": "f499f16d-29b4-4c9c-9286-15e9c5468bc7"
+          "value": "00000000-0000-4000-8000-000000000004"
         },
         "agent_status": "done",
         "completion_seq": 136,
@@ -78,7 +78,7 @@
         "revision": 4,
         "state_change_seq": 136,
         "tab_id": "w3:t1",
-        "terminal_id": "term_66011cf7420b85",
+        "terminal_id": "term_00000000000004",
         "terminal_title": "Herdmesh master prompt architecture",
         "terminal_title_stripped": "Herdmesh master prompt architecture",
         "workspace_id": "w3"
@@ -89,7 +89,7 @@
           "agent": "codex",
           "kind": "id",
           "source": "herdr:codex",
-          "value": "01a1d065-9139-76a2-be97-92ed8341c096"
+          "value": "00000000-0000-4000-8000-000000000005"
         },
         "agent_status": "idle",
         "completion_seq": 134,
@@ -101,7 +101,7 @@
         "revision": 6,
         "state_change_seq": 134,
         "tab_id": "w3:t1",
-        "terminal_id": "term_660123beb6fd5a",
+        "terminal_id": "term_00000000000005",
         "terminal_title": "Implement M4-1 MCP stdio server",
         "terminal_title_stripped": "Implement M4-1 MCP stdio server",
         "workspace_id": "w3"
@@ -112,7 +112,7 @@
           "agent": "agy",
           "kind": "id",
           "source": "herdr:antigravity_cli",
-          "value": "64419020-eade-4795-8290-c573e14e88e8"
+          "value": "00000000-0000-4000-8000-000000000006"
         },
         "agent_status": "working",
         "cwd": "/workspace/hm-wt-agy",
@@ -123,7 +123,7 @@
         "revision": 1,
         "state_change_seq": 135,
         "tab_id": "w3:t1",
-        "terminal_id": "term_66011f24014ed6",
+        "terminal_id": "term_00000000000006",
         "terminal_title": "powershell",
         "terminal_title_stripped": "powershell",
         "workspace_id": "w3"
@@ -134,7 +134,7 @@
           "agent": "claude",
           "kind": "id",
           "source": "herdr:claude",
-          "value": "23e73c9e-1ecc-42fe-89e1-e72aae346350"
+          "value": "00000000-0000-4000-8000-000000000007"
         },
         "agent_status": "working",
         "cwd": "/workspace/hm-wt-impl1",
@@ -145,7 +145,7 @@
         "revision": 3,
         "state_change_seq": 125,
         "tab_id": "w3:t1",
-        "terminal_id": "term_66011f66c778b7",
+        "terminal_id": "term_00000000000007",
         "terminal_title": "Cargo workspace skeleton",
         "terminal_title_stripped": "Cargo workspace skeleton",
         "workspace_id": "w3"
@@ -156,7 +156,7 @@
           "agent": "claude",
           "kind": "id",
           "source": "herdr:claude",
-          "value": "26bcf300-5227-48cd-8c17-15931d10706c"
+          "value": "00000000-0000-4000-8000-000000000008"
         },
         "agent_status": "idle",
         "completion_seq": 129,
@@ -168,7 +168,7 @@
         "revision": 3,
         "state_change_seq": 129,
         "tab_id": "w3:t1",
-        "terminal_id": "term_66011fd8639e88",
+        "terminal_id": "term_00000000000008",
         "terminal_title": "M0-3 GitHub Actions CI",
         "terminal_title_stripped": "M0-3 GitHub Actions CI",
         "workspace_id": "w3"

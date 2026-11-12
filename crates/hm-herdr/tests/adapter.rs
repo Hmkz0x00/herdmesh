@@ -30,7 +30,7 @@ fn parse_fixture() {
     assert_eq!(a2.name.as_deref(), Some("agy"));
     assert_eq!(a2.kind, "agy");
     assert_eq!(a2.status, HerdrStatus::Idle);
-    assert_eq!(a2.cwd, PathBuf::from("/workspace/veil-messenger"));
+    assert_eq!(a2.cwd, PathBuf::from("/workspace/other-project"));
 
     // Done agent
     let a3 = &agents[3];
