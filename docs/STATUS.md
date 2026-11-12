@@ -1,6 +1,6 @@
 # STATUS
 
-Milestone: **M1+M2 code complete → GATES pending** (main 32966e2; just check green)
+Milestone: **GATE M1+M2 = FAIL (codex) → fixes in progress per ADR-002** (main c608f86)
 Updated: 2026-11-12
 
 ## Roster (herdr workspace w3; names prefixed hm- to avoid clashes)
@@ -8,6 +8,9 @@ Updated: 2026-11-12
 - tab hm-review: hm-codex w3:p6 (gatekeeper; blocked on folder trust by human)
 
 ## Open
+- G1 hm-impl1 (impl1/gate-core): ADR-002 §1,2,4 + store side of §3. NOT committed yet; paused by usage limit (resumes ~20:50)
+- G2 hm-impl2 (impl2/gate-net): sync budgets/deadlines, repair, display sanitize, Windows DACL
+- G3 (after G1): seq-based sync wire protocol (impl2), then codex re-review of fixes only
 - GATE M1 + GATE M2 (codex): one combined review card once trusted
 - M2 manual: two machines / NAT / relay fallback (docs/testing/cross-network.md) — needs human + 2nd machine
 - M2 acceptance "3 in-process nodes converge": DONE (tests/converge.rs)
