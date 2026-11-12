@@ -28,3 +28,7 @@ Status: Accepted (2026-11-12). Trigger: GATE M1+M2 codex review (verdict FAIL). 
 ## 5. Local display hygiene (M2 scope, full wrapping in M4)
 - All peer-authored strings are escaped (control chars, ANSI, newlines) and length-capped before terminal output.
 - Secret files (node.key, room secrets) on Windows get an owner-only DACL; existing files with broader ACLs → warning + refuse unless `--allow-insecure-key`.
+
+## Addendum (2026-11-12, after G3)
+- **Equivocation convergence:** a sync response for an author also carries every stored twin (same author+seq, different id) for that author, capped at 64; receivers keep the lowest id deterministically and mark the author. Without this, a node holding only the higher twin never fetches the lower one.
+- **Pre-Genesis rooms:** not migrated (pre-release). They fail with `NoGenesis` and must be recreated.
