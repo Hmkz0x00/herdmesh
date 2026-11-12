@@ -5,14 +5,15 @@
 //!
 //! Catch-up: the store is registered in the endpoint's [`hm_net::SyncRooms`]
 //! so peers can pull from us, and we pull from every known peer after joining
-//! gossip and again on each gossip `NeighborUp`. Syncs run as background
-//! tasks (at most one per peer at a time); `sync_from` appends what it gets
-//! with `Store::append_batch`. Gossip events still go through `Store::append`.
+//! gossip, then per [`crate::repair`]: on `NeighborUp`, on `Lagged`, and
+//! periodically with backoff while connected. Syncs run as background tasks
+//! (at most one per peer at a time); `sync_from` appends what it gets with
+//! `Store::append_batch`. Gossip events still go through `Store::append`.
 
-use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::hash::BuildHasher as _;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 use hm_net::{
@@ -26,6 +27,7 @@ use iroh::EndpointAddr;
 use tokio::sync::mpsc;
 
 use crate::data::{DataDir, DataError, RoomConfig, SyncLog, SyncRecord};
+use crate::repair::Repair;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -148,8 +150,16 @@ pub struct RoomSession {
     rx: RoomReceiver,
     sync_tx: mpsc::UnboundedSender<SyncDone>,
     sync_rx: mpsc::UnboundedReceiver<SyncDone>,
-    syncing: BTreeSet<NodeId>,
+    repair: Repair,
     sync_log: SyncLog,
+}
+
+/// Uniform-ish jitter in `[-1, 1]` from std's randomly keyed hasher.
+fn jitter() -> f64 {
+    let h = std::collections::hash_map::RandomState::new().hash_one(now_ms());
+    #[allow(clippy::cast_precision_loss)]
+    let unit = (h >> 11) as f64 / (1u64 << 53) as f64;
+    unit.mul_add(2.0, -1.0)
 }
 
 impl RoomSession {
@@ -185,7 +195,7 @@ impl RoomSession {
             rx,
             sync_tx,
             sync_rx,
-            syncing: BTreeSet::new(),
+            repair: Repair::default(),
             sync_log: data.load_sync(&id)?,
         };
         let peers: Vec<NodeId> = s
@@ -194,19 +204,25 @@ impl RoomSession {
             .map(|p| node_id_from_endpoint(p.id))
             .collect();
         for p in peers {
-            s.spawn_sync(p);
+            if s.repair.start(p) {
+                s.spawn_sync(p);
+            }
         }
         Ok(s)
     }
 
-    /// Pull from `peer` in the background unless a sync with it is running.
+    /// Pull from `peer` in the background. The caller has marked it started
+    /// in `self.repair`; the result always comes back via `sync_rx`.
     fn spawn_sync(&mut self, peer: NodeId) {
-        let Ok(id) = endpoint_id_from_node(peer) else {
-            return;
+        let id = match endpoint_id_from_node(peer) {
+            Ok(id) if id != self.net.endpoint().id() => id,
+            _ => {
+                // Never a real peer: clear the in-flight mark, never schedule.
+                self.repair.finish(peer, true, Instant::now(), 0.0);
+                self.repair.down(peer);
+                return;
+            }
         };
-        if id == self.net.endpoint().id() || !self.syncing.insert(peer) {
-            return;
-        }
         let endpoint = self.net.endpoint().clone();
         let secret = self.secret.clone();
         let store = Arc::clone(&self.store);
@@ -220,7 +236,8 @@ impl RoomSession {
 
     /// Record a finished sync (memory + sync.json) and describe it.
     fn finish_sync(&mut self, d: SyncDone) -> String {
-        self.syncing.remove(&d.peer);
+        self.repair
+            .finish(d.peer, d.result.is_ok(), Instant::now(), jitter());
         let (rec, line) = sync_record(&d.peer, &d.result, now_ms());
         self.sync_log.insert(d.peer.to_string(), rec);
         if let Err(e) = self.data.save_sync(&self.id, &self.sync_log) {
@@ -286,10 +303,27 @@ impl RoomSession {
     /// gossip subscription ended; `Some(Ok(line))` is a one-line, body-free
     /// description for the console.
     pub async fn step(&mut self) -> Option<Result<String, SessionError>> {
-        let item = tokio::select! {
-            // The session holds a sender, so recv() never yields None here.
-            Some(done) = self.sync_rx.recv() => return Some(Ok(self.finish_sync(done))),
-            item = self.rx.next() => item?,
+        let item = loop {
+            let due = self.repair.next_due();
+            // Far future when nothing is scheduled; the branch is disabled then.
+            let wake = due.map_or_else(
+                || tokio::time::Instant::now() + Duration::from_secs(3600),
+                tokio::time::Instant::from_std,
+            );
+            tokio::select! {
+                // The session holds a sender, so recv() never yields None here.
+                Some(done) = self.sync_rx.recv() => return Some(Ok(self.finish_sync(done))),
+                item = self.rx.next() => break item?,
+                () = tokio::time::sleep_until(wake), if due.is_some() => {
+                    let peers = self.repair.take_due(Instant::now());
+                    for p in &peers {
+                        self.spawn_sync(*p);
+                    }
+                    if !peers.is_empty() {
+                        return Some(Ok(format!("repair    periodic sync with {} peer(s)", peers.len())));
+                    }
+                }
+            }
         };
         let item = match item {
             Ok(item) => item,
@@ -305,11 +339,25 @@ impl RoomSession {
                 }
             }
             RoomEvent::NeighborUp(n) => {
-                self.spawn_sync(n);
+                if self.repair.up(n) {
+                    self.spawn_sync(n);
+                }
                 Ok(format!("peer up   {}", short_node(&n)))
             }
-            RoomEvent::NeighborDown(n) => Ok(format!("peer down {}", short_node(&n))),
-            RoomEvent::Lagged => Ok("lagged: some gossip messages were missed".to_owned()),
+            RoomEvent::NeighborDown(n) => {
+                self.repair.down(n);
+                Ok(format!("peer down {}", short_node(&n)))
+            }
+            RoomEvent::Lagged => {
+                let peers = self.repair.lagged();
+                for p in &peers {
+                    self.spawn_sync(*p);
+                }
+                Ok(format!(
+                    "lagged: some gossip messages were missed; re-syncing with {} peer(s)",
+                    peers.len()
+                ))
+            }
         })
     }
 
@@ -521,6 +569,7 @@ mod tests {
                 inserted: 48,
                 duplicates: 2,
                 rejected: 0,
+                ..SyncStats::default()
             }),
             1_000,
         );
