@@ -20,6 +20,12 @@
 //!    own order key) and walked lowest-first; a claim **wins** unless one of
 //!    its paths overlaps a winner held by someone else. Sets are atomic: a
 //!    claim wins all of its paths or none, and a loser blocks nobody.
+//!    **Late claims** also lose: a claim loses to any later-sorted live
+//!    overlapping claim by another holder whose root `ts + SETTLE_MS` is at
+//!    or before its own root `ts` (that lease had settled before this claim
+//!    was signed), so a low Lamport can't take over a settled lease. This
+//!    only ever adds losers. A signer that also backdates `ts` is not caught
+//!    by signed data alone (needs a causal-head field in the claim).
 //!    - not a winner → **Lost { winner }** (the first winner it overlaps)
 //!    - winner and `now >= root.ts + settle_ms` → **Granted**
 //!    - winner inside the settle window → **Pending**
@@ -236,13 +242,28 @@ impl<'a> Resolved<'a> {
             .map(|c| (self.root(&c.id).map_or(c.key(), ClaimRec::key), c))
             .collect();
         live.sort_by_key(|(root, c)| (*root, c.key()));
+        let root_ts = |c: &ClaimRec| self.root(&c.id).map_or(c.ts, |r| r.ts);
         let mut winners: Vec<&ClaimRec> = Vec::new();
         let mut out = Vec::with_capacity(live.len());
-        for (_, c) in live {
+        for (i, &(_, c)) in live.iter().enumerate() {
+            let c_ts = root_ts(c);
             let beaten = winners
                 .iter()
                 .find(|w| w.holder != c.holder && sets_overlap(&w.paths, &c.paths))
-                .map(|w| w.id);
+                .map(|w| w.id)
+                // Late claim (GATE-2 N3): a later-sorted live claim that had
+                // settled, by signed time, before this one was signed beats
+                // it, so a low Lamport can't retroactively take a lease.
+                .or_else(|| {
+                    live[i + 1..]
+                        .iter()
+                        .find(|(_, v)| {
+                            v.holder != c.holder
+                                && root_ts(v).saturating_add(SETTLE_MS) <= c_ts
+                                && sets_overlap(&v.paths, &c.paths)
+                        })
+                        .map(|(_, v)| v.id)
+                });
             if beaten.is_none() {
                 winners.push(c);
             }

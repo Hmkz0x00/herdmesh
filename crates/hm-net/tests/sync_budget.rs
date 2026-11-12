@@ -95,6 +95,8 @@ enum Mode {
     Drip,
     /// Valid but useless frames, each in time, never an `End`.
     Endless,
+    /// One validly signed event above `MAX_EVENT_BYTES`, then `End`.
+    Oversized,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +118,29 @@ impl ProtocolHandler for Fake {
                             }
                             tokio::time::sleep(Duration::from_millis(100)).await;
                         }
+                    }
+                    Mode::Oversized => {
+                        let k = SigningKey::from_bytes(&[3; 32]);
+                        let e = Event::sign(
+                            &k,
+                            room(),
+                            "ag",
+                            1,
+                            Lamport(1),
+                            1_000,
+                            EventBody::Note {
+                                scope: "s".into(),
+                                text: "x".repeat(hm_proto::limits::MAX_EVENT_BYTES),
+                            },
+                        )
+                        .unwrap();
+                        let wire = e.encode().unwrap();
+                        write_frame(&mut send, &SyncMsg::Event(wire)).await.ok();
+                        write_frame(&mut send, &SyncMsg::End { more: false })
+                            .await
+                            .ok();
+                        send.finish().ok();
+                        tokio::time::sleep(Duration::from_secs(2)).await;
                     }
                     Mode::Endless => {
                         for _ in 0..600 {
@@ -407,4 +432,11 @@ async fn client_caps_total_bytes() {
     );
     a.shutdown().await;
     b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_rejects_event_above_gossip_cap() {
+    // GATE-2 N5: sync must not be a side door for events gossip would drop.
+    let (err, _) = client_vs(Mode::Oversized, short()).await;
+    assert!(matches!(err, SyncError::Protocol(_)), "{err:?}");
 }

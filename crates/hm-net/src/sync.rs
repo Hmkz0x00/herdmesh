@@ -45,6 +45,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
+use hm_proto::limits::MAX_EVENT_BYTES;
 use hm_proto::{Event, NodeId, RoomId};
 use hm_store::{AuthorSeqs, Store, StoreError, SyncCaps};
 use iroh::endpoint::{
@@ -63,8 +64,9 @@ use crate::ticket::RoomSecret;
 pub const SYNC_VERSION: u8 = 2;
 /// Largest request frame a server reads (before auth, so kept small).
 pub const MAX_REQUEST_FRAME: usize = 64 << 10;
-/// Largest response frame (one event) a client reads.
-pub const MAX_RESPONSE_FRAME: usize = 9 << 20;
+/// Largest response frame (one event plus framing) a client reads. Events
+/// above [`MAX_EVENT_BYTES`] are refused on sync exactly as on gossip.
+pub const MAX_RESPONSE_FRAME: usize = MAX_EVENT_BYTES + 1024;
 /// Client-side limits on one response, regardless of server caps.
 pub const MAX_RESPONSE_EVENTS: usize = SyncCaps::DEFAULT.max_events;
 pub const MAX_RESPONSE_BYTES: usize = 2 * SyncCaps::DEFAULT.max_bytes;
@@ -257,6 +259,9 @@ pub fn answer_request(
         }
         for e in store.events_for(author, have_hi, holes, left)? {
             let wire = e.encode()?;
+            if wire.len() > MAX_EVENT_BYTES {
+                continue; // stored by an older build; never sent
+            }
             if !out.is_empty() && bytes.saturating_add(wire.len()) > caps.max_bytes {
                 return Ok((out, true));
             }
@@ -781,6 +786,9 @@ async fn request_round(
                 .map_err(refused_or)?;
         match msg {
             SyncMsg::Event(wire) => {
+                if wire.len() > MAX_EVENT_BYTES {
+                    return Err(SyncError::Protocol("event exceeds MAX_EVENT_BYTES"));
+                }
                 stats.received += 1;
                 stats.bytes = stats.bytes.saturating_add(wire.len());
                 frames += 1;

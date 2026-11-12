@@ -9,7 +9,8 @@
 //! SQLite's memcmp order equals numeric order for the full u64 range.
 //!
 //! Ingestion (ADR-002 §1-3), for every append path:
-//! 1. wrong room / bad signature / seq 0 → rejected;
+//! 1. wrong room / bad signature / seq 0 / encoded size above
+//!    `MAX_EVENT_BYTES` → rejected;
 //! 2. `ts > now + MAX_FUTURE_SKEW` → not stored, parked in a bounded
 //!    in-memory pending queue that every later append retries;
 //! 3. `lamport > local max + MAX_LAMPORT_JUMP` → rejected;
@@ -20,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hm_proto::limits::{MAX_FUTURE_SKEW_MS, MAX_LAMPORT_JUMP};
+use hm_proto::limits::{MAX_EVENT_BYTES, MAX_FUTURE_SKEW_MS, MAX_LAMPORT_JUMP};
 use hm_proto::{AgentRef, Event, EventBody, EventId, EventSig, Lamport, NodeId, RoomId};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -348,6 +349,11 @@ fn id_at(conn: &Connection, node: &NodeId, seq: u64) -> Result<Option<EventId>, 
         .transpose()
 }
 
+/// Size of `e` in wire form (`Event::encode`).
+fn encoded_len(e: &Event) -> Result<usize, StoreError> {
+    Ok(e.encode()?.len())
+}
+
 /// Insert one already-verified event whose (author, seq) is free.
 fn insert_event(conn: &Connection, e: &Event) -> Result<(), StoreError> {
     let body = postcard::to_allocvec(&e.body)?;
@@ -505,6 +511,10 @@ impl Store {
             return Err(StoreError::WrongRoom);
         }
         e.verify()?;
+        let size = encoded_len(e)?;
+        if size > MAX_EVENT_BYTES {
+            return Err(StoreError::Oversized(size));
+        }
         match self.ingest(vec![e.clone()], now)?.first() {
             Some(Disp::Inserted | Disp::Replaced) => Ok(AppendOutcome::Inserted),
             Some(Disp::Duplicate | Disp::Dropped) => Ok(AppendOutcome::Duplicate),
@@ -595,7 +605,11 @@ impl Store {
         let mut todo = Vec::with_capacity(all.len());
         for (i, e) in all.iter().enumerate() {
             // Pending events were verified when first offered.
-            if i < fresh && (e.room != self.room || e.verify().is_err()) {
+            if i < fresh
+                && (e.room != self.room
+                    || e.verify().is_err()
+                    || encoded_len(e).map_or(true, |n| n > MAX_EVENT_BYTES))
+            {
                 continue;
             }
             if e.ts > horizon {
