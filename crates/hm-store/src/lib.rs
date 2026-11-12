@@ -1,7 +1,19 @@
 //! Append-only signed event log and SQLite materialized views.
 //!
-//! M0 stub: real code lands in later milestones (see docs/plans/).
+//! [`Store`] verifies and stores events; [`Views`] are rebuilt deterministically
+//! from the event set ordered by (lamport, author node, id).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+mod error;
+mod store;
+mod views;
+
+pub use error::StoreError;
+pub use store::{AppendOutcome, Store};
+pub use views::{
+    ClaimOutcome, ClaimPolicy, DecisionRec, Lease, Member, OrderKey, Task, Views, next_lamport,
+    order_key, order_only,
+};
 
 /// Crate name, used by `herdmesh doctor` and tests to prove linkage.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
