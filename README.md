@@ -108,11 +108,30 @@ herdmesh is designed from first principles under the assumption that network pee
 | **Event Model & Storage** | **Built** | Append-only event log with SQLite views, deterministic rebuilds, and lease conflict settling ([ADR-002](docs/adr/ADR-002-determinism-sync-roles.md)). |
 | **Token Budget Engine** | **Built** | Calibrated token estimation, L0 room card, L1 brief, and compaction digests (`crates/hm-brief`). |
 | **MCP Server** | **Built** | Stdio server exposing 14 tools within a ≤600 token schema budget (`crates/hm-mcp`). |
+| **Daemon Process** | **Built** | Background per-machine daemon (`herdmesh daemon [--ensure]`), IPC core, and auto-start on agent connect. |
+| **Live TUI Board** | **Built** | Interactive terminal dashboard pane (`herdmesh board [--as <agent>]`) built with `ratatui` for herdr panes. |
 | **P2P Networking** | **Built** | Iroh endpoints, gossip broadcast, and authenticated sequence-based delta sync (`crates/hm-net`). |
-| **Room CLI** | **Built** | `herdmesh room create`, `join`, `invite`, `status`, `leave`, `run`, and `doctor` (`crates/herdmesh`). |
+| **Room CLI** | **Built** | Full room lifecycle: `room create`, `join`, `invite`, `status`, `leave`, `run` (`crates/herdmesh`). |
+| **Environment Check** | **Built** | Diagnostics & health checks via `herdmesh doctor`. |
 | **Self-Hosted Relay** | **Documented** | Standalone `iroh-relay` deployment guide ([docs/ops/self-hosted-relay.md](docs/ops/self-hosted-relay.md)). |
-| **Daemon Process** | *Planned* | Background daemon manager (`herdmesh daemon`) and CLI stdio integration (`crates/hm-daemon` core built). |
-| **TUI Room Board** | *Planned* | Interactive terminal dashboard pane built with `ratatui` for herdr panes. |
+| **Role Grant CLI** | *Planned* | `herdmesh room grant` CLI helper (underlying `RoleGrant` event verification built). |
+
+---
+
+## CLI Command Reference
+
+| Command | Purpose |
+|---|---|
+| `herdmesh room create <name> [--as <agent>]` | Initialize a new room and output its invite ticket. |
+| `herdmesh room join <ticket> [--as <agent>]` | Join an existing room via an invite ticket. |
+| `herdmesh room invite <room>` | Display the shareable ticket for an existing local room. |
+| `herdmesh room status <room>` | Show members, active leases, and open tasks from the local store. |
+| `herdmesh room leave <room> [--yes]` | Announce leave to the room (and optionally delete local state). |
+| `herdmesh room run <room>` | Run room session in the foreground until Ctrl+C. |
+| `herdmesh daemon [--ensure]` | Run the per-user background daemon (or ensure it is running). |
+| `herdmesh mcp --agent <name> [--room <room>]` | Run the stdio MCP server for a specific agent identity. |
+| `herdmesh board [--as <agent>]` | Open the interactive TUI board (herdr plugin pane). |
+| `herdmesh doctor` | Check environment, binary paths, and data directory permissions. |
 
 ---
 

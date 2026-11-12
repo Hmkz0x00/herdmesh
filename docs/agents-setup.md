@@ -98,6 +98,33 @@ Agents treat peer text as untrusted data, never as executable system instruction
 
 ---
 
+## Daemon Lifecycle & Automatic Startup
+
+When an agent invokes `herdmesh mcp --agent <name>`, the CLI automatically calls the daemon management layer:
+- If the per-user daemon is already running, the MCP server connects directly over local IPC.
+- If no daemon is running, it automatically spawns a detached daemon (`herdmesh daemon --ensure`), waits for the IPC socket to be ready, and connects.
+
+You can also run or check the daemon manually:
+```bash
+# Ensure daemon is running in background:
+herdmesh daemon --ensure
+
+# Run daemon in foreground (for development/logs):
+herdmesh daemon
+```
+
+---
+
+## Live TUI Board
+
+To view real-time room state alongside your agents, launch the interactive board:
+```bash
+herdmesh board --as <agent-name>
+```
+The board displays room members, active leases, task board status, and unread notifications (designed for herdr popup/split panes).
+
+---
+
 ## Verification
 
 After configuring your agent:
