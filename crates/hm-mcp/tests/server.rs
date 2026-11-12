@@ -10,11 +10,15 @@ struct FakeBackend {
     calls: Mutex<Vec<String>>,
     arguments: Mutex<Vec<Value>>,
     responses: Mutex<Option<Vec<(String, String)>>>,
+    deny: std::sync::atomic::AtomicBool,
 }
 type Reply = Result<Vec<(String, String)>, BackendError>;
 impl FakeBackend {
     fn reply(&self, name: &str) -> Reply {
         self.calls.lock().unwrap().push(name.into());
+        if self.deny.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(BackendError::NotPermitted);
+        }
         Ok(self.responses.lock().unwrap().clone().unwrap_or_else(|| {
             vec![(
                 "person/agent".into(),
@@ -41,6 +45,36 @@ fake! {
     task_update(task: String, status: String, note: Option<String>);
     task_list(filter: Option<String>); decide(title: String, rationale: String, refs: Vec<String>);
     get_event(id: String); search(query: String, limit: usize);
+}
+
+/// Working cap for the tool list; the hard cap stays `TOOLS_TOTAL_MAX`.
+const TOOLS_HEADROOM_MAX: usize = 540;
+
+#[tokio::test]
+async fn not_permitted_is_a_clear_error_not_a_silent_success() {
+    let backend = Arc::new(FakeBackend::default());
+    backend
+        .deny
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let server = McpServer::new(backend);
+    for (tool, args) in [
+        ("claim", json!({"paths": ["src/a"], "ttl_min": 5})),
+        (
+            "decide",
+            json!({"title": "t", "rationale": "r", "refs": []}),
+        ),
+        (
+            "task_add",
+            json!({"task": "t-1", "title": "x", "paths": []}),
+        ),
+    ] {
+        let err = server.invoke(tool, args).await.unwrap_err();
+        assert!(
+            err.message.contains("Not permitted"),
+            "{tool}: {}",
+            err.message
+        );
+    }
 }
 
 #[test]
@@ -70,6 +104,11 @@ fn mcp_tools_budget() {
     let count = estimate_tokens(&json);
     println!("mcp_tools_budget: {count}/{TOOLS_TOTAL_MAX} tokens");
     assert!(count <= TOOLS_TOTAL_MAX, "{count}: {json}");
+    // Headroom: new tools or fields must not eat the whole hard cap.
+    assert!(
+        count <= TOOLS_HEADROOM_MAX,
+        "{count} > {TOOLS_HEADROOM_MAX}: {json}"
+    );
     assert_eq!(json, include_str!("fixtures/tools-list.json").trim());
 }
 

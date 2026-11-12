@@ -3,7 +3,7 @@
 //! tags calls with the agent's name.
 
 use async_trait::async_trait;
-use hm_daemon::ipc::{Call, Client, Items, Request, Response, Token};
+use hm_daemon::ipc::{Call, Client, ErrCode, Items, Request, Response, Token};
 use hm_proto::RoomId;
 
 use crate::{Backend, BackendError};
@@ -40,7 +40,8 @@ impl DaemonBackend {
         };
         match self.client.request(&req).await {
             Ok(Response::Ok(items)) => Ok(items),
-            _ => Err(BackendError),
+            Ok(Response::Err(ErrCode::Forbidden)) => Err(BackendError::NotPermitted),
+            _ => Err(BackendError::Unavailable),
         }
     }
 }
