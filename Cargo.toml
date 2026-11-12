@@ -28,6 +28,7 @@ ed25519-dalek = "3"
 getrandom = "0.4"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 proptest = "1"
+rusqlite = { version = "0.42", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 tempfile = "3"
