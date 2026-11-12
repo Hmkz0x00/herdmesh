@@ -1,9 +1,13 @@
-//! Lease settle semantics (ADR-001 note 2).
+//! Lease model (ADR-001 note 2, ADR-002 §1): settle, atomic sets, renewal,
+//! release by claim id, TTL cap.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ed25519_dalek::SigningKey;
+use hm_proto::limits::MAX_LEASE_TTL_SECS;
 use hm_proto::{Event, EventBody, EventId, Lamport, RoomId};
-use hm_store::settle::{ClaimState, SETTLE_MS, claim_state, claim_state_with, paths_overlap};
+use hm_store::settle::{
+    ClaimState, SETTLE_MS, book_from_events, claim_state, claim_state_with, paths_overlap,
+};
 use proptest::prelude::*;
 
 const T0: u64 = 1_000_000;
@@ -18,10 +22,15 @@ fn room() -> RoomId {
 }
 
 fn claim(k: u8, lamport: u64, ts: u64, paths: &[&str], ttl_secs: u32) -> Event {
+    claim_as(k, &format!("agent{k}"), lamport, ts, paths, ttl_secs)
+}
+
+fn claim_as(k: u8, name: &str, lamport: u64, ts: u64, paths: &[&str], ttl_secs: u32) -> Event {
     Event::sign(
         &key(k),
         room(),
-        format!("agent{k}"),
+        name,
+        lamport,
         Lamport(lamport),
         ts,
         EventBody::LeaseClaim {
@@ -32,16 +41,15 @@ fn claim(k: u8, lamport: u64, ts: u64, paths: &[&str], ttl_secs: u32) -> Event {
     .unwrap()
 }
 
-fn release(k: u8, lamport: u64, ts: u64, paths: &[&str]) -> Event {
+fn release(k: u8, lamport: u64, ts: u64, claim: &Event) -> Event {
     Event::sign(
         &key(k),
         room(),
         format!("agent{k}"),
+        lamport,
         Lamport(lamport),
         ts,
-        EventBody::LeaseRelease {
-            paths: paths.iter().map(|s| s.to_string()).collect(),
-        },
+        EventBody::LeaseRelease { claim: claim.id },
     )
     .unwrap()
 }
@@ -123,8 +131,8 @@ fn equal_lamport_lower_author_node_wins() {
 
 #[test]
 fn equal_lamport_and_node_lower_id_wins() {
-    let a = claim(1, 4, T0, &["src/net/**"], 600);
-    let b = claim(1, 4, T0 + 1, &["src/net/a.rs"], 600);
+    let a = claim_as(1, "x", 4, T0, &["src/net/**"], 600);
+    let b = claim_as(1, "y", 4, T0 + 1, &["src/net/a.rs"], 600);
     let (lo, hi) = if a.id < b.id { (a, b) } else { (b, a) };
     let evs = vec![hi.clone(), lo.clone()];
     assert_eq!(
@@ -222,7 +230,7 @@ fn expired_winner_no_longer_blocks() {
 #[test]
 fn author_release_releases() {
     let a = claim(1, 1, T0, &["src/**"], 600);
-    let r = release(1, 2, T0 + 10, &["src/**"]);
+    let r = release(1, 2, T0 + 10, &a);
     let evs = vec![a.clone(), r];
     assert_eq!(
         claim_state(&a.id, &evs, SETTLED),
@@ -233,18 +241,23 @@ fn author_release_releases() {
 #[test]
 fn foreign_release_is_ignored() {
     let a = claim(1, 1, T0, &["src/**"], 600);
-    let r = release(2, 2, T0 + 10, &["src/**"]);
+    let r = release(2, 2, T0 + 10, &a);
     let evs = vec![a.clone(), r];
     assert_eq!(claim_state(&a.id, &evs, SETTLED), Some(ClaimState::Granted));
 }
 
 #[test]
-fn release_before_claim_is_ignored() {
-    let r = release(1, 1, T0, &["src/**"]);
-    let a = claim(1, 2, T0 + 10, &["src/**"], 600);
-    let evs = vec![r, a.clone()];
+fn release_targets_only_the_named_claim() {
+    let a = claim(1, 1, T0, &["src/**"], 600);
+    let b = claim(1, 2, T0 + 10, &["docs/**"], 600);
+    let r = release(1, 3, T0 + 20, &a);
+    let evs = vec![a.clone(), b.clone(), r];
     assert_eq!(
-        claim_state(&a.id, &evs, SETTLED + 10),
+        claim_state(&a.id, &evs, SETTLED),
+        Some(ClaimState::Released)
+    );
+    assert_eq!(
+        claim_state(&b.id, &evs, SETTLED + 10),
         Some(ClaimState::Granted)
     );
 }
@@ -253,7 +266,7 @@ fn release_before_claim_is_ignored() {
 fn released_winner_unblocks_loser() {
     let a = claim(1, 1, T0, &["src/**"], 600);
     let b = claim(2, 2, T0, &["src/a.rs"], 600);
-    let r = release(1, 3, T0 + 100, &["src/**"]);
+    let r = release(1, 3, T0 + 100, &a);
     let evs = vec![a, b.clone(), r];
     assert_eq!(claim_state(&b.id, &evs, SETTLED), Some(ClaimState::Granted));
 }
@@ -261,7 +274,7 @@ fn released_winner_unblocks_loser() {
 #[test]
 fn unknown_or_non_claim_id_is_none() {
     let a = claim(1, 1, T0, &["src/**"], 600);
-    let r = release(1, 2, T0, &["src/**"]);
+    let r = release(1, 2, T0, &a);
     let evs = vec![a, r.clone()];
     assert_eq!(claim_state(&EventId::from_bytes([0; 32]), &evs, T0), None);
     assert_eq!(claim_state(&r.id, &evs, T0), None);
@@ -270,21 +283,143 @@ fn unknown_or_non_claim_id_is_none() {
 // ---- order independence ----
 
 fn scenario() -> Vec<Event> {
+    let a = claim(1, 1, T0, &["src/net/**"], 600);
+    let b = claim(2, 1, T0, &["src/net/a.rs", "docs/**"], 600);
     vec![
-        claim(1, 1, T0, &["src/net/**"], 600),
-        claim(2, 1, T0, &["src/net/a.rs", "docs/**"], 600),
         claim(3, 2, T0 + 500, &["docs/x.md"], 600),
         claim(4, 3, T0 + 900, &["Cargo.toml"], 1),
         claim(1, 4, T0 + 1_500, &["crates/**"], 600),
-        release(2, 5, T0 + 1_800, &["docs/**"]),
-        release(3, 6, T0 + 1_900, &["src/**"]), // foreign for every src claim
+        claim(1, 5, T0 + 1_600, &["src/net/**", "crates/**"], 600), // renewal
+        release(2, 5, T0 + 1_800, &b),
+        release(3, 6, T0 + 1_900, &a), // foreign
+        a,
+        b,
     ]
+}
+
+// ---- TTL cap ----
+
+#[test]
+fn ttl_is_capped_at_8h() {
+    let a = claim(1, 1, T0, &["src/**"], u32::MAX);
+    let evs = vec![a.clone()];
+    let cap = u64::from(MAX_LEASE_TTL_SECS) * 1000;
+    assert_eq!(
+        claim_state(&a.id, &evs, T0 + cap - 1),
+        Some(ClaimState::Granted)
+    );
+    assert_eq!(
+        claim_state(&a.id, &evs, T0 + cap),
+        Some(ClaimState::Expired)
+    );
+    let active = book_from_events(&evs).active(T0);
+    assert_eq!(active["src/**"].expires_at_ms, T0 + cap);
+}
+
+// ---- atomic sets ----
+
+#[test]
+fn claim_sets_are_atomic() {
+    // b loses src/x.rs to a, so it gets docs/y.md neither; c then wins it.
+    let a = claim(1, 1, T0, &["src/x.rs"], 600);
+    let b = claim(2, 2, T0, &["src/x.rs", "docs/y.md"], 600);
+    let c = claim(3, 3, T0, &["docs/y.md"], 600);
+    let evs = vec![a.clone(), b.clone(), c.clone()];
+    let active = book_from_events(&evs).active(SETTLED);
+    assert_eq!(active.len(), 2);
+    assert_eq!(active["src/x.rs"].claim, a.id);
+    assert_eq!(active["docs/y.md"].claim, c.id);
+    assert!(active.values().all(|l| l.claim != b.id));
+}
+
+// ---- renewal ----
+
+#[test]
+fn renewal_keeps_place_in_line_and_extends_ttl() {
+    let a1 = claim(1, 1, T0, &["src/**"], 60);
+    let b = claim(2, 2, T0 + 10, &["src/a.rs"], 600);
+    // a re-claims a superset before a1 expires, after b's claim.
+    let a2 = claim(1, 3, T0 + 50_000, &["src/**", "docs/**"], 60);
+    let evs = vec![a1.clone(), b.clone(), a2.clone()];
+    assert_eq!(
+        claim_state(&a1.id, &evs, T0 + 55_000),
+        Some(ClaimState::Renewed { by: a2.id })
+    );
+    // Past a1's own expiry, a2 still holds and b still loses.
+    let now = T0 + 70_000;
+    assert_eq!(claim_state(&a2.id, &evs, now), Some(ClaimState::Granted));
+    assert_eq!(
+        claim_state(&b.id, &evs, now),
+        Some(ClaimState::Lost { winner: a2.id })
+    );
+    // A renewal is settled from the original claim's time.
+    assert_eq!(
+        claim_state(&a2.id, &evs, T0 + 50_000),
+        Some(ClaimState::Granted)
+    );
+    assert_eq!(
+        book_from_events(&evs).active(now)["src/**"].expires_at_ms,
+        T0 + 110_000
+    );
+}
+
+#[test]
+fn reclaim_after_expiry_is_a_new_claim() {
+    let a1 = claim(1, 1, T0, &["src/**"], 10);
+    let b = claim(2, 2, T0 + 15_000, &["src/a.rs"], 600);
+    let a2 = claim(1, 3, T0 + 20_000, &["src/**"], 600);
+    let evs = vec![a1.clone(), b.clone(), a2.clone()];
+    let now = T0 + 30_000;
+    assert_eq!(claim_state(&a1.id, &evs, now), Some(ClaimState::Expired));
+    assert_eq!(claim_state(&b.id, &evs, now), Some(ClaimState::Granted));
+    assert_eq!(
+        claim_state(&a2.id, &evs, now),
+        Some(ClaimState::Lost { winner: b.id })
+    );
+}
+
+#[test]
+fn subset_reclaim_or_other_agent_is_not_a_renewal() {
+    let a1 = claim_as(1, "x", 1, T0, &["src/**", "docs/**"], 600);
+    let a2 = claim_as(1, "x", 2, T0 + 10, &["src/**"], 600);
+    let other = claim_as(1, "y", 3, T0 + 20, &["src/**", "docs/**"], 600);
+    let evs = vec![a1.clone(), a2.clone(), other.clone()];
+    // Same holder never blocks itself; a2 is a separate claim.
+    assert_eq!(
+        claim_state(&a1.id, &evs, SETTLED),
+        Some(ClaimState::Granted)
+    );
+    assert_eq!(
+        claim_state(&a2.id, &evs, SETTLED + 10),
+        Some(ClaimState::Granted)
+    );
+    // Another agent on the same node cannot renew x's claim.
+    assert_eq!(
+        claim_state(&other.id, &evs, SETTLED + 20),
+        Some(ClaimState::Lost { winner: a1.id })
+    );
+}
+
+#[test]
+fn released_claim_cannot_be_renewed() {
+    let a1 = claim(1, 1, T0, &["src/**"], 600);
+    let r = release(1, 2, T0 + 10, &a1);
+    let b = claim(2, 3, T0 + 20, &["src/**"], 600);
+    let a2 = claim(1, 4, T0 + 30, &["src/**"], 600);
+    let evs = vec![a1.clone(), r, b.clone(), a2.clone()];
+    let now = SETTLED + 100;
+    assert_eq!(claim_state(&a1.id, &evs, now), Some(ClaimState::Released));
+    assert_eq!(claim_state(&b.id, &evs, now), Some(ClaimState::Granted));
+    assert_eq!(
+        claim_state(&a2.id, &evs, now),
+        Some(ClaimState::Lost { winner: b.id })
+    );
 }
 
 proptest! {
     #[test]
     fn state_is_independent_of_event_order(
-        perm in Just((0..7usize).collect::<Vec<_>>()).prop_shuffle(),
+        perm in Just((0..8usize).collect::<Vec<_>>()).prop_shuffle(),
         now in T0..T0 + 5_000,
     ) {
         let base = scenario();

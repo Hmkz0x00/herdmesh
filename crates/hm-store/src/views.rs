@@ -1,13 +1,18 @@
-//! Materialized views: a pure, deterministic reducer over events applied in
-//! [`OrderKey`] order. Same event set → same views, whatever the arrival order.
+//! Materialized views: a pure, deterministic reducer over signed events
+//! applied in [`OrderKey`] order (ADR-002 §1). Same event set (and pinned
+//! genesis) → same views, whatever the arrival order. No local times enter a
+//! view; time-based answers ([`Views::active_leases`], [`Views::claim_state`])
+//! take `now` at read time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map};
 
 use hm_proto::{
     AgentRef, AgentStatus, Event, EventBody, EventId, Lamport, NodeId, Ref, Role, TaskId,
     TaskStatus,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::settle::{ClaimRec, ClaimState, Lease, LeaseBook};
 
 /// Total order over events: (lamport, author node, id). ADR-001 note 6.
 pub type OrderKey = (Lamport, NodeId, EventId);
@@ -16,16 +21,11 @@ pub fn order_key(e: &Event) -> OrderKey {
     (e.lamport, e.author.node, e.id)
 }
 
-/// Time used for lease TTL/settle: the author's `ts`, but never later than
-/// when this node received the event. `None` (unknown) falls back to `ts`.
-pub fn effective_ts(ts: u64, received_at: Option<u64>) -> u64 {
-    received_at.map_or(ts, |r| ts.min(r))
-}
-
 /// Next Lamport value after everything seen: `max(seen) + 1`, or 1 if none.
-pub fn next_lamport(seen: impl IntoIterator<Item = Lamport>) -> Lamport {
+/// `None` when the clock is exhausted (never wraps or saturates).
+pub fn next_lamport(seen: impl IntoIterator<Item = Lamport>) -> Option<Lamport> {
     let max = seen.into_iter().map(|l| l.0).max().unwrap_or(0);
-    Lamport(max.saturating_add(1))
+    max.checked_add(1).map(Lamport)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,16 +40,6 @@ pub struct Task {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Lease {
-    pub holder: AgentRef,
-    pub claim: EventId,
-    pub lamport: Lamport,
-    /// Effective claim time + ttl. Compared only against other claims' effective
-    /// time during reduction, so views depend on stored data, not on "now".
-    pub expires_at_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionRec {
     pub id: EventId,
     pub author: AgentRef,
@@ -61,7 +51,8 @@ pub struct DecisionRec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
-    /// `None` until a `Join` is seen.
+    /// The node's anchored role; `None` until a `Join` is seen. A `Join`'s
+    /// self-declared role is ignored.
     pub role: Option<Role>,
     pub present: bool,
     pub status: Option<AgentStatus>,
@@ -69,51 +60,67 @@ pub struct Member {
     pub last_lamport: Lamport,
 }
 
-/// Outcome of a lease claim against the current holder of one path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaimOutcome {
-    Granted,
-    Lost,
-}
-
-/// Lease conflict policy. M1 uses [`order_only`]; M1-4 plugs settle logic in here.
-pub type ClaimPolicy = fn(current: Option<&Lease>, claim: &Lease, claim_ts: u64) -> ClaimOutcome;
-
-/// First claim in event order wins while it is unexpired at the new claim's `ts`.
-/// The same holder may renew.
-pub fn order_only(current: Option<&Lease>, claim: &Lease, claim_ts: u64) -> ClaimOutcome {
-    match current {
-        Some(cur) if cur.holder != claim.holder && cur.expires_at_ms > claim_ts => {
-            ClaimOutcome::Lost
-        }
-        _ => ClaimOutcome::Granted,
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Views {
     pub board: BTreeMap<TaskId, Task>,
-    /// Current holder per path. Expired entries stay until replaced; filter with
-    /// [`Views::active_leases`].
-    pub leases: BTreeMap<String, Lease>,
+    /// All lease claims and releases; query with [`Views::active_leases`]
+    /// and [`Views::claim_state`].
+    pub leases: LeaseBook,
     pub decisions: Vec<DecisionRec>,
     pub members: BTreeMap<AgentRef, Member>,
+    /// Pinned Genesis event id (from the ticket). Only that Genesis counts.
+    pub genesis: Option<EventId>,
+    /// Owner named by the pinned Genesis, once it has been applied.
+    pub owner: Option<NodeId>,
+    /// Explicit grants. Nodes without one are members.
+    pub roles: BTreeMap<NodeId, Role>,
+    /// Events stored but ignored because their author lacked permission.
+    pub ignored: u64,
 }
 
 impl Views {
-    /// Leases still valid at `now_ms`.
-    pub fn active_leases(&self, now_ms: u64) -> impl Iterator<Item = (&String, &Lease)> {
-        self.leases
-            .iter()
-            .filter(move |(_, l)| l.expires_at_ms > now_ms)
+    /// Empty views anchored to `genesis` (if known).
+    pub fn new(genesis: Option<EventId>) -> Self {
+        Self {
+            genesis,
+            ..Self::default()
+        }
+    }
+
+    /// Role of `node`: the genesis owner is always `Owner`; otherwise its
+    /// latest grant, else `Member`.
+    pub fn role_of(&self, node: &NodeId) -> Role {
+        if self.owner.as_ref() == Some(node) {
+            return Role::Owner;
+        }
+        self.roles.get(node).copied().unwrap_or(Role::Member)
+    }
+
+    /// Path → lease for every winning claim at `now_ms`.
+    pub fn active_leases(&self, now_ms: u64) -> btree_map::IntoIter<String, Lease> {
+        self.leases.active(now_ms).into_iter()
+    }
+
+    /// Lease state of claim `id` at `now_ms` (see [`crate::settle`]).
+    pub fn claim_state(&self, id: &EventId, now_ms: u64) -> Option<ClaimState> {
+        self.leases.state(id, now_ms)
     }
 
     /// Apply one event. Callers must apply events in ascending [`OrderKey`].
-    ///
-    /// `effective_ts` is the time used for lease TTLs and conflicts:
-    /// `min(e.ts, received_at)` (see [`effective_ts`]), so a future-dated
-    /// claim cannot hold a lease past its TTL.
-    pub fn apply(&mut self, e: &Event, effective_ts: u64, policy: ClaimPolicy) {
+    pub fn apply(&mut self, e: &Event) {
+        if let EventBody::Genesis { owner } = &e.body {
+            if self.genesis == Some(e.id) && self.owner.is_none() {
+                self.owner = Some(*owner);
+            } else {
+                self.ignored += 1;
+            }
+            return;
+        }
+        let role = self.role_of(&e.author.node);
+        if !role.may(e.kind()) {
+            self.ignored += 1;
+            return;
+        }
         let member = self
             .members
             .entry(e.author.clone())
@@ -126,8 +133,8 @@ impl Views {
         member.last_lamport = member.last_lamport.max(e.lamport);
 
         match &e.body {
-            EventBody::Join { role } => {
-                member.role = Some(*role);
+            EventBody::Join { .. } => {
+                member.role = Some(role);
                 member.present = true;
             }
             EventBody::Leave => member.present = false,
@@ -153,25 +160,13 @@ impl Views {
                     t.updated = e.id;
                 }
             }
-            EventBody::LeaseClaim { paths, ttl_secs } => {
-                let claim = Lease {
-                    holder: e.author.clone(),
-                    claim: e.id,
-                    lamport: e.lamport,
-                    expires_at_ms: effective_ts.saturating_add(u64::from(*ttl_secs) * 1000),
-                };
-                for p in paths {
-                    if policy(self.leases.get(p), &claim, effective_ts) == ClaimOutcome::Granted {
-                        self.leases.insert(p.clone(), claim.clone());
-                    }
+            EventBody::LeaseClaim { .. } => {
+                if let Some(c) = ClaimRec::from_event(e) {
+                    self.leases.add_claim(c);
                 }
             }
-            EventBody::LeaseRelease { paths } => {
-                for p in paths {
-                    if self.leases.get(p).is_some_and(|l| l.holder == e.author) {
-                        self.leases.remove(p);
-                    }
-                }
+            EventBody::LeaseRelease { claim } => {
+                self.leases.add_release(e.author.node, order_key(e), *claim);
             }
             EventBody::Decision {
                 title,
@@ -185,6 +180,19 @@ impl Views {
                 rationale: rationale.clone(),
                 refs: refs.clone(),
             }),
+            EventBody::RoleGrant { node, role } => {
+                // The genesis owner can't be demoted.
+                if self.owner.as_ref() != Some(node) {
+                    self.roles.insert(*node, *role);
+                    for (who, m) in &mut self.members {
+                        if who.node == *node && m.role.is_some() {
+                            m.role = Some(*role);
+                        }
+                    }
+                }
+            }
+            // Handled above.
+            EventBody::Genesis { .. } => {}
             // Read from the log directly; no materialized view yet.
             EventBody::Handoff { .. }
             | EventBody::Ask { .. }
@@ -192,36 +200,5 @@ impl Views {
             | EventBody::Note { .. }
             | EventBody::Digest { .. } => {}
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn lease(holder: u8, exp: u64) -> Lease {
-        Lease {
-            holder: AgentRef::new(NodeId::from_bytes([holder; 32]), "x"),
-            claim: EventId::from_bytes([0; 32]),
-            lamport: Lamport(1),
-            expires_at_ms: exp,
-        }
-    }
-
-    #[test]
-    fn order_only_policy() {
-        assert_eq!(order_only(None, &lease(1, 5), 0), ClaimOutcome::Granted);
-        assert_eq!(
-            order_only(Some(&lease(1, 5)), &lease(2, 9), 4),
-            ClaimOutcome::Lost
-        );
-        assert_eq!(
-            order_only(Some(&lease(1, 5)), &lease(2, 9), 5),
-            ClaimOutcome::Granted
-        );
-        assert_eq!(
-            order_only(Some(&lease(1, 5)), &lease(1, 9), 0),
-            ClaimOutcome::Granted
-        );
     }
 }

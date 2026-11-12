@@ -12,8 +12,7 @@ use hm_net::{
     RoomSecret, SYNC_ALPN, SharedStore, SyncError, SyncMsg, SyncSince, read_frame, sync_auth,
     sync_from, write_frame,
 };
-use hm_proto::{Event, EventBody, Lamport, RoomId, TaskId, TaskStatus};
-use hm_store::settle::ClaimState;
+use hm_proto::{Event, EventBody, EventId, Lamport, RoomId, TaskId, TaskStatus};
 use hm_store::{Store, SyncCaps, now_ms};
 use iroh::endpoint::{Connection, ReadError, ReadExactError, VarInt, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -70,7 +69,7 @@ fn workload(n: u64) -> Vec<Event> {
                     ttl_secs: 60,
                 },
                 3 => EventBody::LeaseRelease {
-                    paths: vec![format!("src/{}.rs", i % 4)],
+                    claim: EventId::from_bytes([(i % 4) as u8; 32]),
                 },
                 _ => EventBody::Note {
                     scope: "s".into(),
@@ -78,7 +77,7 @@ fn workload(n: u64) -> Vec<Event> {
                 },
             };
             // Lamport roughly i/2 so authors interleave and tie.
-            Event::sign(k, room(), "ag", Lamport(i / 2 + 1), 1_000 + i, body).unwrap()
+            Event::sign(k, room(), "ag", i, Lamport(i / 2 + 1), 1_000 + i, body).unwrap()
         })
         .collect()
 }
@@ -117,15 +116,10 @@ async fn empty_node_catches_up_to_500_events() {
     assert_eq!(stats.rejected, 0);
     assert!(stats.rounds >= 8, "{stats:?}");
     assert_eq!(count(&sb), 500);
-    // Same received_at as A so lease times match exactly; other views must too.
+    // Views are pure over the signed event set (ADR-002), so they match.
     sb.lock().unwrap().rebuild_views().unwrap();
-    let mut a_views = sa.lock().unwrap().views().clone();
-    let mut b_views = sb.lock().unwrap().views().clone();
-    // Lease expiry may differ by received_at; it is clamped to min(ts, recv) and
-    // every ts here is in the past, so they are equal.
-    assert_eq!(a_views.leases, b_views.leases);
-    a_views.leases.clear();
-    b_views.leases.clear();
+    let a_views = sa.lock().unwrap().views().clone();
+    let b_views = sb.lock().unwrap().views().clone();
     assert_eq!(a_views, b_views);
     assert_eq!(snapshot(&sa), snapshot(&sb));
 
@@ -149,7 +143,18 @@ async fn partial_overlap_transfers_only_missing() {
     fill(&sb, &all[..200]);
     // B also has events A never saw; they must not be sent back or lost.
     let own: Vec<Event> = (1..=10)
-        .map(|l| Event::sign(&key_from(9), room(), "b", Lamport(l), 1, EventBody::Leave).unwrap())
+        .map(|l| {
+            Event::sign(
+                &key_from(9),
+                room(),
+                "b",
+                l,
+                Lamport(l),
+                1,
+                EventBody::Leave,
+            )
+            .unwrap()
+        })
         .collect();
     fill(&sb, &own);
     a.sync_rooms().insert(secret(), sa.clone()).unwrap();
@@ -338,8 +343,10 @@ async fn secret_must_match_store_room() {
     b.shutdown().await;
 }
 
+/// ADR-002 skew guard: a far-future event is not stored by the receiver
+/// (it waits in the bounded pending queue instead).
 #[tokio::test(flavor = "multi_thread")]
-async fn future_dated_claim_expires_by_received_at() {
+async fn future_dated_claim_is_not_stored_by_receiver() {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = (bind(&dir, "a").await, bind(&dir, "b").await);
     let (sa, sb) = (store(), store());
@@ -348,6 +355,7 @@ async fn future_dated_claim_expires_by_received_at() {
         &key_from(1),
         room(),
         "evil",
+        1,
         Lamport(1),
         far_future,
         EventBody::LeaseClaim {
@@ -356,23 +364,23 @@ async fn future_dated_claim_expires_by_received_at() {
         },
     )
     .unwrap();
-    fill(&sa, std::slice::from_ref(&claim));
+    // A's clock agrees with the claim, so A stores and serves it.
+    let r = sa
+        .lock()
+        .unwrap()
+        .append_batch_at(std::slice::from_ref(&claim), far_future)
+        .unwrap();
+    assert_eq!(r.inserted, 1);
     a.sync_rooms().insert(secret(), sa.clone()).unwrap();
 
-    let before = now_ms();
     sync_from(b.endpoint(), a.local_addr(), &secret(), &sb)
         .await
         .unwrap();
-    let after = now_ms();
-
     {
         let s = sb.lock().unwrap();
-        let exp = s.views().leases["src/**"].expires_at_ms;
-        assert!((before + 5_000..=after + 5_000).contains(&exp), "{exp}");
-        assert_eq!(
-            s.claim_state(&claim.id, after + 5_000).unwrap(),
-            Some(ClaimState::Expired)
-        );
+        assert_eq!(s.event_count().unwrap(), 0);
+        assert_eq!(s.pending_len(), 1);
+        assert_eq!(s.views().active_leases(far_future).count(), 0);
     }
     a.shutdown().await;
     b.shutdown().await;

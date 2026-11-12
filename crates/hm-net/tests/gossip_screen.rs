@@ -14,6 +14,7 @@ fn note(room: RoomId, text: &str) -> Event {
         &key(),
         room,
         "a",
+        1,
         Lamport(1),
         1,
         EventBody::Note {

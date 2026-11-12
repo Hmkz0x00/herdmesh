@@ -298,11 +298,16 @@ impl RoomSession {
 
     /// Sign `body` as us, store it, broadcast it.
     pub async fn publish(&mut self, body: EventBody) -> Result<Event, SessionError> {
-        let lamport = self.lock()?.next_lamport()?;
+        let me = NodeId::from_verifying_key(&self.key.verifying_key());
+        let (seq, lamport) = {
+            let s = self.lock()?;
+            (s.next_seq(&me)?, s.next_lamport()?)
+        };
         let ev = Event::sign(
             &self.key,
             self.id,
             self.cfg.agent_name.clone(),
+            seq,
             lamport,
             now_ms(),
             body,
@@ -348,6 +353,7 @@ impl RoomSession {
                 match appended {
                     Ok(AppendOutcome::Inserted) => Ok(event_line(&ev)),
                     Ok(AppendOutcome::Duplicate) => Ok(format!("{} (duplicate)", event_line(&ev))),
+                    Ok(AppendOutcome::Deferred) => Ok(format!("{} (deferred)", event_line(&ev))),
                     Err(e) => Err(e),
                 }
             }
@@ -436,7 +442,7 @@ pub fn render_status(
         let _ = writeln!(
             s,
             "  {} by {} ({left}s left)",
-            sanitize_display(path, TEXT_MAX),
+            sanitize_display(&path, TEXT_MAX),
             short_agent(&l.holder)
         );
     }
@@ -495,7 +501,7 @@ mod tests {
     use super::*;
     use crate::data::RoleName;
     use hm_proto::{Lamport, TaskId};
-    use hm_store::{Lease, Member, Task};
+    use hm_store::{ClaimRec, Member, Task};
 
     fn agent(n: u8, name: &str) -> AgentRef {
         AgentRef::new(NodeId::from_bytes([n; 32]), name)
@@ -516,24 +522,19 @@ mod tests {
             },
         );
         let ev = hm_proto::EventId::from_bytes([0; 32]);
-        v.leases.insert(
-            "src/net/**".into(),
-            Lease {
+        for (n, path, lamport, ts, ttl_secs) in [
+            (1u8, "src/net/**", 2, 10_000, 60), // expires at 70_000
+            (2u8, "old/**", 1, 0, 5),           // expires at 5_000
+        ] {
+            v.leases.add_claim(ClaimRec {
+                id: hm_proto::EventId::from_bytes([n; 32]),
                 holder: agent(1, "lead"),
-                claim: ev,
-                lamport: Lamport(2),
-                expires_at_ms: 70_000,
-            },
-        );
-        v.leases.insert(
-            "old/**".into(),
-            Lease {
-                holder: agent(1, "lead"),
-                claim: ev,
-                lamport: Lamport(1),
-                expires_at_ms: 5_000,
-            },
-        );
+                lamport: Lamport(lamport),
+                ts,
+                paths: vec![path.into()],
+                ttl_secs,
+            });
+        }
         for (tid, title, status) in [
             ("t-1", "open one", TaskStatus::Open),
             ("t-2", "done one", TaskStatus::Done),
@@ -637,15 +638,14 @@ mod tests {
             },
         );
         let ev = hm_proto::EventId::from_bytes([0; 32]);
-        v.leases.insert(
-            format!("src/{evil}"),
-            Lease {
-                holder: who.clone(),
-                claim: ev,
-                lamport: Lamport(1),
-                expires_at_ms: 70_000,
-            },
-        );
+        v.leases.add_claim(ClaimRec {
+            id: hm_proto::EventId::from_bytes([9; 32]),
+            holder: who.clone(),
+            lamport: Lamport(1),
+            ts: 0,
+            paths: vec![format!("src/{evil}")],
+            ttl_secs: 60,
+        });
         v.board.insert(
             TaskId::new("t-1").unwrap(),
             Task {
@@ -686,6 +686,7 @@ mod tests {
             &SigningKey::from_bytes(&[4; 32]),
             RoomId::from_bytes([1; 32]),
             evil,
+            1,
             Lamport(1),
             1,
             EventBody::Note {

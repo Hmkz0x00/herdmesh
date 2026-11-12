@@ -1,25 +1,32 @@
-//! Lease settle semantics (ADR-001 note 2). Pure functions, no I/O.
+//! The lease model (ADR-001 note 2, ADR-002 §1). Pure, no I/O, no clock:
+//! every time-based answer takes `now` (unix millis) as an argument.
+//!
+//! This module is the single source of truth for leases. [`crate::Views`]
+//! keeps a [`LeaseBook`] and asks it; [`claim_state`] builds one from a slice
+//! of events for callers without a store.
 //!
 //! # Rule
-//! Given the room's `LeaseClaim` / `LeaseRelease` events and a wall-clock
-//! `now` (unix millis), a claim is, in this order of precedence:
+//! A `LeaseClaim` names a set of path globs and a TTL. At time `now` a claim
+//! is, in this order of precedence:
 //!
-//! 1. **Released**: a `LeaseRelease` exists from the *same author node*, with
-//!    a higher Lamport than the claim, whose paths overlap the claim's.
-//!    Releases from other nodes are ignored.
-//! 2. **Expired**: `now >= claim.ts + ttl_secs * 1000`.
-//! 3. Otherwise the claim is *live* and competes with every other live claim:
-//!    live claims are sorted by `(lamport, author node, event id)` and walked
-//!    lowest-first; a claim **wins** unless it overlaps a claim that already
-//!    won. A claim that lost does not block anyone. So the result depends only
-//!    on the set of events, never on the order they arrived.
-//!    - not a winner → **Lost { winner }** (the lowest-keyed winner it overlaps)
-//!    - winner and `now >= claim.ts + settle_ms` → **Granted**
+//! 1. **Released**: a `LeaseRelease { claim }` naming it exists from the
+//!    claim's *author node*. Releases from other nodes are ignored.
+//! 2. **Renewed { by }**: a later claim by the same holder (node + agent)
+//!    covers a superset of its paths, was signed (`ts`) before it expired,
+//!    and no release of it sorts before that renewal. The renewal takes over
+//!    the original's place in line (its *root*). `by` is the latest renewal.
+//! 3. **Expired**: `now >= ts + min(ttl, MAX_LEASE_TTL)`.
+//! 4. Otherwise it is *live*. Live claims are sorted by (root's order key,
+//!    own order key) and walked lowest-first; a claim **wins** unless one of
+//!    its paths overlaps a winner held by someone else. Sets are atomic: a
+//!    claim wins all of its paths or none, and a loser blocks nobody.
+//!    - not a winner → **Lost { winner }** (the first winner it overlaps)
+//!    - winner and `now >= root.ts + settle_ms` → **Granted**
 //!    - winner inside the settle window → **Pending**
 //!
-//! "Granted" is relative to the events seen so far: a lower-keyed conflicting
-//! claim that arrives late still flips it to Lost; the settle window
-//! ([`SETTLE_MS`]) makes that unlikely in practice.
+//! Everything above reads only signed fields, so the result depends on the
+//! event set and `now`, never on arrival order. Local arrival times (for the
+//! "conflict seen recently" safety check) live in the store, not here.
 //!
 //! # Path overlap
 //! Paths are globs (`globset`, `*` does not cross `/`). Two patterns overlap
@@ -30,7 +37,13 @@
 //! prefix-compatible. That can over-report overlap between two globs, which
 //! is the safe direction for a lease.
 
-use hm_proto::{Event, EventBody, EventId};
+use std::collections::{BTreeMap, BTreeSet};
+
+use hm_proto::limits::MAX_LEASE_TTL_SECS;
+use hm_proto::{AgentRef, Event, EventBody, EventId, Lamport, NodeId};
+use serde::{Deserialize, Serialize};
+
+use crate::views::{OrderKey, order_key};
 
 /// Default settle window in milliseconds.
 pub const SETTLE_MS: u64 = 2000;
@@ -51,6 +64,11 @@ pub enum ClaimState {
     Expired,
     /// Released by the claim's author node.
     Released,
+    /// Superseded by a renewal from the same holder.
+    Renewed {
+        /// The latest renewing claim.
+        by: EventId,
+    },
 }
 
 const GLOB_META: &[char] = &['*', '?', '[', '{', '\\'];
@@ -90,40 +108,274 @@ fn sets_overlap(a: &[String], b: &[String]) -> bool {
     a.iter().any(|x| b.iter().any(|y| paths_overlap(x, y)))
 }
 
-struct Claim<'a> {
-    ev: &'a Event,
-    paths: &'a [String],
-    ttl_secs: u32,
+/// The signed facts of one `LeaseClaim`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimRec {
+    pub id: EventId,
+    pub holder: AgentRef,
+    pub lamport: Lamport,
+    pub ts: u64,
+    pub paths: Vec<String>,
+    pub ttl_secs: u32,
 }
 
-fn as_claim(ev: &Event) -> Option<Claim<'_>> {
-    match &ev.body {
-        EventBody::LeaseClaim { paths, ttl_secs } => Some(Claim {
-            ev,
-            paths,
-            ttl_secs: *ttl_secs,
-        }),
-        _ => None,
+impl ClaimRec {
+    /// `Some` if `e` is a `LeaseClaim`.
+    pub fn from_event(e: &Event) -> Option<Self> {
+        match &e.body {
+            EventBody::LeaseClaim { paths, ttl_secs } => Some(Self {
+                id: e.id,
+                holder: e.author.clone(),
+                lamport: e.lamport,
+                ts: e.ts,
+                paths: paths.clone(),
+                ttl_secs: *ttl_secs,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn key(&self) -> OrderKey {
+        (self.lamport, self.holder.node, self.id)
+    }
+
+    /// `ts + min(ttl, MAX_LEASE_TTL)`.
+    pub fn expires_at_ms(&self) -> u64 {
+        let ttl = self.ttl_secs.min(MAX_LEASE_TTL_SECS);
+        self.ts.saturating_add(u64::from(ttl) * 1000)
+    }
+
+    fn expired(&self, now: u64) -> bool {
+        now >= self.expires_at_ms()
     }
 }
 
-fn is_released(c: &Claim<'_>, events: &[Event]) -> bool {
-    events.iter().any(|ev| match &ev.body {
-        EventBody::LeaseRelease { paths } => {
-            ev.room == c.ev.room
-                && ev.author.node == c.ev.author.node
-                && ev.lamport > c.ev.lamport
-                && sets_overlap(paths, c.paths)
-        }
-        _ => false,
-    })
+/// A lease currently won by a claim; see [`LeaseBook::active`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lease {
+    pub holder: AgentRef,
+    pub claim: EventId,
+    pub lamport: Lamport,
+    pub expires_at_ms: u64,
 }
 
-fn is_expired(c: &Claim<'_>, now: u64) -> bool {
-    now >= c
-        .ev
-        .ts
-        .saturating_add(u64::from(c.ttl_secs).saturating_mul(1000))
+/// All claims and releases seen, as signed data. Answers are computed per
+/// call from `now`; nothing time-based is stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseBook {
+    claims: BTreeMap<EventId, ClaimRec>,
+    /// claim id → per releasing node, the lowest order key of its releases.
+    releases: BTreeMap<EventId, BTreeMap<NodeId, OrderKey>>,
+}
+
+/// Derived, per-call structure: renewal links and roots.
+struct Resolved<'a> {
+    book: &'a LeaseBook,
+    /// child → parent it renews.
+    parent: BTreeMap<EventId, EventId>,
+    /// parent → latest child renewing it.
+    renewed_by: BTreeMap<EventId, EventId>,
+}
+
+impl<'a> Resolved<'a> {
+    fn new(book: &'a LeaseBook) -> Self {
+        let mut parent = BTreeMap::new();
+        let mut renewed_by: BTreeMap<EventId, (OrderKey, EventId)> = BTreeMap::new();
+        let mut by_holder: BTreeMap<&AgentRef, Vec<&ClaimRec>> = BTreeMap::new();
+        for c in book.claims.values() {
+            by_holder.entry(&c.holder).or_default().push(c);
+        }
+        for list in by_holder.values_mut() {
+            list.sort_by_key(|c| c.key());
+            for (i, child) in list.iter().enumerate() {
+                let have: BTreeSet<&String> = child.paths.iter().collect();
+                // Most recent earlier claim this one can renew.
+                let found = list[..i].iter().rev().find(|p| {
+                    child.ts < p.expires_at_ms()
+                        && p.paths.iter().all(|x| have.contains(x))
+                        && !book.released_before(p, Some(child.key()))
+                });
+                if let Some(p) = found {
+                    parent.insert(child.id, p.id);
+                    let e = renewed_by.entry(p.id).or_insert((child.key(), child.id));
+                    if child.key() > e.0 {
+                        *e = (child.key(), child.id);
+                    }
+                }
+            }
+        }
+        Self {
+            book,
+            parent,
+            renewed_by: renewed_by.into_iter().map(|(k, (_, v))| (k, v)).collect(),
+        }
+    }
+
+    fn root(&self, id: &EventId) -> Option<&'a ClaimRec> {
+        let mut cur = *id;
+        // Parent keys strictly decrease, so this terminates.
+        while let Some(p) = self.parent.get(&cur) {
+            cur = *p;
+        }
+        self.book.claims.get(&cur)
+    }
+
+    fn live(&self, c: &ClaimRec, now: u64) -> bool {
+        !self.book.released_before(c, None)
+            && !self.renewed_by.contains_key(&c.id)
+            && !c.expired(now)
+    }
+
+    /// Winners at `now` in priority order, and the full sorted live list.
+    fn walk(&self, now: u64) -> Vec<(&'a ClaimRec, Option<EventId>)> {
+        let mut live: Vec<(OrderKey, &'a ClaimRec)> = self
+            .book
+            .claims
+            .values()
+            .filter(|c| self.live(c, now))
+            .map(|c| (self.root(&c.id).map_or(c.key(), ClaimRec::key), c))
+            .collect();
+        live.sort_by_key(|(root, c)| (*root, c.key()));
+        let mut winners: Vec<&ClaimRec> = Vec::new();
+        let mut out = Vec::with_capacity(live.len());
+        for (_, c) in live {
+            let beaten = winners
+                .iter()
+                .find(|w| w.holder != c.holder && sets_overlap(&w.paths, &c.paths))
+                .map(|w| w.id);
+            if beaten.is_none() {
+                winners.push(c);
+            }
+            out.push((c, beaten));
+        }
+        out
+    }
+}
+
+impl LeaseBook {
+    /// Record a claim. Idempotent.
+    pub fn add_claim(&mut self, c: ClaimRec) {
+        self.claims.insert(c.id, c);
+    }
+
+    /// Record that node `by` released `claim` with an event of order `key`.
+    pub fn add_release(&mut self, by: NodeId, key: OrderKey, claim: EventId) {
+        let e = self
+            .releases
+            .entry(claim)
+            .or_default()
+            .entry(by)
+            .or_insert(key);
+        if key < *e {
+            *e = key;
+        }
+    }
+
+    pub fn claim(&self, id: &EventId) -> Option<&ClaimRec> {
+        self.claims.get(id)
+    }
+
+    pub fn claims(&self) -> impl Iterator<Item = &ClaimRec> {
+        self.claims.values()
+    }
+
+    /// Released by the claim's own node (before `before`, if given).
+    fn released_before(&self, c: &ClaimRec, before: Option<OrderKey>) -> bool {
+        self.releases
+            .get(&c.id)
+            .and_then(|m| m.get(&c.holder.node))
+            .is_some_and(|k| before.is_none_or(|b| *k < b))
+    }
+
+    /// State of claim `id` at `now` with the default settle window.
+    pub fn state(&self, id: &EventId, now: u64) -> Option<ClaimState> {
+        self.state_with(id, now, SETTLE_MS)
+    }
+
+    /// State of claim `id` at `now`. `None` if `id` is not a known claim.
+    pub fn state_with(&self, id: &EventId, now: u64, settle_ms: u64) -> Option<ClaimState> {
+        let target = self.claims.get(id)?;
+        if self.released_before(target, None) {
+            return Some(ClaimState::Released);
+        }
+        let r = Resolved::new(self);
+        if let Some(by) = r.renewed_by.get(id) {
+            return Some(ClaimState::Renewed { by: *by });
+        }
+        if target.expired(now) {
+            return Some(ClaimState::Expired);
+        }
+        let (_, beaten) = r.walk(now).into_iter().find(|(c, _)| c.id == *id)?;
+        if let Some(winner) = beaten {
+            return Some(ClaimState::Lost { winner });
+        }
+        let root_ts = r.root(id).map_or(target.ts, |c| c.ts);
+        Some(if now >= root_ts.saturating_add(settle_ms) {
+            ClaimState::Granted
+        } else {
+            ClaimState::Pending
+        })
+    }
+
+    /// Path → lease for every winning claim at `now` (pending or granted).
+    pub fn active(&self, now: u64) -> BTreeMap<String, Lease> {
+        let mut out: BTreeMap<String, Lease> = BTreeMap::new();
+        for (c, beaten) in Resolved::new(self).walk(now) {
+            if beaten.is_some() {
+                continue;
+            }
+            for p in &c.paths {
+                let lease = Lease {
+                    holder: c.holder.clone(),
+                    claim: c.id,
+                    lamport: c.lamport,
+                    expires_at_ms: c.expires_at_ms(),
+                };
+                match out.get(p) {
+                    Some(cur) if cur.expires_at_ms >= lease.expires_at_ms => {}
+                    _ => {
+                        out.insert(p.clone(), lease);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Claims by other holders whose paths overlap claim `id`'s, and that
+    /// are not released, renewed or expired at `now`.
+    pub fn conflicting(&self, id: &EventId, now: u64) -> Vec<EventId> {
+        let Some(target) = self.claims.get(id) else {
+            return Vec::new();
+        };
+        let r = Resolved::new(self);
+        self.claims
+            .values()
+            .filter(|c| c.holder != target.holder && sets_overlap(&c.paths, &target.paths))
+            .filter(|c| r.live(c, now))
+            .map(|c| c.id)
+            .collect()
+    }
+}
+
+/// Build a book from raw events (no role checks). Releases count only from
+/// the claim's node, as everywhere.
+pub fn book_from_events(events: &[Event]) -> LeaseBook {
+    let mut book = LeaseBook::default();
+    for e in events {
+        match &e.body {
+            EventBody::LeaseClaim { .. } => {
+                if let Some(c) = ClaimRec::from_event(e) {
+                    book.add_claim(c);
+                }
+            }
+            EventBody::LeaseRelease { claim } => {
+                book.add_release(e.author.node, order_key(e), *claim);
+            }
+            _ => {}
+        }
+    }
+    book
 }
 
 /// [`claim_state_with`] using the default [`SETTLE_MS`].
@@ -131,8 +383,7 @@ pub fn claim_state(claim_id: &EventId, events: &[Event], now: u64) -> Option<Cla
     claim_state_with(claim_id, events, now, SETTLE_MS)
 }
 
-/// State of the `LeaseClaim` event `claim_id` at time `now` (unix millis).
-///
+/// State of the `LeaseClaim` event `claim_id` among `events` at `now`.
 /// Returns `None` if `claim_id` is not a `LeaseClaim` in `events`.
 pub fn claim_state_with(
     claim_id: &EventId,
@@ -140,46 +391,5 @@ pub fn claim_state_with(
     now: u64,
     settle_ms: u64,
 ) -> Option<ClaimState> {
-    let target = events
-        .iter()
-        .filter(|e| e.id == *claim_id)
-        .find_map(as_claim)?;
-    if is_released(&target, events) {
-        return Some(ClaimState::Released);
-    }
-    if is_expired(&target, now) {
-        return Some(ClaimState::Expired);
-    }
-
-    let mut live: Vec<Claim<'_>> = events
-        .iter()
-        .filter(|e| e.room == target.ev.room)
-        .filter_map(as_claim)
-        .filter(|c| !is_released(c, events) && !is_expired(c, now))
-        .collect();
-    live.sort_by(|a, b| {
-        (a.ev.lamport, a.ev.author.node, a.ev.id).cmp(&(b.ev.lamport, b.ev.author.node, b.ev.id))
-    });
-    live.dedup_by(|a, b| a.ev.id == b.ev.id);
-
-    let mut winners: Vec<&Claim<'_>> = Vec::new();
-    for c in &live {
-        if let Some(w) = winners.iter().find(|w| sets_overlap(w.paths, c.paths)) {
-            if c.ev.id == *claim_id {
-                return Some(ClaimState::Lost { winner: w.ev.id });
-            }
-            continue;
-        }
-        if c.ev.id == *claim_id {
-            let settled = now >= c.ev.ts.saturating_add(settle_ms);
-            return Some(if settled {
-                ClaimState::Granted
-            } else {
-                ClaimState::Pending
-            });
-        }
-        winners.push(c);
-    }
-    // Unreachable: target is live and therefore in `live`.
-    None
+    book_from_events(events).state_with(claim_id, now, settle_ms)
 }
