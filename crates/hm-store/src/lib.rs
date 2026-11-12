@@ -10,10 +10,10 @@ mod store;
 mod views;
 
 pub use error::StoreError;
-pub use store::{AppendOutcome, Store};
+pub use store::{AppendOutcome, BatchReport, Store, SyncCaps, now_ms};
 pub use views::{
-    ClaimOutcome, ClaimPolicy, DecisionRec, Lease, Member, OrderKey, Task, Views, next_lamport,
-    order_key, order_only,
+    ClaimOutcome, ClaimPolicy, DecisionRec, Lease, Member, OrderKey, Task, Views, effective_ts,
+    next_lamport, order_key, order_only,
 };
 
 /// Crate name, used by `herdmesh doctor` and tests to prove linkage.
