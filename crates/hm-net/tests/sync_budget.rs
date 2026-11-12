@@ -224,11 +224,10 @@ async fn serving(dir: &tempfile::TempDir, n: u64, limits: SyncLimits) -> Net {
 }
 
 fn request(from: &Net, to: &Net) -> SyncSince {
-    SyncSince {
-        room: room(),
-        have: vec![],
-        auth: sync_auth(&secret(), from.endpoint().id(), to.endpoint().id(), room()),
-    }
+    SyncSince::everything(
+        room(),
+        sync_auth(&secret(), from.endpoint().id(), to.endpoint().id(), room()),
+    )
 }
 
 /// One valid request on `conn`: (event frames, outcome).

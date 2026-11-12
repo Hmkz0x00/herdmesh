@@ -3,10 +3,22 @@
 //! Gossip is best-effort with no history, so late joiners and returning peers
 //! pull what they lack directly from a member:
 //!
-//! - One bi-stream per request. Client sends [`SyncSince`] (room, per-author
-//!   max-lamport vector, auth tag); server streams [`SyncMsg::Event`] frames
-//!   for events the client lacks, then [`SyncMsg::End`] `{ more }`. Responses
-//!   are capped ([`SyncCaps`]); the client re-asks while `more`.
+//! - **Per-author sequences** (ADR-002 §3, wire v2). Every author numbers
+//!   its events 1, 2, 3... The client describes what it holds as a page of
+//!   [`AuthorWant`]s `(author, have_hi, holes)`: "I have every seq up to
+//!   `have_hi` except `holes`". The server answers with its indexed
+//!   per-author range queries (`Store::events_for`, LIMIT-ed), never a scan
+//!   of the log. Authors the page does not list but whose id falls in the
+//!   page's `(from, to]` range are sent from seq 1, so unknown authors are
+//!   discovered. Many authors are split into pages of at most
+//!   [`MAX_AUTHORS_PER_REQUEST`], so a request always fits
+//!   [`MAX_REQUEST_FRAME`].
+//! - One bi-stream per request. Server streams [`SyncMsg::Event`] frames,
+//!   then [`SyncMsg::End`] `{ more }`. Responses are capped ([`SyncCaps`]);
+//!   the client re-asks the same page while `more` and it made progress,
+//!   cycles through windows of its holes, then moves to the next page.
+//!   `have_hi` is always the client's highest seq, so new events always
+//!   flow even while some holes can't be filled by anyone.
 //! - Frame: `u32 BE length || SYNC_VERSION || postcard(msg)`. The server reads
 //!   requests with [`MAX_REQUEST_FRAME`]; only clients accept the larger
 //!   [`MAX_RESPONSE_FRAME`].
@@ -25,12 +37,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
-use hm_proto::{Event, Lamport, NodeId, RoomId};
-use hm_store::{Store, StoreError, SyncCaps};
+use hm_proto::{Event, NodeId, RoomId};
+use hm_store::{AuthorSeqs, Store, StoreError, SyncCaps};
 use iroh::endpoint::{
     ClosedStream, ConnectError, Connection, ConnectionError, ReadError, ReadExactError, RecvStream,
     SendStream, VarInt, WriteError,
@@ -44,7 +57,7 @@ use crate::net::SYNC_ALPN;
 use crate::ticket::RoomSecret;
 
 /// Version byte at the start of every frame payload.
-pub const SYNC_VERSION: u8 = 1;
+pub const SYNC_VERSION: u8 = 2;
 /// Largest request frame a server reads (before auth, so kept small).
 pub const MAX_REQUEST_FRAME: usize = 64 << 10;
 /// Largest response frame (one event) a client reads.
@@ -56,6 +69,14 @@ pub const MAX_RESPONSE_BYTES: usize = 2 * SyncCaps::DEFAULT.max_bytes;
 pub const MAX_ROUNDS: usize = 1024;
 /// Default cap on event bytes per connection (server) / sync run (client).
 pub const MAX_SYNC_BYTES: usize = 256 << 20;
+/// Authors listed in one request page.
+pub const MAX_AUTHORS_PER_REQUEST: usize = 256;
+/// Holes listed per author in one request.
+pub const MAX_HOLES_PER_AUTHOR: usize = 16;
+/// Hole windows a client cycles through per page: it asks about at most
+/// `MAX_HOLES_PER_AUTHOR * HOLE_WINDOWS` holes per author per sync run, so
+/// holes no peer can fill never starve the ones behind them.
+pub const HOLE_WINDOWS: usize = 8;
 /// Stream reset code for every refused request.
 pub const ERR_REFUSED: u32 = 1;
 
@@ -98,14 +119,147 @@ impl Default for SyncLimits {
 /// A store shared between the sync server, the client and the daemon.
 pub type SharedStore = Arc<Mutex<Store>>;
 
-/// Client request: "send me what I lack in `room`".
+/// What the client holds of one author: every seq in `1..=have_hi` except
+/// `holes` (ascending, each `<= have_hi`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorWant {
+    pub author: NodeId,
+    pub have_hi: u64,
+    pub holes: Vec<u64>,
+}
+
+/// Client request: "send me what I lack in `room`" for authors in the id
+/// range `(from, to]` (`None` = unbounded).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncSince {
     pub room: RoomId,
-    /// Highest lamport the client holds per author node.
-    pub have: Vec<(NodeId, Lamport)>,
+    pub from: Option<NodeId>,
+    pub to: Option<NodeId>,
+    /// Ascending by author, all inside `(from, to]`.
+    pub want: Vec<AuthorWant>,
     /// [`sync_auth`]`(secret, requester, server, room)`.
     pub auth: [u8; 32],
+}
+
+impl SyncSince {
+    /// A request for everything in `room` (empty client, one page).
+    pub fn everything(room: RoomId, auth: [u8; 32]) -> Self {
+        Self {
+            room,
+            from: None,
+            to: None,
+            want: Vec::new(),
+            auth,
+        }
+    }
+
+    fn in_range(&self, n: &NodeId) -> bool {
+        self.from.is_none_or(|f| *n > f) && self.to.is_none_or(|t| *n <= t)
+    }
+
+    /// Size limits and ordering a server enforces before answering.
+    fn well_formed(&self) -> bool {
+        self.want.len() <= MAX_AUTHORS_PER_REQUEST
+            && self.want.windows(2).all(|w| w[0].author < w[1].author)
+            && self.want.iter().all(|w| {
+                self.in_range(&w.author)
+                    && w.holes.len() <= MAX_HOLES_PER_AUTHOR
+                    && w.holes.iter().all(|h| (1..=w.have_hi).contains(h))
+            })
+            && match (self.from, self.to) {
+                (Some(f), Some(t)) => f < t,
+                _ => true,
+            }
+    }
+}
+
+/// One page of the client's per-author summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestPage {
+    pub want: Vec<AuthorWant>,
+    /// Upper bound of the page; `None` when it reaches the last author.
+    pub to: Option<NodeId>,
+    /// Hole windows the page's most holey author needs (at least 1).
+    pub windows: usize,
+}
+
+/// The page of `summary` after `from`, listing hole window `window` of each
+/// author (summary from `Store::seq_summary(MAX_HOLES_PER_AUTHOR *
+/// HOLE_WINDOWS)`).
+pub fn request_page(
+    summary: &BTreeMap<NodeId, AuthorSeqs>,
+    from: Option<NodeId>,
+    window: usize,
+) -> RequestPage {
+    let lo = from.map_or(Bound::Unbounded, Bound::Excluded);
+    let mut rest = summary.range((lo, Bound::Unbounded));
+    let mut windows = 1;
+    let want: Vec<AuthorWant> = rest
+        .by_ref()
+        .take(MAX_AUTHORS_PER_REQUEST)
+        .map(|(author, s)| {
+            let mine = s.holes.len().div_ceil(MAX_HOLES_PER_AUTHOR).max(1);
+            windows = windows.max(mine);
+            let start = (window % mine) * MAX_HOLES_PER_AUTHOR;
+            let holes = s
+                .holes
+                .iter()
+                .copied()
+                .skip(start)
+                .take(MAX_HOLES_PER_AUTHOR)
+                .collect();
+            AuthorWant {
+                author: *author,
+                have_hi: s.max,
+                holes,
+            }
+        })
+        .collect();
+    let to = if rest.next().is_some() {
+        want.last().map(|w| w.author)
+    } else {
+        None
+    };
+    RequestPage {
+        want,
+        to,
+        windows: windows.min(HOLE_WINDOWS),
+    }
+}
+
+/// Server side of one request: wire events the client lacks within `caps`,
+/// and whether more remain. Indexed per-author queries only.
+pub fn answer_request(
+    store: &Store,
+    req: &SyncSince,
+    caps: SyncCaps,
+) -> Result<(Vec<Vec<u8>>, bool), SyncError> {
+    let want: BTreeMap<NodeId, &AuthorWant> = req.want.iter().map(|w| (w.author, w)).collect();
+    let lo = req.from.map_or(Bound::Unbounded, Bound::Excluded);
+    let hi = req.to.map_or(Bound::Unbounded, Bound::Included);
+    let summary = store.seq_summary(0)?;
+    let (mut out, mut bytes) = (Vec::new(), 0usize);
+    for (author, held) in summary.range((lo, hi)) {
+        let (have_hi, holes) = want
+            .get(author)
+            .map_or((0, &[][..]), |w| (w.have_hi, w.holes.as_slice()));
+        if held.max <= have_hi && holes.is_empty() {
+            continue;
+        }
+        let left = caps.max_events.saturating_sub(out.len());
+        if left == 0 {
+            return Ok((out, true));
+        }
+        for e in store.events_for(author, have_hi, holes, left)? {
+            let wire = e.encode()?;
+            if !out.is_empty() && bytes.saturating_add(wire.len()) > caps.max_bytes {
+                return Ok((out, true));
+            }
+            bytes = bytes.saturating_add(wire.len());
+            out.push(wire);
+        }
+    }
+    Ok((out, false))
 }
 
 /// Server response frames.
@@ -159,6 +313,8 @@ pub enum SyncError {
     Join(#[from] tokio::task::JoinError),
     #[error("timed out: {0}")]
     Timeout(&'static str),
+    #[error("event encoding: {0}")]
+    Proto(#[from] hm_proto::ProtoError),
 }
 
 impl<T> From<PoisonError<T>> for SyncError {
@@ -424,16 +580,20 @@ async fn serve_stream(
     let req =
         read_frame_within::<SyncSince>(recv, MAX_REQUEST_FRAME, budget.limits.frame_deadline).await;
     let authorized = match req {
-        Ok(req) => budget
+        Ok(req) if req.well_formed() => budget
             .rooms
             .authorize(&req, budget.remote, budget.local)?
-            .map(|(store, caps)| (store, caps, req.have)),
+            .map(|(store, caps)| (store, caps, req)),
+        Ok(_) => {
+            tracing::debug!("malformed sync request");
+            None
+        }
         Err(e) => {
             tracing::debug!(error = %e, "bad sync request");
             None
         }
     };
-    let Some((store, caps, have)) = authorized else {
+    let Some((store, caps, req)) = authorized else {
         refuse(send, recv);
         return Ok(());
     };
@@ -447,9 +607,8 @@ async fn serve_stream(
         max_bytes: caps.max_bytes.min(left),
         ..caps
     };
-    let have: BTreeMap<NodeId, Lamport> = have.into_iter().collect();
     let answer = tokio::task::spawn_blocking(move || -> Result<_, SyncError> {
-        Ok(store.lock()?.missing_events(&have, caps)?)
+        answer_request(&*store.lock()?, &req, caps)
     })
     .await?;
     let (mut events, mut more) = match answer {
@@ -550,6 +709,22 @@ pub struct SyncStats {
     pub duplicates: usize,
     /// Undecodable, unverifiable or wrong-room events dropped.
     pub rejected: usize,
+    /// Future-dated events parked by the store's skew guard.
+    pub deferred: usize,
+    /// Events with the same (author, seq) as another, different event.
+    pub equivocations: usize,
+}
+
+/// Outcome of one [`sync_page`] round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageRound {
+    /// Server cut the response short.
+    pub more: bool,
+    pub inserted: usize,
+    /// Upper bound of the page asked for; `None` = it was the last page.
+    pub to: Option<NodeId>,
+    /// Hole windows this page needs; see [`request_page`].
+    pub windows: usize,
 }
 
 /// Map a stream reset/stop with [`ERR_REFUSED`] to [`SyncError::Refused`].
@@ -608,28 +783,35 @@ async fn request_round(
     Ok((events, more))
 }
 
-/// One request/response round within `limits.request_deadline`. `local` is
-/// this node's endpoint id. Returns whether another round is worthwhile
-/// (server said `more` and we progressed).
-pub async fn sync_once(
+/// One request/response round for the summary page after `from`, within
+/// `limits.request_deadline`. `local` is this node's endpoint id.
+#[allow(clippy::too_many_arguments)]
+pub async fn sync_page(
     conn: &Connection,
     local: EndpointId,
     secret: &RoomSecret,
     store: &SharedStore,
     stats: &mut SyncStats,
     limits: &SyncLimits,
-) -> Result<bool, SyncError> {
-    let req = {
+    from: Option<NodeId>,
+    window: usize,
+) -> Result<PageRound, SyncError> {
+    let (req, to, windows) = {
         let s = store.lock()?;
         let room = s.room();
         if room != secret.room_id() {
             return Err(SyncError::RoomMismatch);
         }
-        SyncSince {
+        let summary = s.seq_summary(MAX_HOLES_PER_AUTHOR * HOLE_WINDOWS)?;
+        let page = request_page(&summary, from, window);
+        let req = SyncSince {
             room,
-            have: s.have()?.into_iter().collect(),
+            from,
+            to: page.to,
+            want: page.want,
             auth: sync_auth(secret, local, conn.remote_id(), room),
-        }
+        };
+        (req, page.to, page.windows)
     };
     let (events, more) = within(
         limits.request_deadline,
@@ -647,20 +829,28 @@ pub async fn sync_once(
     stats.inserted += report.inserted;
     stats.duplicates += report.duplicates;
     stats.rejected += report.rejected;
+    stats.deferred += report.deferred;
+    stats.equivocations += report.equivocations;
     tracing::debug!(
         inserted = report.inserted,
         rejected = report.rejected,
         more,
         "sync round"
     );
-    Ok(more && report.inserted > 0)
+    Ok(PageRound {
+        more,
+        inserted: report.inserted,
+        to,
+        windows,
+    })
 }
 
-/// Pull everything `conn`'s peer has that `store` lacks.
+/// Pull everything `conn`'s peer has that `store` lacks, page by page.
 ///
-/// Stops when the server says no `more`, when a round adds nothing (so a
-/// server that keeps saying `more` can't loop us), or after
-/// `limits.max_rounds`.
+/// A page is re-asked while rounds insert something (so a server that keeps
+/// saying `more` without progress can't loop us), then once per remaining
+/// hole window, then the next page follows; at most `limits.max_rounds`
+/// rounds in total.
 pub async fn sync_with(
     conn: &Connection,
     local: EndpointId,
@@ -669,9 +859,24 @@ pub async fn sync_with(
     limits: &SyncLimits,
 ) -> Result<SyncStats, SyncError> {
     let mut stats = SyncStats::default();
-    while stats.rounds < limits.max_rounds
-        && sync_once(conn, local, secret, store, &mut stats, limits).await?
-    {}
+    let (mut from, mut window) = (None, 0);
+    while stats.rounds < limits.max_rounds {
+        let r = sync_page(conn, local, secret, store, &mut stats, limits, from, window).await?;
+        if r.inserted > 0 {
+            // Progress shifts the hole list: start its windows over.
+            window = 0;
+            continue;
+        }
+        if window + 1 < r.windows {
+            window += 1;
+            continue;
+        }
+        window = 0;
+        match r.to {
+            Some(to) => from = Some(to),
+            None => break,
+        }
+    }
     Ok(stats)
 }
 

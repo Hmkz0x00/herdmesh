@@ -12,7 +12,8 @@ use hm_proto::EventBody;
 use crate::data::{DataDir, RoleName, RoomConfig};
 use crate::display::{NAME_MAX, sanitize_display};
 use crate::session::{
-    RoomSession, SessionError, bind_net, make_ticket, now_ms, own_addr, render_status,
+    RoomSession, SessionError, bind_net, init_genesis, make_ticket, now_ms, own_addr, pin_genesis,
+    render_status, room_genesis,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -43,11 +44,12 @@ pub async fn create(data: &DataDir, name: &str, agent: &str) -> Result<String, R
     let relay = data.load_config()?.relay()?;
     let secret = RoomSecret::generate()?;
     let id = data.create_room(&secret, &RoomConfig::new(name, RoleName::Owner, agent), &[])?;
+    let genesis = init_genesis(data, id, agent)?;
     let net = bind_net(data, relay.clone()).await?;
     let own = own_addr(&net, &relay, ONLINE_WAIT).await;
     let node = net.endpoint().id();
     net.shutdown().await;
-    let t = make_ticket(secret, own, vec![]);
+    let t = make_ticket(secret, genesis, own, vec![]);
     Ok(format!(
         "Created room '{name}' (id: {id})\nNode: {node}\n{}Run `herdmesh room run {name}` to go online.\n",
         ticket_block(&t)
@@ -60,10 +62,11 @@ pub async fn invite(data: &DataDir, room: &str) -> Result<String, RoomError> {
     let (id, cfg) = data.resolve_room(room)?;
     let secret = data.load_secret(&id, &cfg)?;
     let peers = data.load_peers(&id)?;
+    let genesis = room_genesis(data, id)?;
     let net = bind_net(data, relay.clone()).await?;
     let own = own_addr(&net, &relay, ONLINE_WAIT).await;
     net.shutdown().await;
-    Ok(ticket_block(&make_ticket(secret, own, peers)))
+    Ok(ticket_block(&make_ticket(secret, genesis, own, peers)))
 }
 
 /// `room join <ticket> [--as <agent>] [--name <name>]`: local state only.
@@ -81,6 +84,8 @@ pub fn join(
         &RoomConfig::new(&name, RoleName::Member, agent),
         &t.bootstrap,
     )?;
+    // Roles are anchored to the creator's Genesis; it arrives by sync.
+    pin_genesis(data, id, t.genesis)?;
     Ok(format!(
         "Joined room '{name}' (id: {id}) as {agent}, {} bootstrap peer(s).\nRun `herdmesh room run {name}` to connect.\n",
         t.bootstrap.len()
