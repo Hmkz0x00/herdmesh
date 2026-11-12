@@ -1,0 +1,24 @@
+[package]
+name = "herdmesh"
+description = "herdmesh CLI: rooms, daemon, MCP server, doctor."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hm-daemon.workspace = true
+hm-mcp.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

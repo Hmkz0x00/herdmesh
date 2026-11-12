@@ -1,0 +1,18 @@
+[package]
+name = "hm-daemon"
+description = "Per-machine daemon wiring store, net, brief and herdr together."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hm-proto.workspace = true
+hm-store.workspace = true
+hm-net.workspace = true
+hm-brief.workspace = true
+hm-herdr.workspace = true
