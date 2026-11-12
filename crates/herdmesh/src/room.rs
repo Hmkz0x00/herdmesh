@@ -10,6 +10,7 @@ use hm_net::{RoomSecret, RoomTicket};
 use hm_proto::EventBody;
 
 use crate::data::{DataDir, RoleName, RoomConfig};
+use crate::display::{NAME_MAX, sanitize_display};
 use crate::session::{
     RoomSession, SessionError, bind_net, make_ticket, now_ms, own_addr, render_status,
 };
@@ -144,8 +145,8 @@ pub async fn run(
     let mut s = RoomSession::open(data, id, relay).await?;
     out(&format!(
         "Online in '{}' as {} (node {}). Ctrl+C to exit.",
-        cfg.name,
-        cfg.agent_name,
+        sanitize_display(&cfg.name, NAME_MAX),
+        sanitize_display(&cfg.agent_name, NAME_MAX),
         s.net().endpoint().id()
     ));
     s.publish(EventBody::Join {

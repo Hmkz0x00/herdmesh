@@ -27,6 +27,7 @@ use iroh::EndpointAddr;
 use tokio::sync::mpsc;
 
 use crate::data::{DataDir, DataError, RoomConfig, SyncLog, SyncRecord};
+use crate::display::{ERROR_MAX, NAME_MAX, TEXT_MAX, sanitize_display};
 use crate::repair::Repair;
 
 #[derive(Debug, thiserror::Error)]
@@ -55,9 +56,18 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// `name@node10` for display.
+/// `name@node10` for display; the peer-chosen name is sanitized.
 pub fn short_agent(a: &AgentRef) -> String {
-    format!("{}@{}", a.agent_name, short_node(&a.node))
+    format!(
+        "{}@{}",
+        sanitize_display(&a.agent_name, NAME_MAX),
+        short_node(&a.node)
+    )
+}
+
+/// Error text for the terminal: it may embed a peer's close reason.
+fn show_err(e: &impl std::fmt::Display) -> String {
+    sanitize_display(&e.to_string(), ERROR_MAX)
 }
 
 fn short_node(n: &NodeId) -> String {
@@ -131,7 +141,7 @@ fn sync_record(
                 inserted: 0,
                 error: Some(e.to_string()),
             },
-            format!("sync      {} failed: {e}", short_node(peer)),
+            format!("sync      {} failed: {}", short_node(peer), show_err(e)),
         ),
     }
 }
@@ -391,9 +401,9 @@ pub fn render_status(
     let _ = writeln!(
         s,
         "room {} ({})  you: {} [{:?}]",
-        cfg.name,
+        sanitize_display(&cfg.name, NAME_MAX),
         short_room(id),
-        cfg.agent_name,
+        sanitize_display(&cfg.agent_name, NAME_MAX),
         cfg.role
     );
     let _ = writeln!(s, "events: {event_count}");
@@ -420,7 +430,12 @@ pub fn render_status(
     }
     for (path, l) in leases {
         let left = l.expires_at_ms.saturating_sub(now_ms) / 1000;
-        let _ = writeln!(s, "  {path} by {} ({left}s left)", short_agent(&l.holder));
+        let _ = writeln!(
+            s,
+            "  {} by {} ({left}s left)",
+            sanitize_display(path, TEXT_MAX),
+            short_agent(&l.holder)
+        );
     }
 
     let open: Vec<_> = views
@@ -439,7 +454,12 @@ pub fn render_status(
     }
     for (id, t) in open {
         let st = format!("{:?}", t.status).to_lowercase();
-        let _ = writeln!(s, "  {} [{st}] {}", id.as_str(), t.title);
+        let _ = writeln!(
+            s,
+            "  {} [{st}] {}",
+            sanitize_display(id.as_str(), TEXT_MAX),
+            sanitize_display(&t.title, TEXT_MAX)
+        );
     }
 
     let _ = writeln!(s, "last sync per peer:");
@@ -448,7 +468,7 @@ pub fn render_status(
     }
     for (peer, r) in sync {
         let ago = now_ms.saturating_sub(r.at_ms) / 1000;
-        let peer: String = peer.chars().take(10).collect();
+        let peer = sanitize_display(&peer.chars().take(10).collect::<String>(), 10);
         if r.ok {
             let _ = writeln!(
                 s,
@@ -457,7 +477,7 @@ pub fn render_status(
             );
         } else {
             let err = r.error.as_deref().unwrap_or("unknown error");
-            let _ = writeln!(s, "  {peer} failed: {err}, {ago}s ago");
+            let _ = writeln!(s, "  {peer} failed: {}, {ago}s ago", show_err(&err));
         }
     }
     s
@@ -597,6 +617,82 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("efefefefef failed: "), "{out}");
+    }
+
+    #[test]
+    fn peer_authored_fields_are_sanitized_in_status_and_event_lines() {
+        let evil = "\x1b[2J\x1b]0;pwned\x07x\r\nsync      fake ok";
+        let mut v = Views::default();
+        let who = agent(1, evil);
+        v.members.insert(
+            who.clone(),
+            Member {
+                role: None,
+                present: true,
+                status: None,
+                last_lamport: Lamport(1),
+            },
+        );
+        let ev = hm_proto::EventId::from_bytes([0; 32]);
+        v.leases.insert(
+            format!("src/{evil}"),
+            Lease {
+                holder: who.clone(),
+                claim: ev,
+                lamport: Lamport(1),
+                expires_at_ms: 70_000,
+            },
+        );
+        v.board.insert(
+            TaskId::new("t-1").unwrap(),
+            Task {
+                title: evil.into(),
+                paths: vec![],
+                status: TaskStatus::Open,
+                note: None,
+                created_by: who.clone(),
+                created: ev,
+                updated: ev,
+            },
+        );
+        let mut log = SyncLog::new();
+        let peer = NodeId::from_bytes([0xcd; 32]);
+        let mut rec = sync_record(&peer, &Err(SyncError::RoomMismatch), 0).0;
+        rec.error = Some(evil.into());
+        log.insert(peer.to_string(), rec);
+        let out = render_status(
+            &RoomId::from_bytes([1; 32]),
+            &RoomConfig::new("x", RoleName::Member, "a"),
+            &v,
+            3,
+            &log,
+            10_000,
+        );
+        assert!(
+            !out.contains('\x1b') && !out.contains('\r') && !out.contains('\x07'),
+            "{out:?}"
+        );
+        // Only the renderer's own newlines: one per line it writes.
+        assert!(
+            out.lines().all(|l| !l.starts_with("sync")),
+            "a peer forged a line: {out}"
+        );
+        assert!(out.contains("\\x1b[2J"), "{out}");
+
+        let note = Event::sign(
+            &SigningKey::from_bytes(&[4; 32]),
+            RoomId::from_bytes([1; 32]),
+            evil,
+            Lamport(1),
+            1,
+            EventBody::Note {
+                scope: "s".into(),
+                text: "t".into(),
+            },
+        )
+        .unwrap();
+        let line = event_line(&note);
+        assert!(!line.chars().any(char::is_control), "{line:?}");
     }
 
     #[test]
