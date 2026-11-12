@@ -1244,6 +1244,7 @@ dependencies = [
  "getrandom 0.4.3",
  "postcard",
  "proptest",
+ "regex",
  "serde",
  "serde_bytes",
  "thiserror 2.0.21",
