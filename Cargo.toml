@@ -20,6 +20,9 @@ hm-herdr = { path = "crates/hm-herdr" }
 hm-daemon = { path = "crates/hm-daemon" }
 # external
 anyhow = "1"
+async-trait = "0.1"
+rmcp = { version = "=3.9.0", features = ["transport-io"] }
+serde_json = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 data-encoding = "2"
