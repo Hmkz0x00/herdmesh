@@ -19,6 +19,15 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 hm-daemon.workspace = true
 hm-mcp.workspace = true
+hm-net.workspace = true
+hm-proto.workspace = true
+hm-store.workspace = true
+ed25519-dalek.workspace = true
+iroh.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+toml = "1.2.1"
+serde_json = "1.0.154"
 
 [dev-dependencies]
 tempfile.workspace = true
