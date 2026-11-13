@@ -310,7 +310,7 @@ pub enum Call {
         limit: u32,
     },
     /// Read-only room snapshot for `herdmesh view` (ADR-003): never writes
-    /// and never joins `agent` to the room. Events with lamport > `since`,
+    /// and never joins `agent` to the room. Events inserted locally after `since`,
     /// at most `limit` (≤ 200). Answered with one item `("feed", <JSON>)`
     /// in the shape of [`crate::feed::Feed`].
     Feed {

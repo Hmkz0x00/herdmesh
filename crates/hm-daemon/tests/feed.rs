@@ -593,3 +593,47 @@ fn room_log_keeps_complete_text_and_neutralizes_controls() {
     assert!(line.ends_with(&format!("{}end", "x".repeat(9000))));
     assert!(!line.chars().any(char::is_control));
 }
+
+#[test]
+fn feed_cursor_returns_late_lower_lamport_and_same_lamport_pages() {
+    let (d, room, _) = setup();
+    ok(&d, "alice", Call::RoomCard);
+    let key = SigningKey::from_bytes(&[9; 32]);
+    let event = |seq, lam| {
+        Event::sign(
+            &key,
+            room,
+            "peer",
+            seq,
+            Lamport(lam),
+            T0,
+            EventBody::Note {
+                scope: "s".into(),
+                text: format!("arrival {seq}"),
+            },
+        )
+        .unwrap()
+    };
+    let store = d.store_for_test(room);
+    store.lock().unwrap().append(&event(1, 100)).unwrap();
+    let before = feed(&d, 0, 200);
+    let cursor = before["cursor"].as_u64().unwrap();
+    let late = event(2, 1);
+    let sibling = event(3, 1);
+    store.lock().unwrap().append(&late).unwrap();
+    store.lock().unwrap().append(&sibling).unwrap();
+    let next = feed(&d, cursor, 1);
+    assert_eq!(next["events"].as_array().unwrap().len(), 1);
+    assert_eq!(next["events"][0]["id"], late.id.to_string());
+    assert_eq!(next["events"][0]["lamport"], 1);
+    let cursor2 = next["cursor"].as_u64().unwrap();
+    assert!(cursor2 > cursor);
+    let next = feed(&d, cursor2, 1);
+    assert_eq!(next["events"][0]["id"], sibling.id.to_string());
+    assert!(
+        feed(&d, next["cursor"].as_u64().unwrap(), 200)["events"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

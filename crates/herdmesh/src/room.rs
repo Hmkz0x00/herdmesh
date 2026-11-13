@@ -265,7 +265,7 @@ pub async fn run(
 }
 
 /// Print the newest `limit` messages, then optionally follow local store updates.
-/// Tracking ids also catches events synced later with an older Lamport clock.
+/// Local insertion cursors also catch late events with older Lamport clocks.
 pub async fn log(
     data: &DataDir,
     room: &str,
@@ -276,11 +276,11 @@ pub async fn log(
 ) -> Result<(), RoomError> {
     let (id, _) = data.resolve_room(room)?;
     let store = hm_store::Store::open(data.events_db(&id), id)?;
-    let initial = store.events_since(hm_proto::Lamport(0))?;
-    let mut seen: std::collections::BTreeSet<_> = initial.iter().map(|e| e.id).collect();
+    let initial = store.events_after(0, usize::MAX)?;
+    let mut cursor = initial.last().map_or(0, |(position, _)| *position);
     let lines: Vec<_> = initial
         .iter()
-        .filter_map(hm_daemon::feed::log_line)
+        .filter_map(|(_, e)| hm_daemon::feed::log_line(e))
         .collect();
     for line in &lines[lines.len().saturating_sub(limit)..] {
         out(line);
@@ -293,8 +293,9 @@ pub async fn log(
         tokio::select! {
             () = &mut shutdown => return Ok(()),
             () = tokio::time::sleep(Duration::from_millis(500)) => {
-                for e in store.events_since(hm_proto::Lamport(0))? {
-                    if seen.insert(e.id) && let Some(line) = hm_daemon::feed::log_line(&e) { out(&line); }
+                for (position, e) in store.events_after(cursor, 200)? {
+                    cursor = position;
+                    if let Some(line) = hm_daemon::feed::log_line(&e) { out(&line); }
                 }
             }
         }
@@ -331,7 +332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn log_limits_initial_history_and_follows_new_events_once() {
+    async fn log_limits_history_and_follows_late_lower_lamport_once() {
         let temp = tempfile::tempdir().unwrap();
         let data = DataDir::new(temp.path().join("data"));
         let id = data
@@ -349,7 +350,7 @@ mod tests {
                 id,
                 "alice",
                 seq,
-                Lamport(seq),
+                Lamport(if seq == 3 { 1 } else { seq * 10 }),
                 seq * 1000,
                 EventBody::Note {
                     scope: "test".into(),

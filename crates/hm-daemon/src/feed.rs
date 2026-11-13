@@ -384,27 +384,27 @@ pub fn build(
         })
         .collect();
 
-    // Events: the newest `limit` on first load, else the next `limit`
-    // after the cursor. Lamport is the cursor, so an event synced late with
-    // a lower lamport than the cursor is not re-sent (acceptable for a view).
-    let shown: Vec<&Event> = all
+    // Initial load shows the newest arrivals; subsequent pages use local
+    // insertion positions, including late and equal-Lamport peer events.
+    let arrivals = store.events_after(since, usize::MAX)?;
+    let head = arrivals.last().map_or(since, |(position, _)| *position);
+    let shown: Vec<_> = arrivals
         .iter()
-        .filter(|e| e.lamport.0 > since && parts(e).is_some())
+        .filter(|(_, e)| parts(e).is_some())
         .collect();
     let more = since != 0 && shown.len() > limit;
-    let page: Vec<&Event> = if since == 0 {
+    let page: Vec<_> = if since == 0 {
         shown[shown.len().saturating_sub(limit)..].to_vec()
     } else {
         shown.into_iter().take(limit).collect()
     };
-    let max_lamport = all.iter().map(|e| e.lamport.0).max().unwrap_or(since);
     let cursor = match page.last() {
-        Some(l) if more => l.lamport.0,
-        _ => max_lamport.max(since),
+        Some((position, _)) if more => *position,
+        _ => head,
     };
     let events = page
         .iter()
-        .filter_map(|e| {
+        .filter_map(|(_, e)| {
             let p = parts(e)?;
             let (t, full) = text_full(&p.raw);
             Some(FeedEvent {

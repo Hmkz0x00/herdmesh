@@ -52,6 +52,7 @@ pub struct Feed {
     pub room: String,
     pub you: String,
     pub now_ms: u64,
+    /// Opaque local insertion position; unrelated to event Lamport clocks.
     pub cursor: u64,
     pub members: Vec<FeedMember>,
     pub leases: Vec<FeedLease>,

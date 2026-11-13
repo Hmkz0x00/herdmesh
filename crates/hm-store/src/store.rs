@@ -512,6 +512,37 @@ fn migrate_prefix(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Local arrival positions are independent of the replicated Lamport order.
+/// Retain positions for deleted equivocation twins so cursors never get reused.
+/// Existing databases are backfilled in their original SQLite insertion order.
+fn migrate_arrivals(conn: &Connection) -> Result<(), StoreError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'event_arrivals')",
+        [], |r| r.get(0),
+    )?;
+    if exists {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS event_arrivals (
+            position INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BLOB NOT NULL UNIQUE
+        );
+        INSERT INTO event_arrivals (id)
+            SELECT e.id FROM events e
+            WHERE NOT EXISTS (SELECT 1 FROM event_arrivals a WHERE a.id = e.id)
+            ORDER BY e.rowid;
+        CREATE TRIGGER IF NOT EXISTS event_arrival_insert AFTER INSERT ON events BEGIN
+            INSERT INTO event_arrivals (id) VALUES (NEW.id);
+        END;
+    ",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 impl Store {
     /// Open (or create) a file-backed store for `room`.
     pub fn open(path: impl AsRef<Path>, room: RoomId) -> Result<Self, StoreError> {
@@ -529,6 +560,7 @@ impl Store {
         check_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
         migrate_prefix(&conn)?;
+        migrate_arrivals(&conn)?;
         match get_meta(&conn, "room")? {
             Some(r) if r.as_slice() != room.as_bytes() => return Err(StoreError::WrongRoom),
             Some(_) => {}
@@ -1072,6 +1104,31 @@ impl Store {
             "WHERE e.lamport > ?1 ORDER BY e.lamport, e.author_node, e.id",
             params![be(since.0)],
         )
+    }
+
+    /// Events inserted locally after an opaque arrival cursor, oldest arrival first.
+    /// Positions persist across reopen and are never reused after twin replacement.
+    /// Lamport remains part of each event and does not affect this query.
+    pub fn events_after(&self, since: u64, limit: usize) -> Result<Vec<(u64, Event)>, StoreError> {
+        let Ok(since) = i64::try_from(since) else {
+            return Ok(Vec::new());
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT e.id, e.author_node, e.seq, e.lamport, e.agent_name, e.ts,
+                    b.body, e.sig, a.position
+             FROM event_arrivals a JOIN events e ON e.id = a.id
+             JOIN blobs b ON b.hash = e.body_hash
+             WHERE a.position > ?1 ORDER BY a.position LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![since, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let position = u64::try_from(row.get::<_, i64>(8)?)
+                .map_err(|_| StoreError::Corrupt("arrival position"))?;
+            out.push((position, row_event(row, self.room)?));
+        }
+        Ok(out)
     }
 
     /// Local read cursor for `agent`, if any.
