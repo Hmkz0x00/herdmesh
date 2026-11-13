@@ -12,9 +12,13 @@
 //! 1. **Released**: a `LeaseRelease { claim }` naming it exists from the
 //!    claim's *author node*. Releases from other nodes are ignored.
 //! 2. **Renewed { by }**: a later claim by the same holder (node + agent)
-//!    covers a superset of its paths, was signed (`ts`) before it expired,
-//!    and no release of it sorts before that renewal. The renewal takes over
-//!    the original's place in line (its *root*). `by` is the latest renewal.
+//!    names the same paths or a subset of them (literal strings), was signed
+//!    (`ts`) before it expired, and no release of it sorts before that
+//!    renewal. The renewal takes over the original's place in line (its
+//!    *root*); dropped paths are freed. `by` is the latest renewal. A claim
+//!    naming any path the parent did not is a new claim with its own root
+//!    (ADR-002 Addendum 2, GATE-3 N9), so renewal can't inherit priority for
+//!    paths it never held.
 //! 3. **Expired**: `now >= ts + min(ttl, MAX_LEASE_TTL)`.
 //! 4. Otherwise it is *live*. Live claims are sorted by (root's order key,
 //!    own order key) and walked lowest-first; a claim **wins** unless one of
@@ -194,11 +198,12 @@ impl<'a> Resolved<'a> {
         for list in by_holder.values_mut() {
             list.sort_by_key(|c| c.key());
             for (i, child) in list.iter().enumerate() {
-                let have: BTreeSet<&String> = child.paths.iter().collect();
-                // Most recent earlier claim this one can renew.
+                // Most recent earlier claim this one can renew. A renewal
+                // never grows the path set (GATE-3 N9): wider is a new claim.
                 let found = list[..i].iter().rev().find(|p| {
+                    let held: BTreeSet<&String> = p.paths.iter().collect();
                     child.ts < p.expires_at_ms()
-                        && p.paths.iter().all(|x| have.contains(x))
+                        && child.paths.iter().all(|x| held.contains(x))
                         && !book.released_before(p, Some(child.key()))
                 });
                 if let Some(p) = found {
