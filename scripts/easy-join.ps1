@@ -7,12 +7,25 @@ param([Parameter(Mandatory = $true)][string]$Ticket)
 $ErrorActionPreference = 'Continue'
 $dir = Join-Path $env:LOCALAPPDATA 'herdmesh-test'
 $exe = Join-Path $dir 'herdmesh.exe'
+$sums = Join-Path $dir 'SHA256SUMS.txt'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
-if (-not (Test-Path $exe)) {
-    Write-Host 'Downloading herdmesh.exe ...'
-    $url = 'https://github.com/Hmkz0x00/herdmesh/releases/latest/download/herdmesh-windows-x64.exe'
-    try { Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing -ErrorAction Stop }
-    catch { Write-Host "download failed: $_" -ForegroundColor Red; exit 1 }
+$url = 'https://github.com/Hmkz0x00/herdmesh/releases/latest/download'
+Write-Host 'Downloading herdmesh.exe ...'
+try {
+    Invoke-WebRequest -Uri "$url/herdmesh-windows-x64.exe" -OutFile $exe -UseBasicParsing -ErrorAction Stop
+    Invoke-WebRequest -Uri "$url/SHA256SUMS.txt" -OutFile $sums -UseBasicParsing -ErrorAction Stop
+}
+catch {
+    Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+    Write-Host "download failed: $_" -ForegroundColor Red
+    exit 1
+}
+$expectedLine = Get-Content -LiteralPath $sums | Where-Object { $_ -match '^([0-9a-f]{64})  herdmesh-windows-x64\.exe$' } | Select-Object -First 1
+$actualHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+if (-not $expectedLine -or $actualHash -ne $Matches[1]) {
+    Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+    Write-Host 'SHA256 verification failed for herdmesh.exe; the downloaded executable was deleted.' -ForegroundColor Red
+    exit 1
 }
 & $exe room join $Ticket.Trim() --as friend --name test
 if ($LASTEXITCODE -ne 0) { Write-Host 'join failed (see message above)' -ForegroundColor Red; exit 1 }
