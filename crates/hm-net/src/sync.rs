@@ -3,27 +3,27 @@
 //! Gossip is best-effort with no history, so late joiners and returning peers
 //! pull what they lack directly from a member:
 //!
-//! - **Per-author sequences** (ADR-002 §3, wire v2). Every author numbers
-//!   its events 1, 2, 3... The client describes what it holds as a page of
-//!   [`AuthorWant`]s `(author, have_hi, holes)`: "I have every seq up to
-//!   `have_hi` except `holes`". The server answers with its indexed
-//!   per-author range queries (`Store::events_for`, LIMIT-ed), never a scan
-//!   of the log. Authors the page does not list but whose id falls in the
+//! - **Sparse inventories** (GATE-3 N2/N10, wire v4). The client pages exact
+//!   `(seq, id)` pairs in [`SparseCheck`] ranges. The server compares bounded
+//!   indexed pages and sends only missing/different events, acknowledging
+//!   completed ranges with [`SparseAck`]. Empty sequence spans cost no work.
+//!   This detects twins without a contiguous prefix and traverses every gap.
+//!   Authors the page does not list but whose id falls in the
 //!   page's `(from, to]` range are sent from seq 1, so unknown authors are
 //!   discovered. Many authors are split into pages of at most
 //!   [`MAX_AUTHORS_PER_REQUEST`], so a request always fits
 //!   [`MAX_REQUEST_FRAME`].
 //! - One bi-stream per request. Server streams [`SyncMsg::Event`] frames,
 //!   then [`SyncMsg::End`] `{ more }`. Responses are capped ([`SyncCaps`]);
-//!   the client re-asks the same page while `more` and it made progress,
-//!   cycles through windows of its holes, then moves to the next page.
-//!   `have_hi` is always the client's highest seq, so new events always
-//!   flow even while some holes can't be filled by anyone.
+//!   the client re-asks while events or acknowledged ranges make progress,
+//!   then moves to the next author page. Both cursors persist per peer, so
+//!   bounded runs resume instead of revisiting the same unfillable holes.
+//!   Completed sweeps wrap to catch later arrivals and replacements.
 //! - **Twins.** For each listed author the response also carries the kept
 //!   twin of every equivocated seq (at most [`MAX_TWINS_PER_AUTHOR`]); the
 //!   client's store keeps the lowest id and records the mark.
-//! - **Prefix checks** (GATE-2 N2). Twins nobody holds both of leave no
-//!   mark, so each listed author also carries a [`PrefixCheck`] (the
+//! - **Prefix checks** remain supported for callers with contiguous logs:
+//!   an author can carry a [`PrefixCheck`] (the
 //!   client's XOR fingerprint over its contiguous prefix). A server that
 //!   disagrees replies with a [`SyncMsg::Probe`] of [`PROBE_POINTS`]
 //!   fingerprints; the client narrows the range over rounds of the same
@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use hm_proto::limits::MAX_EVENT_BYTES;
-use hm_proto::{Event, NodeId, RoomId};
+use hm_proto::{Event, EventId, NodeId, RoomId};
 use hm_store::{AuthorSeqs, Store, StoreError, SyncCaps};
 use iroh::endpoint::{
     ClosedStream, ConnectError, Connection, ConnectionError, ReadError, ReadExactError, RecvStream,
@@ -68,7 +68,7 @@ use crate::net::SYNC_ALPN;
 use crate::ticket::RoomSecret;
 
 /// Version byte at the start of every frame payload.
-pub const SYNC_VERSION: u8 = 3;
+pub const SYNC_VERSION: u8 = 4;
 /// Largest request frame a server reads (before auth, so kept small).
 pub const MAX_REQUEST_FRAME: usize = 64 << 10;
 /// Largest response frame (one event plus framing) a client reads. Events
@@ -82,14 +82,15 @@ pub const MAX_ROUNDS: usize = 1024;
 /// Default cap on event bytes per connection (server) / sync run (client).
 pub const MAX_SYNC_BYTES: usize = 256 << 20;
 /// Authors listed in one request page.
-pub const MAX_AUTHORS_PER_REQUEST: usize = 256;
+pub const MAX_AUTHORS_PER_REQUEST: usize = 64;
+/// Held IDs per sparse page; even worst-case requests fit 64 KiB.
+pub const SPARSE_IDS: usize = 8;
 /// Holes listed per author in one request.
 pub const MAX_HOLES_PER_AUTHOR: usize = 16;
 /// Twins (kept events at equivocated seqs) served per requested author.
 pub const MAX_TWINS_PER_AUTHOR: usize = 64;
-/// Hole windows a client cycles through per page: it asks about at most
-/// `MAX_HOLES_PER_AUTHOR * HOLE_WINDOWS` holes per author per sync run, so
-/// holes no peer can fill never starve the ones behind them.
+/// Legacy explicit-hole windows. Normal sync uses sparse range inventories
+/// instead, so this bound cannot hide later gaps.
 pub const HOLE_WINDOWS: usize = 8;
 /// Authors the server reads per store query while answering.
 const SERVER_AUTHOR_PAGE: usize = 64;
@@ -139,8 +140,8 @@ impl Default for SyncLimits {
 /// A store shared between the sync server, the client and the daemon.
 pub type SharedStore = Arc<Mutex<Store>>;
 
-/// What the client holds of one author: every seq in `1..=have_hi` except
-/// `holes` (ascending, each `<= have_hi`).
+/// Exact sparse inventory, or a legacy high-watermark plus explicit holes.
+/// `have_hi` alone does not prove coverage of a sparse log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorWant {
     pub author: NodeId,
@@ -148,6 +149,24 @@ pub struct AuthorWant {
     pub holes: Vec<u64>,
     /// Prefix fingerprint check (GATE-2 N2), see [`PrefixCheck`].
     pub check: Option<PrefixCheck>,
+    /// Exact inventory for a bounded sparse range, preferred over `holes`.
+    pub sparse: Option<SparseCheck>,
+}
+
+/// All locally held IDs in `(after, through]`. Absent sequence numbers need
+/// no enumeration. `u64::MAX` as the upper bound includes the entire tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparseCheck {
+    pub after: u64,
+    pub through: u64,
+    pub ids: Vec<(u64, EventId)>,
+}
+
+/// Server has compared/delivered every held event through this position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparseAck {
+    pub author: NodeId,
+    pub through: u64,
 }
 
 /// "My prefix fingerprint (`Store::prefix_fp`) at `at` is `fp`; any
@@ -199,6 +218,14 @@ impl SyncSince {
                     && w.holes.len() <= MAX_HOLES_PER_AUTHOR
                     && w.holes.iter().all(|h| (1..=w.have_hi).contains(h))
                     && w.check.is_none_or(|c| c.lo < c.at && c.at <= w.have_hi)
+                    && w.sparse.as_ref().is_none_or(|c| {
+                        c.after < c.through
+                            && c.ids.len() <= SPARSE_IDS
+                            && c.ids.windows(2).all(|v| v[0].0 < v[1].0)
+                            && c.ids
+                                .iter()
+                                .all(|(seq, _)| *seq > c.after && *seq <= c.through)
+                    })
             })
             && match (self.from, self.to) {
                 (Some(f), Some(t)) => f < t,
@@ -247,6 +274,7 @@ pub fn request_page(
                 have_hi: s.max,
                 holes,
                 check: None,
+                sparse: None,
             }
         })
         .collect();
@@ -265,13 +293,25 @@ pub fn request_page(
 /// Server side of one request: wire events the client lacks within `caps`,
 /// and whether more remain. Indexed per-author queries only.
 pub fn answer_request(store: &Store, req: &SyncSince, caps: SyncCaps) -> Result<Answer, SyncError> {
+    if !req.well_formed() {
+        return Err(SyncError::Protocol("malformed request"));
+    }
+    // Leave frame room for metadata independently of the configured event cap.
+    let caps = SyncCaps {
+        max_events: caps
+            .max_events
+            .min(MAX_RESPONSE_EVENTS - 2 * req.want.len()),
+        ..caps
+    };
     let want: BTreeMap<NodeId, &AuthorWant> = req.want.iter().map(|w| (w.author, w)).collect();
     let (mut out, mut bytes) = (Vec::new(), 0usize);
     let mut probes = Vec::new();
-    let done = |events, probes, more| {
+    let mut sparse = Vec::new();
+    let done = |events, probes, sparse, more| {
         Ok(Answer {
             events,
             probes,
+            sparse,
             more,
         })
     };
@@ -290,9 +330,53 @@ pub fn answer_request(store: &Store, req: &SyncSince, caps: SyncCaps) -> Result<
             }
             scanned += 1;
             if scanned > scan_cap {
-                return done(out, probes, true);
+                return done(out, probes, sparse, true);
             }
             let w = want.get(author);
+            if let Some(c) = w.and_then(|w| w.sparse.as_ref()) {
+                let ids = store.seq_ids_after(author, c.after, SPARSE_IDS + 1)?;
+                let mut through = c.after;
+                let mut complete = true;
+                for (i, &(seq, id)) in ids.iter().enumerate() {
+                    if seq > c.through {
+                        break;
+                    }
+                    if i == SPARSE_IDS {
+                        complete = false;
+                        break;
+                    }
+                    if !c.ids.contains(&(seq, id)) {
+                        let events = store.events_for(author, seq - 1, &[], 1)?;
+                        let Some(e) = events.first() else {
+                            return Err(SyncError::Protocol("sparse event disappeared"));
+                        };
+                        let wire = e.encode()?;
+                        if wire.len() > MAX_EVENT_BYTES {
+                            return Err(SyncError::Protocol("stored event exceeds cap"));
+                        }
+                        if out.len() >= caps.max_events
+                            || (!out.is_empty()
+                                && bytes.saturating_add(wire.len()) > caps.max_bytes)
+                        {
+                            if through > c.after {
+                                sparse.push(SparseAck {
+                                    author: *author,
+                                    through,
+                                });
+                            }
+                            return done(out, probes, sparse, true);
+                        }
+                        bytes = bytes.saturating_add(wire.len());
+                        out.push(wire);
+                    }
+                    through = seq;
+                }
+                sparse.push(SparseAck {
+                    author: *author,
+                    through: if complete { c.through } else { through },
+                });
+                continue;
+            }
             let (have_hi, holes) = w.map_or((0, &[][..]), |w| (w.have_hi, w.holes.as_slice()));
             let mut ranged = Vec::new();
             if let Some(c) = w.and_then(|w| w.check) {
@@ -310,7 +394,7 @@ pub fn answer_request(store: &Store, req: &SyncSince, caps: SyncCaps) -> Result<
             }
             let left = caps.max_events.saturating_sub(out.len());
             if left == 0 {
-                return done(out, probes, true);
+                return done(out, probes, sparse, true);
             }
             let regular = store.events_for(author, have_hi, holes, left)?;
             for e in ranged.into_iter().chain(regular) {
@@ -318,8 +402,10 @@ pub fn answer_request(store: &Store, req: &SyncSince, caps: SyncCaps) -> Result<
                 if wire.len() > MAX_EVENT_BYTES {
                     continue; // stored by an older build; never sent
                 }
-                if !out.is_empty() && bytes.saturating_add(wire.len()) > caps.max_bytes {
-                    return done(out, probes, true);
+                if out.len() >= caps.max_events
+                    || (!out.is_empty() && bytes.saturating_add(wire.len()) > caps.max_bytes)
+                {
+                    return done(out, probes, sparse, true);
                 }
                 bytes = bytes.saturating_add(wire.len());
                 out.push(wire);
@@ -334,6 +420,9 @@ pub fn answer_request(store: &Store, req: &SyncSince, caps: SyncCaps) -> Result<
     // holds a higher twin converges to the lowest id. Twins only fill spare
     // capacity and never set `more`, so they can't starve regular events.
     'twins: for w in &req.want {
+        if w.sparse.is_some() {
+            continue; // exact ID comparison already covers twins
+        }
         for e in store.twins_for(&w.author, MAX_TWINS_PER_AUTHOR)? {
             let left = caps.max_events.saturating_sub(out.len());
             let wire = e.encode()?;
@@ -344,7 +433,18 @@ pub fn answer_request(store: &Store, req: &SyncSince, caps: SyncCaps) -> Result<
             out.push(wire);
         }
     }
-    done(out, probes, false)
+    // Authors absent at the server still acknowledge their empty ranges.
+    for w in &req.want {
+        if let Some(c) = &w.sparse
+            && !sparse.iter().any(|a| a.author == w.author)
+        {
+            sparse.push(SparseAck {
+                author: w.author,
+                through: c.through,
+            });
+        }
+    }
+    done(out, probes, sparse, false)
 }
 
 /// What [`answer_request`] sends: events, prefix probes, and `more`.
@@ -352,6 +452,7 @@ pub fn answer_request(store: &Store, req: &SyncSince, caps: SyncCaps) -> Result<
 pub struct Answer {
     pub events: Vec<Vec<u8>>,
     pub probes: Vec<Probe>,
+    pub sparse: Vec<SparseAck>,
     pub more: bool,
 }
 
@@ -426,6 +527,8 @@ pub enum SyncMsg {
     Refused(Refusal),
     /// Prefix fingerprints answering a mismatched [`PrefixCheck`].
     Probe(Probe),
+    /// Acknowledged progress through an exact sparse inventory.
+    Sparse(SparseAck),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -768,6 +871,7 @@ async fn serve_stream(
     let Answer {
         mut events,
         mut probes,
+        mut sparse,
         mut more,
     } = match answer {
         Ok(a) => a,
@@ -791,6 +895,7 @@ async fn serve_stream(
     }
     if fit < events.len() {
         events.truncate(fit);
+        sparse.clear(); // never acknowledge events removed by the byte budget
         more = true;
     }
     let probe_bytes: usize = probes.iter().map(|p| 40 + 40 * p.points.len()).sum();
@@ -798,6 +903,12 @@ async fn serve_stream(
         probes.clear(); // the client asks again next sync
     } else {
         total += probe_bytes;
+    }
+    let sparse_bytes = sparse.len() * 48;
+    if total.saturating_add(sparse_bytes) > left {
+        sparse.clear();
+    } else {
+        total += sparse_bytes;
     }
     if (events.is_empty() && more) || !budget.take(total) {
         tracing::debug!("sync connection byte budget too small");
@@ -810,6 +921,9 @@ async fn serve_stream(
     }
     for p in probes {
         write_frame(send, &SyncMsg::Probe(p)).await?;
+    }
+    for ack in sparse {
+        write_frame(send, &SyncMsg::Sparse(ack)).await?;
     }
     write_frame(send, &SyncMsg::End { more }).await?;
     send.finish()?;
@@ -882,7 +996,7 @@ pub struct SyncStats {
     pub equivocations: usize,
 }
 
-/// Client-side prefix-check state for one sync run (GATE-2 N2).
+/// Client-side reconciliation state for one sync run.
 ///
 /// Each author is checked once per run at its prefix end. A mismatch
 /// answered by a [`Probe`] narrows to a suspect range `(lo, at]`, re-checked
@@ -892,6 +1006,7 @@ pub struct SyncStats {
 pub struct PrefixChecks {
     suspect: BTreeMap<NodeId, (u64, u64)>,
     settled: BTreeSet<NodeId>,
+    sparse_done: BTreeSet<NodeId>,
 }
 
 impl PrefixChecks {
@@ -971,8 +1086,10 @@ pub struct PageRound {
     pub to: Option<NodeId>,
     /// Hole windows this page needs; see [`request_page`].
     pub windows: usize,
-    /// Authors of this page with a prefix mismatch still being narrowed.
+    /// Nonzero while a prefix mismatch or acknowledged sparse page progresses.
     pub suspects: usize,
+    /// Every sparse inventory in this author page was fully acknowledged.
+    pub complete: bool,
 }
 
 /// Map a stream reset/stop with [`ERR_REFUSED`] to [`SyncError::Refused`].
@@ -995,13 +1112,14 @@ async fn request_round(
     req: &SyncSince,
     stats: &mut SyncStats,
     limits: &SyncLimits,
-) -> Result<(Vec<Event>, Vec<Probe>, bool), SyncError> {
+) -> Result<(Vec<Event>, Vec<Probe>, Vec<SparseAck>, bool), SyncError> {
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(&mut send, req).await.map_err(refused_or)?;
     send.finish()?;
 
     let mut events = Vec::new();
     let mut probes = Vec::new();
+    let mut sparse = Vec::new();
     let (mut frames, mut bytes) = (0usize, 0usize);
     let more = loop {
         let msg =
@@ -1044,11 +1162,30 @@ async fn request_round(
                 }
                 probes.push(p);
             }
+            SyncMsg::Sparse(ack) => {
+                frames += 1;
+                bytes = bytes.saturating_add(48);
+                stats.bytes = stats.bytes.saturating_add(48);
+                let check = req
+                    .want
+                    .iter()
+                    .find(|w| w.author == ack.author)
+                    .and_then(|w| w.sparse.as_ref());
+                if frames > MAX_RESPONSE_EVENTS
+                    || bytes > MAX_RESPONSE_BYTES
+                    || stats.bytes > limits.max_bytes
+                    || check.is_none_or(|c| ack.through <= c.after || ack.through > c.through)
+                    || sparse.iter().any(|a: &SparseAck| a.author == ack.author)
+                {
+                    return Err(SyncError::Protocol("bad sparse acknowledgement"));
+                }
+                sparse.push(ack);
+            }
             SyncMsg::End { more } => break more,
             SyncMsg::Refused(r) => return Err(SyncError::Refused(r)),
         }
     };
-    Ok((events, probes, more))
+    Ok((events, probes, sparse, more))
 }
 
 /// One request/response round for the summary page after `from`, within
@@ -1065,6 +1202,7 @@ pub async fn sync_page(
     window: usize,
     checks: &mut PrefixChecks,
 ) -> Result<PageRound, SyncError> {
+    let peer = NodeId::from_bytes(*conn.remote_id().as_bytes());
     let (req, to, windows, asked) = {
         let s = store.lock()?;
         let room = s.room();
@@ -1072,18 +1210,29 @@ pub async fn sync_page(
             return Err(SyncError::RoomMismatch);
         }
         // One page plus one author, so `request_page` knows if more follow.
-        let summary = s.seq_summary_page(
-            from,
-            MAX_AUTHORS_PER_REQUEST + 1,
-            MAX_HOLES_PER_AUTHOR * HOLE_WINDOWS,
-        )?;
+        let summary = s.seq_summary_page(from, MAX_AUTHORS_PER_REQUEST + 1, 0)?;
         let mut page = request_page(&summary, from, window);
         let mut asked = Vec::new();
         for w in &mut page.want {
-            let hi = summary.get(&w.author).map_or(0, |a| a.hi);
-            w.check = checks.check(&s, &w.author, hi)?;
-            if let Some(c) = w.check {
-                asked.push((w.author, c));
+            if !checks.sparse_done.contains(&w.author) {
+                let after = s.sparse_cursor(&peer, &w.author)?;
+                let ids = s.seq_ids_after(&w.author, after, SPARSE_IDS)?;
+                let through = if ids.len() == SPARSE_IDS {
+                    ids.last().map_or(u64::MAX, |(seq, _)| *seq)
+                } else {
+                    u64::MAX
+                };
+                w.sparse = Some(SparseCheck {
+                    after,
+                    through,
+                    ids,
+                });
+            } else {
+                let hi = summary.get(&w.author).map_or(0, |a| a.hi);
+                w.check = checks.check(&s, &w.author, hi)?;
+                if let Some(c) = w.check {
+                    asked.push((w.author, c));
+                }
             }
         }
         let req = SyncSince {
@@ -1095,13 +1244,27 @@ pub async fn sync_page(
         };
         (req, page.to, page.windows, asked)
     };
-    let (events, probes, more) = within(
+    let rejected_before = stats.rejected;
+    let (events, probes, sparse, more) = within(
         limits.request_deadline,
         "sync request",
         request_round(conn, &req, stats, limits),
     )
     .await?;
     stats.rounds += 1;
+    let decoded_cleanly = stats.rejected == rejected_before;
+
+    let sparse_progress = !sparse.is_empty()
+        && (sparse.iter().any(|a| a.through != u64::MAX)
+            || sparse.len() < req.want.iter().filter(|w| w.sparse.is_some()).count());
+    let page_complete = !req.want.is_empty()
+        && !more
+        && req.want.iter().all(|w| {
+            checks.sparse_done.contains(&w.author)
+                || sparse
+                    .iter()
+                    .any(|a| a.author == w.author && a.through == u64::MAX)
+        });
 
     let store = store.clone();
     let mut state = std::mem::take(checks);
@@ -1110,6 +1273,20 @@ pub async fn sync_page(
         let report = s.append_batch(&events)?;
         // After ingest, so a twin that just arrived is already reflected.
         state.absorb(&s, &asked, &probes)?;
+        // Never skip a rejected/deferred event on the strength of an ack.
+        if decoded_cleanly && report.rejected == 0 && report.deferred == 0 {
+            for ack in sparse {
+                let done = ack.through == u64::MAX;
+                s.set_sparse_cursor(&peer, &ack.author, if done { 0 } else { ack.through })?;
+                if done {
+                    state.sparse_done.insert(ack.author);
+                    state.settled.insert(ack.author);
+                }
+            }
+            if page_complete {
+                s.set_sync_author_cursor(&peer, to)?;
+            }
+        }
         Ok((report, state))
     })
     .await??;
@@ -1125,7 +1302,9 @@ pub async fn sync_page(
         more,
         "sync round"
     );
-    let suspects = req
+    let suspects = usize::from(
+        decoded_cleanly && sparse_progress && report.rejected == 0 && report.deferred == 0,
+    ) + req
         .want
         .iter()
         .filter(|w| checks.suspect.contains_key(&w.author))
@@ -1136,15 +1315,15 @@ pub async fn sync_page(
         to,
         windows,
         suspects,
+        complete: decoded_cleanly && page_complete && report.rejected == 0 && report.deferred == 0,
     })
 }
 
 /// Pull everything `conn`'s peer has that `store` lacks, page by page.
 ///
-/// A page is re-asked while rounds insert something (so a server that keeps
-/// saying `more` without progress can't loop us), then once per remaining
-/// hole window, then the next page follows; at most `limits.max_rounds`
-/// rounds in total.
+/// A page is re-asked while events or acknowledged sparse ranges progress;
+/// a server saying `more` without progress cannot loop us. Cursors survive
+/// bounded runs; at most `limits.max_rounds` rounds execute per connection.
 pub async fn sync_with(
     conn: &Connection,
     local: EndpointId,
@@ -1153,7 +1332,9 @@ pub async fn sync_with(
     limits: &SyncLimits,
 ) -> Result<SyncStats, SyncError> {
     let mut stats = SyncStats::default();
-    let (mut from, mut window) = (None, 0);
+    let peer = NodeId::from_bytes(*conn.remote_id().as_bytes());
+    let mut from = store.lock()?.sync_author_cursor(&peer)?;
+    let mut window = 0;
     let mut checks = PrefixChecks::default();
     while stats.rounds < limits.max_rounds {
         let r = sync_page(
@@ -1168,6 +1349,16 @@ pub async fn sync_with(
             &mut checks,
         )
         .await?;
+        if r.complete {
+            match r.to {
+                Some(to) => {
+                    from = Some(to);
+                    window = 0;
+                    continue;
+                }
+                None => break,
+            }
+        }
         if r.suspects > 0 {
             // Keep narrowing prefix mismatches on this page.
             continue;
@@ -1184,7 +1375,13 @@ pub async fn sync_with(
         window = 0;
         match r.to {
             Some(to) => from = Some(to),
-            None => break,
+            None => {
+                // Also wrap an empty resumed page (e.g. authors were removed).
+                if !r.more {
+                    store.lock()?.set_sync_author_cursor(&peer, None)?;
+                }
+                break;
+            }
         }
     }
     Ok(stats)

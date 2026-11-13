@@ -22,6 +22,121 @@ use iroh::{Endpoint, EndpointAddr, RelayMode};
 
 const T: Duration = Duration::from_secs(60);
 
+#[tokio::test(flavor = "multi_thread")]
+async fn sparse_gap_after_128_unfillable_holes_is_fetched() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = key(42);
+    let all: Vec<_> = (129..=131).map(|i| ev(&k, i, i, "gap")).collect();
+    let (a, sa) = serve(&dir, &all).await;
+    let b = bind(&dir, "b").await;
+    let sb = store();
+    fill(&sb, &[all[0].clone(), all[2].clone()]);
+    let stats = sync_from(b.endpoint(), a.local_addr(), &secret(), &sb)
+        .await
+        .unwrap();
+    assert_eq!(stats.inserted, 1, "{stats:?}");
+    assert_eq!(ids(&sa), ids(&sb));
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sparse_pages_resume_across_budgeted_runs_and_store_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = key(43);
+    let all: Vec<_> = (0..40)
+        .map(|i| ev(&k, 129 + i * 2, 129 + i * 2, "sparse"))
+        .collect();
+    let (a, sa) = serve(&dir, &all).await;
+    let b = bind(&dir, "b").await;
+    let db = dir.path().join("client.db");
+    let sb = Arc::new(Mutex::new(Store::open(&db, room()).unwrap()));
+    let held: Vec<_> = all
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 35)
+        .map(|(_, e)| e.clone())
+        .collect();
+    fill(&sb, &held);
+    let limits = hm_net::SyncLimits {
+        max_rounds: 1,
+        ..hm_net::SyncLimits::DEFAULT
+    };
+    for _ in 0..8 {
+        let stats = hm_net::sync_from_with(b.endpoint(), a.local_addr(), &secret(), &sb, &limits)
+            .await
+            .unwrap();
+        assert_eq!(stats.rounds, 1);
+        *sb.lock().unwrap() = Store::open(&db, room()).unwrap();
+    }
+    assert_eq!(ids(&sa), ids(&sb));
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[test]
+fn sparse_ack_does_not_skip_events_cut_by_response_cap() {
+    let s = store();
+    let k = key(44);
+    let all = [ev(&k, 129, 129, "one"), ev(&k, 131, 131, "two")];
+    fill(&s, &all);
+    let req = SyncSince {
+        want: vec![AuthorWant {
+            author: all[0].author.node,
+            have_hi: 131,
+            holes: vec![],
+            check: None,
+            sparse: Some(hm_net::sync::SparseCheck {
+                after: 0,
+                through: u64::MAX,
+                ids: vec![],
+            }),
+        }],
+        ..SyncSince::everything(room(), [0; 32])
+    };
+    let answer = hm_net::answer_request(
+        &s.lock().unwrap(),
+        &req,
+        hm_store::SyncCaps {
+            max_events: 1,
+            max_bytes: 1 << 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(answer.events.len(), 1);
+    assert!(answer.more);
+    assert_eq!(answer.sparse[0].through, 129);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sparse_author_pages_resume_across_short_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut keys: Vec<_> = (100..100 + MAX_AUTHORS_PER_REQUEST as u32 + 1)
+        .map(key)
+        .collect();
+    keys.sort_by_key(|k| NodeId::from_verifying_key(&k.verifying_key()));
+    let held: Vec<_> = keys.iter().map(|k| ev(k, 129, 129, "held")).collect();
+    let missing = ev(keys.last().unwrap(), 130, 130, "last author");
+    let mut all = held.clone();
+    all.push(missing);
+    let (a, sa) = serve(&dir, &all).await;
+    let b = bind(&dir, "b").await;
+    let sb = store();
+    fill(&sb, &held);
+    let limits = hm_net::SyncLimits {
+        max_rounds: 1,
+        ..hm_net::SyncLimits::DEFAULT
+    };
+    for _ in 0..3 {
+        hm_net::sync_from_with(b.endpoint(), a.local_addr(), &secret(), &sb, &limits)
+            .await
+            .unwrap();
+    }
+    assert_eq!(ids(&sa), ids(&sb));
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
 fn secret() -> RoomSecret {
     RoomSecret::from_bytes([11; 32])
 }
@@ -260,7 +375,30 @@ fn worst_case_request_page_fits_the_request_frame() {
             room: room(),
             from,
             to: page.to,
-            want: page.want,
+            want: page
+                .want
+                .into_iter()
+                .map(|mut w| {
+                    w.check = Some(hm_net::PrefixCheck {
+                        lo: 0,
+                        at: w.have_hi,
+                        fp: [255; 32],
+                    });
+                    w.sparse = Some(hm_net::sync::SparseCheck {
+                        after: u64::MAX - 1000,
+                        through: u64::MAX,
+                        ids: (0..hm_net::sync::SPARSE_IDS)
+                            .map(|i| {
+                                (
+                                    u64::MAX - 999 + i as u64,
+                                    hm_proto::EventId::from_bytes([255; 32]),
+                                )
+                            })
+                            .collect(),
+                    });
+                    w
+                })
+                .collect(),
             auth: [0; 32],
         };
         let len = 1 + postcard::to_allocvec(&req).unwrap().len();
@@ -387,6 +525,7 @@ async fn malformed_requests_are_refused() {
         have_hi: 100,
         holes,
         check: None,
+        sparse: None,
     };
     let bad = [
         // Too many holes.
@@ -422,6 +561,44 @@ async fn malformed_requests_are_refused() {
             }],
             ..SyncSince::everything(room(), auth)
         },
+        // Empty sparse interval.
+        SyncSince {
+            want: vec![AuthorWant {
+                sparse: Some(hm_net::sync::SparseCheck {
+                    after: 9,
+                    through: 9,
+                    ids: vec![],
+                }),
+                ..want(n(1), vec![])
+            }],
+            ..SyncSince::everything(room(), auth)
+        },
+        // Too many held IDs, even though the wire frame itself is small.
+        SyncSince {
+            want: vec![AuthorWant {
+                sparse: Some(hm_net::sync::SparseCheck {
+                    after: 0,
+                    through: u64::MAX,
+                    ids: (1..=hm_net::sync::SPARSE_IDS as u64 + 1)
+                        .map(|seq| (seq, hm_proto::EventId::from_bytes([0; 32])))
+                        .collect(),
+                }),
+                ..want(n(1), vec![])
+            }],
+            ..SyncSince::everything(room(), auth)
+        },
+        // An ID outside the claimed sparse interval.
+        SyncSince {
+            want: vec![AuthorWant {
+                sparse: Some(hm_net::sync::SparseCheck {
+                    after: 10,
+                    through: 20,
+                    ids: vec![(21, hm_proto::EventId::from_bytes([0; 32]))],
+                }),
+                ..want(n(1), vec![])
+            }],
+            ..SyncSince::everything(room(), auth)
+        },
         // Prefix check above have_hi.
         SyncSince {
             want: vec![AuthorWant {
@@ -450,7 +627,7 @@ async fn malformed_requests_are_refused() {
         assert!(is_reset_refused(&out), "{req:?} -> {out:?}");
     }
     conn.close(0u32.into(), b"done");
-    assert_eq!(SYNC_VERSION, 3);
+    assert_eq!(SYNC_VERSION, 4);
     a.shutdown().await;
     b.shutdown().await;
 }

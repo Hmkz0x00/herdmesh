@@ -939,6 +939,89 @@ impl Store {
         px_at(&self.conn, node.as_bytes(), seq)
     }
 
+    /// A bounded page of held sequence/ID pairs, including sparse tails.
+    /// Reads only the author/sequence index, never event bodies or absent seqs.
+    pub fn seq_ids_after(
+        &self,
+        author: &NodeId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, EventId)>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = self.conn.prepare_cached(
+            "SELECT seq, id FROM events WHERE author_node = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+        )?.query_map(params![author.as_bytes().to_vec(), be(after), limit], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        rows.into_iter()
+            .map(|(seq, id)| {
+                Ok((
+                    u64_of(seq, "seq")?,
+                    EventId::from_bytes(arr(id, "event id")?),
+                ))
+            })
+            .collect()
+    }
+
+    /// Local sparse reconciliation position, isolated from inbox cursors.
+    pub fn sparse_cursor(&self, peer: &NodeId, author: &NodeId) -> Result<u64, StoreError> {
+        let key = AgentRef::new(*author, format!("sync-sparse-v4:{peer}"));
+        Ok(self.cursor(&key)?.map_or(0, |v| v.0))
+    }
+
+    /// Save acknowledged sparse progress; zero starts the next complete sweep.
+    pub fn set_sparse_cursor(
+        &self,
+        peer: &NodeId,
+        author: &NodeId,
+        after: u64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO cursors (node, name, lamport) VALUES (?1, ?2, ?3)",
+            params![
+                author.as_bytes().to_vec(),
+                format!("sync-sparse-v4:{peer}"),
+                be(after)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Resume the author page for a peer after a round/deadline budget ends.
+    /// This reserved cursor row holds an opaque NodeId rather than a Lamport.
+    pub fn sync_author_cursor(&self, peer: &NodeId) -> Result<Option<NodeId>, StoreError> {
+        let bytes: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT lamport FROM cursors WHERE node = ?1 AND name = 'sync:authors:v4'",
+                params![peer.as_bytes().to_vec()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        bytes
+            .map(|b| arr(b, "sync author cursor").map(NodeId::from_bytes))
+            .transpose()
+    }
+
+    /// Complete an author page, wrapping to the start only after a full sweep.
+    pub fn set_sync_author_cursor(
+        &self,
+        peer: &NodeId,
+        after: Option<NodeId>,
+    ) -> Result<(), StoreError> {
+        if let Some(after) = after {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO cursors (node, name, lamport) VALUES (?1, 'sync:authors:v4', ?2)",
+                params![peer.as_bytes().to_vec(), after.as_bytes().to_vec()],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM cursors WHERE node = ?1 AND name = 'sync:authors:v4'",
+                params![peer.as_bytes().to_vec()],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Events by `author` with `seq` in `holes` or `seq > after_seq`, by
     /// ascending seq (holes first), at most `limit`. Indexed point and range
     /// lookups only.
