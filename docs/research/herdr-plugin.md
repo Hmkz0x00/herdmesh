@@ -137,5 +137,5 @@ herdr plugin pane commands:
   herdr plugin pane open --plugin ID --entrypoint ID [--placement overlay|popup|split|tab|zoomed] [--width SIZE] [--height SIZE] [--workspace ID] [--target-pane PANE] [--direction right|down] [--cwd PATH] [--env KEY=VALUE] [--focus|--no-focus]
 
 $ herdr plugin config-dir herdmesh
-C:\Users\Hnkzoxoo\AppData\Roaming\herdr\plugins\config\herdmesh
+%APPDATA%\herdr\plugins\config\herdmesh
 ```
