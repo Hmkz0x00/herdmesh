@@ -290,7 +290,7 @@ fn scenario() -> Vec<Event> {
         claim(4, 3, T0 + 900, &["Cargo.toml"], 1),
         claim(1, 4, T0 + 1_500, &["crates/**"], 600),
         claim(1, 5, T0 + 1_600, &["src/net/**", "crates/**"], 600), // widening: new claim
-        claim(1, 6, T0 + 1_700, &["crates/**"], 600),                // subset renewal
+        claim(1, 6, T0 + 1_700, &["crates/**"], 600),               // subset renewal
         release(2, 5, T0 + 1_800, &b),
         release(3, 6, T0 + 1_900, &a), // foreign
         a,

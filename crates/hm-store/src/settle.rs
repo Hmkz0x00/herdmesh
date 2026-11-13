@@ -297,6 +297,55 @@ impl LeaseBook {
         }
     }
 
+    /// Keep only the claims, and the releases, whose own event id passes
+    /// `keep`. A dropped release removes that node's release of the claim.
+    pub fn retain(&mut self, keep: impl Fn(&EventId) -> bool) {
+        self.claims.retain(|id, _| keep(id));
+        for by_node in self.releases.values_mut() {
+            by_node.retain(|_, (_, _, id)| keep(id));
+        }
+        self.releases.retain(|_, by_node| !by_node.is_empty());
+    }
+
+    /// Event ids of every claim and every recorded release.
+    pub fn event_ids(&self) -> impl Iterator<Item = EventId> + '_ {
+        let releases = self.releases.values().flat_map(|m| m.values().map(|k| k.2));
+        self.claims.keys().copied().chain(releases)
+    }
+
+    /// Ids of the claims that win at `now` (pending or granted).
+    pub fn winners(&self, now: u64) -> BTreeSet<EventId> {
+        Resolved::new(self)
+            .walk(now)
+            .into_iter()
+            .filter(|(_, beaten)| beaten.is_none())
+            .map(|(c, _)| c.id)
+            .collect()
+    }
+
+    /// The claim at the start of `id`'s renewal chain (`id` itself if it
+    /// renews nothing). `None` if `id` is not a known claim.
+    pub fn root_of(&self, id: &EventId) -> Option<EventId> {
+        Resolved::new(self).root(id).map(|c| c.id)
+    }
+
+    /// Claims of other holders that win at `now` but would stop winning if
+    /// `c` were added: the leases `c` would take (ADR-002 Addendum 2).
+    pub fn displaced_by(&self, c: &ClaimRec, now: u64) -> Vec<EventId> {
+        let before = self.winners(now);
+        if before.is_empty() {
+            return Vec::new();
+        }
+        let mut with = self.clone();
+        with.add_claim(c.clone());
+        let after = with.winners(now);
+        before
+            .into_iter()
+            .filter(|id| !after.contains(id))
+            .filter(|id| self.claims.get(id).is_some_and(|v| v.holder != c.holder))
+            .collect()
+    }
+
     pub fn claim(&self, id: &EventId) -> Option<&ClaimRec> {
         self.claims.get(id)
     }
