@@ -29,6 +29,7 @@ getrandom.workspace = true
 interprocess = { version = "=2.4.8", features = ["tokio"] }
 postcard.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
@@ -44,5 +45,4 @@ windows-sys = { version = "0.61.2", features = [
 
 [dev-dependencies]
 hm-mcp.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true

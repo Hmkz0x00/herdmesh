@@ -309,6 +309,20 @@ pub enum Call {
         query: String,
         limit: u32,
     },
+    /// Read-only room snapshot for `herdmesh view` (ADR-003): never writes
+    /// and never joins `agent` to the room. Events with lamport > `since`,
+    /// at most `limit` (≤ 200). Answered with one item `("feed", <JSON>)`
+    /// in the shape of [`crate::feed::Feed`].
+    Feed {
+        since: u64,
+        limit: u32,
+    },
+    /// Read-only: one message with its complete redacted text (<= 8 KiB), by
+    /// full or unique-prefix hex id. One item `("event", <JSON>)`
+    /// ([`crate::feed::FullEvent`]); `NotFound` if unknown.
+    FeedEvent {
+        id: String,
+    },
 }
 
 /// A call tagged with the calling agent's identity (its name; the daemon

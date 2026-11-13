@@ -793,6 +793,8 @@ impl Daemon {
                 }
             }
             Call::Search { query, limit } => Self::search(st, &query, limit as usize),
+            // Served by `handle_request` without joining; never reaches here.
+            Call::Feed { .. } | Call::FeedEvent { .. } => Err(ErrCode::Internal),
         }
     }
 
@@ -936,6 +938,31 @@ impl Daemon {
             return Response::Err(ErrCode::NoRoom);
         };
         let mut guard = lock(&entry.store);
+        if let Call::Feed { since, limit } = req.call {
+            // Read-only: no `ensure_member`, nothing is signed or published.
+            let me = AgentRef::new(self.node, req.agent);
+            return match crate::feed::build(
+                &entry.name,
+                &guard,
+                &me,
+                (self.clock)(),
+                since,
+                limit as usize,
+            )
+            .ok()
+            .and_then(|f| serde_json::to_string(&f).ok())
+            {
+                Some(json) => Response::Ok(vec![("feed".to_owned(), json)]),
+                None => Response::Err(ErrCode::Internal),
+            };
+        }
+        if let Call::FeedEvent { id } = &req.call {
+            return match crate::feed::event_json(&guard, id) {
+                Ok(Some(json)) => Response::Ok(vec![("event".to_owned(), json)]),
+                Ok(None) => Response::Err(ErrCode::NotFound),
+                Err(_) => Response::Err(ErrCode::Internal),
+            };
+        }
         let mut st = RoomState {
             name: &entry.name,
             store: &mut guard,

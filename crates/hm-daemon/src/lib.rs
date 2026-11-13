@@ -6,6 +6,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod core;
+pub mod feed;
 pub mod ipc;
 mod peer_owner;
 
