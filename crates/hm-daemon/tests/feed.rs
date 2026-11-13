@@ -433,6 +433,8 @@ fn event_req(d: &Daemon, id: &str) -> Response {
 fn long_text_is_cut_in_the_feed_but_complete_in_feed_event() {
     let (d, room, _) = setup();
     let long = format!("start {}end", "w ".repeat(300));
+    // bob must be in the room: unknown targets are no longer addressed silently.
+    ok(&d, "bob", Call::Inbox { ack: false });
     ok(
         &d,
         "alice",
