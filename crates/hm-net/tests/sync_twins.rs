@@ -12,6 +12,39 @@ use hm_store::Store;
 
 const T: Duration = Duration::from_secs(30);
 
+#[tokio::test(flavor = "multi_thread")]
+async fn sparse_twins_without_any_prefix_converge() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = SigningKey::from_bytes(&[41; 32]);
+    let (x, y) = (note(&k, 2, "x"), note(&k, 2, "y"));
+    let (low, high) = if x.id < y.id { (x, y) } else { (y, x) };
+    let (sa, sb) = (store(), store());
+    fill(&sa, std::slice::from_ref(&high));
+    fill(&sb, std::slice::from_ref(&low));
+    let (a, b) = (bind(&dir, "a").await, bind(&dir, "b").await);
+    a.sync_rooms().insert(secret(), sa.clone()).unwrap();
+    b.sync_rooms().insert(secret(), sb.clone()).unwrap();
+    for _ in 0..2 {
+        sync_from(a.endpoint(), b.local_addr(), &secret(), &sa)
+            .await
+            .unwrap();
+        sync_from(b.endpoint(), a.local_addr(), &secret(), &sb)
+            .await
+            .unwrap();
+    }
+    for s in [&sa, &sb] {
+        let s = s.lock().unwrap();
+        assert_eq!(
+            s.events_for(&low.author.node, 0, &[], 1).unwrap()[0].id,
+            low.id
+        );
+        assert_eq!(s.seq_summary(1).unwrap()[&low.author.node].hi, 0);
+    }
+    assert_eq!(sa.lock().unwrap().equivocations().unwrap().len(), 1);
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
 fn secret() -> RoomSecret {
     RoomSecret::from_bytes([13; 32])
 }
