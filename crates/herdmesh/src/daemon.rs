@@ -334,6 +334,27 @@ pub fn spawn_detached(data: &DataDir) -> io::Result<()> {
     cmd.spawn().map(|_| ())
 }
 
+/// For read-only CLI commands (`view`, `room log`): make sure our daemon
+/// serves `socket`, starting one like `herdmesh mcp` does. `notice` is called
+/// once, before the start, so the user sees why there is a pause. Returns the
+/// IPC token (created first, so daemon and client agree on it).
+pub async fn ensure_for_cli(
+    data: &DataDir,
+    socket: &str,
+    start: impl FnOnce() -> io::Result<()>,
+    notice: impl FnOnce(&str),
+) -> Result<Token, DaemonError> {
+    let token: Token = ipc::load_or_create_token(&token_path(data))?;
+    if ipc::probe_owner(socket).await == Probe::Free {
+        notice("no herdmesh daemon is running; starting one...");
+    }
+    ensure_running(socket, start).await?;
+    if serving(socket, &token).await != Probe::Ours {
+        return Err(DaemonError::Foreign(socket.to_owned()));
+    }
+    Ok(token)
+}
+
 /// A [`hm_mcp::DaemonBackend`] for `agent` (optionally pinned to a room by
 /// local name), starting the daemon first if needed.
 pub async fn mcp_backend(
@@ -407,5 +428,56 @@ mod tests {
         ensure_running(&n, || Err(io::Error::other("must not start")))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_for_cli_starts_a_missing_daemon_and_says_so() {
+        let n = name();
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        let slot = std::cell::RefCell::new(None);
+        let mut notes = Vec::new();
+        let t = ensure_for_cli(
+            &data,
+            &n,
+            || {
+                // Stands in for spawn_detached: a daemon appears.
+                let tok = ipc::load_or_create_token(&token_path(&data)).unwrap();
+                *slot.borrow_mut() = Some(serve(&n, tok));
+                Ok(())
+            },
+            |m| notes.push(m.to_owned()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("starting"));
+        assert_eq!(serving(&n, &t).await, Probe::Ours);
+    }
+
+    #[tokio::test]
+    async fn ensure_for_cli_is_silent_when_a_daemon_runs() {
+        let n = name();
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        let tok = ipc::load_or_create_token(&token_path(&data)).unwrap();
+        let _srv = serve(&n, tok);
+        ensure_for_cli(
+            &data,
+            &n,
+            || Err(io::Error::other("must not start")),
+            |_| panic!("no notice expected"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_for_cli_reports_a_failed_start() {
+        let n = name();
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        let r = ensure_for_cli(&data, &n, || Err(io::Error::other("nope")), |_| {}).await;
+        assert!(r.is_err());
     }
 }
