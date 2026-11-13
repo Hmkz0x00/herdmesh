@@ -567,7 +567,24 @@ fn fit_bytes(feed: &mut Feed) {
 
 /// Complete terminal-safe conversation entry; unlike HTTP detail, no text cap.
 pub fn log_line(e: &Event) -> Option<String> {
-    let p = parts(e)?;
+    let mut p = parts(e)?;
+    // The terminal log is an explicit full-message reader, not a polling IPC
+    // snapshot: retain the complete handoff/claim within the event's wire cap.
+    match &e.body {
+        EventBody::Handoff {
+            summary,
+            next_steps,
+            ..
+        } => {
+            p.raw.clone_from(summary);
+            for step in next_steps {
+                p.raw.push_str("\nnext: ");
+                p.raw.push_str(step);
+            }
+        }
+        EventBody::LeaseClaim { paths, .. } => p.raw = paths.join(" "),
+        _ => {}
+    }
     let ms = e.ts % 86_400_000;
     Some(format!(
         "{:02}:{:02}:{:02}.{:03}Z {} -> {} [{}] {}",
@@ -749,5 +766,54 @@ mod budget_tests {
         assert_eq!(detail.refs.len(), REFS_MAX);
         assert!(detail.text.len() <= FULL_MAX);
         assert!(serde_json::to_vec(&detail).unwrap().len() < FEED_JSON_MAX);
+    }
+
+    #[test]
+    fn incremental_byte_limited_pages_never_skip_messages() {
+        let mut store = Store::open_in_memory(RoomId::from_bytes([1; 32])).unwrap();
+        append(&mut store, "alice", EventBody::Join { role: Role::Member });
+        for _ in 0..210 {
+            append(
+                &mut store,
+                "alice",
+                EventBody::Note {
+                    scope: "test".into(),
+                    text: "\"\u{754c}".repeat(100),
+                },
+            );
+        }
+        let mut cursor = 1;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut byte_limited = false;
+        loop {
+            let feed = snapshot(&store, cursor, EVENTS_MAX);
+            assert!(serde_json::to_vec(&feed).unwrap().len() <= FEED_JSON_MAX);
+            byte_limited |= feed.truncated && feed.events.len() < EVENTS_MAX;
+            for event in &feed.events {
+                assert!(seen.insert(event.id.clone()), "no duplicate event");
+            }
+            if feed.cursor == cursor {
+                break;
+            }
+            cursor = feed.cursor;
+        }
+        assert!(byte_limited);
+        assert_eq!(seen.len(), 210);
+    }
+
+    #[test]
+    fn conversation_log_keeps_all_handoff_steps() {
+        let mut store = Store::open_in_memory(RoomId::from_bytes([1; 32])).unwrap();
+        let event = append(
+            &mut store,
+            "alice",
+            EventBody::Handoff {
+                to: None,
+                summary: "take over".into(),
+                refs: vec![],
+                next_steps: (0..20).map(|i| format!("step {i}")).collect(),
+            },
+        );
+        assert!(log_line(&event).unwrap().contains("step 19"));
     }
 }

@@ -5,6 +5,7 @@ pub mod board;
 pub mod daemon;
 pub mod data;
 pub mod display;
+pub mod herdr_notify;
 pub mod notify;
 pub mod repair;
 pub mod room;

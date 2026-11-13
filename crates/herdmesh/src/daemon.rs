@@ -8,7 +8,7 @@ use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hm_daemon::ipc::{self, IpcError, Probe, Server, Token};
 use hm_daemon::{Daemon, NetHandle};
@@ -119,6 +119,8 @@ pub struct Ticker {
     cli: Arc<dyn HerdrCli>,
     presence: PresenceTracker,
     queue: NotifyQueue,
+    notifications: crate::herdr_notify::Notifications,
+    started: Instant,
 }
 
 /// What one tick did.
@@ -135,6 +137,8 @@ impl Ticker {
             cli,
             presence: PresenceTracker::default(),
             queue: NotifyQueue::default(),
+            notifications: crate::herdr_notify::Notifications::default(),
+            started: Instant::now(),
         }
     }
 
@@ -150,7 +154,11 @@ impl Ticker {
                 }
             }
         }
-        self.queue.offer(self.daemon.pending_pings());
+        let pings = self.daemon.pending_pings();
+        let now = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.notifications
+            .dispatch(&*self.cli, &self.daemon, &pings, now);
+        self.queue.offer(pings);
         report.pings = self.queue.flush(&*self.cli);
         report
     }
