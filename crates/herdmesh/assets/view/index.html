@@ -1,5 +1,44 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Herdmesh Room</title><link rel="stylesheet" href="view.css"></head>
-<body><main id="app"></main><script src="view.js"></script></body>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>herdmesh live room</title>
+<link rel="stylesheet" href="view.css">
+<script src="view.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="logo" aria-hidden="true"></span><h1>herdmesh</h1><span id="room" class="room"></span></div>
+  <div class="top-r">
+    <span id="conn" class="pill" role="status">connecting</span>
+    <span id="mode" class="pill mode"></span>
+    <button id="theme" type="button" class="btn" aria-label="Switch colour theme">Theme</button>
+  </div>
+</header>
+<main class="layout">
+  <section class="stage-wrap" aria-label="Agents working together">
+    <div id="stage" class="stage">
+      <div class="zone"><h2 class="zone-h" id="h-local">On this machine</h2><div id="col-local" class="agents" aria-labelledby="h-local"></div></div>
+      <div class="zone zone-mid"><h2 class="zone-h" id="h-claims">Claims</h2><div id="claims" class="claims" aria-labelledby="h-claims"></div></div>
+      <div class="zone"><h2 class="zone-h" id="h-remote">Remote peers</h2><div id="col-remote" class="agents" aria-labelledby="h-remote"></div></div>
+      <div id="fx" class="fx" aria-hidden="true"></div>
+    </div>
+  </section>
+  <aside class="side">
+    <section class="panel"><h2 class="panel-h">Open tasks <span id="task-n" class="count"></span></h2><ul id="tasks" class="tasks"></ul></section>
+    <section class="panel feed-sec"><h2 class="panel-h">Activity</h2><ol id="feed" class="feed"></ol></section>
+  </aside>
+</main>
+<section id="detail" class="detail" role="dialog" aria-labelledby="d-kind" hidden>
+  <div class="d-head"><strong id="d-kind" class="d-kind"></strong><span id="d-who" class="d-who"></span><button id="d-close" type="button" class="btn" aria-label="Close details (Esc)">Close</button></div>
+  <div class="d-meta"><time id="d-time"></time><span id="d-id" class="node"></span></div>
+  <pre id="d-text" class="d-text"></pre>
+  <div id="d-refs" class="d-refs"></div>
+  <div id="d-note" class="d-note" role="status"></div>
+</section>
+<div id="sr" class="sr" aria-live="polite"></div>
+<noscript><p class="ns">This page needs JavaScript.</p></noscript>
+</body>
 </html>
