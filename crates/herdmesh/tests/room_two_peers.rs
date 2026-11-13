@@ -212,3 +212,23 @@ async fn forged_genesis_in_ticket_is_never_verified() {
     a.close().await;
     b.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_up_reports_a_direct_connection_without_relay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, b_dir, mut a) = setup(&tmp).await;
+    let b = join_b(&b_dir, &a).await;
+    let line = timeout(DEADLINE, async {
+        loop {
+            let line = a.step().await.unwrap().unwrap();
+            if line.starts_with("peer up") {
+                break line;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(line.ends_with("(direct)"), "{line}");
+    a.close().await;
+    b.close().await;
+}

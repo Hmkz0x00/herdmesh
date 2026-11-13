@@ -6,6 +6,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod core;
+pub mod feed;
 pub mod ipc;
 mod peer_owner;
 
@@ -15,3 +16,5 @@ pub use core::{
 
 /// Crate name, used by `herdmesh doctor` and tests to prove linkage.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+
+pub mod display;

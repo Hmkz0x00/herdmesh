@@ -9,3 +9,5 @@ pub mod notify;
 pub mod repair;
 pub mod room;
 pub mod session;
+
+pub mod view;

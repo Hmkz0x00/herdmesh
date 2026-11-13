@@ -377,3 +377,86 @@ fn oversized_event_is_rejected_on_every_append_path() {
     assert_eq!((r.inserted, r.rejected), (0, 1));
     assert_eq!(s.event_count().unwrap(), 0);
 }
+
+#[test]
+fn insertion_cursor_survives_reopen_migration_and_twin_replacement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("events.db");
+    let key = key_from(1);
+    let early = ev(
+        &key,
+        "a",
+        100,
+        0,
+        EventBody::Note {
+            scope: "s".into(),
+            text: "early".into(),
+        },
+    );
+    let late = ev(
+        &key,
+        "a",
+        1,
+        0,
+        EventBody::Note {
+            scope: "s".into(),
+            text: "late".into(),
+        },
+    );
+    {
+        let mut store = Store::open(&path, room()).unwrap();
+        store.append(&early).unwrap();
+        store.append(&late).unwrap();
+    }
+    // Simulate a database from before local insertion cursors existed.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS event_arrival_insert; DROP TABLE IF EXISTS event_arrivals;",
+    )
+    .unwrap();
+    drop(conn);
+    let mut store = Store::open(&path, room()).unwrap();
+    let rows = store.events_after(0, 10).unwrap();
+    assert_eq!(
+        rows.iter().map(|(_, e)| e.id).collect::<Vec<_>>(),
+        [early.id, late.id]
+    );
+    assert!(rows[0].0 < rows[1].0);
+    assert_eq!(store.events_after(rows[0].0, 1).unwrap()[0].1.id, late.id);
+    store.append(&late).unwrap();
+    assert!(store.events_after(rows[1].0, 10).unwrap().is_empty());
+    let twin_key = key_from(2);
+    let mut twins: Vec<_> = ["one", "two"]
+        .into_iter()
+        .map(|text| {
+            Event::sign(
+                &twin_key,
+                room(),
+                "b",
+                1,
+                Lamport(1),
+                0,
+                EventBody::Note {
+                    scope: "s".into(),
+                    text: text.into(),
+                },
+            )
+            .unwrap()
+        })
+        .collect();
+    twins.sort_by_key(|e| e.id);
+    store.append(&twins[1]).unwrap();
+    let cursor = store.events_after(rows[1].0, 10).unwrap()[0].0;
+    drop(store);
+    let mut store = Store::open(&path, room()).unwrap();
+    store.append(&twins[0]).unwrap();
+    let replacement = store.events_after(cursor, 10).unwrap();
+    assert_eq!(replacement.len(), 1);
+    assert!(
+        replacement[0].0 > cursor,
+        "never reuse a deleted event's cursor"
+    );
+    assert_eq!(replacement[0].1.id, twins[0].id);
+    assert!(store.events_after(u64::MAX, 10).unwrap().is_empty());
+    assert!(store.events_after(0, 0).unwrap().is_empty());
+}
