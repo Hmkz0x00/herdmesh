@@ -65,6 +65,22 @@ Add the `herdmesh` entry to `.agents/mcp_config.json` (at the repository root):
 
 ---
 
+## 4. Tell Your Agent to Use It
+
+Configuring the MCP server makes herdmesh tools available, but an agent will not call them unless instructed. Without instructions, an agent works in isolation and appears idle on the live room board.
+
+Add the collaboration instructions from [docs/snippets/herdmesh-collab.md](snippets/herdmesh-collab.md) to your agent's instruction file:
+
+| Agent | Instruction File Location |
+| :--- | :--- |
+| **Claude Code** | `CLAUDE.md` (at repository root) |
+| **OpenAI Codex** | `AGENTS.md` (at repository root or `$CODEX_HOME/AGENTS.md`) |
+| **Google Antigravity** | `AGENTS.md` (at repository root or `.agents/rules/herdmesh.md`) |
+
+See [docs/snippets/herdmesh-collab.md](snippets/herdmesh-collab.md) for the exact copy-paste snippet (<=120 words).
+
+---
+
 ## Agent Identity & Multi-Agent Workspaces
 
 When running multiple agents on the same host (for example, inside [herdr](https://herdr.dev)), ensure each agent uses its own distinct identity:
