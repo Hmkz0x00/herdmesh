@@ -48,6 +48,8 @@ pub enum SessionError {
     Poisoned,
     #[error("room has no genesis event; recreate it with this version")]
     NoGenesis,
+    #[error("agent name: {0}")]
+    Name(#[from] hm_proto::names::NameError),
 }
 
 /// Unix millis now (0 if the clock is before 1970).
@@ -152,6 +154,7 @@ pub fn node_key(data: &DataDir) -> Result<SigningKey, SessionError> {
 /// Room creation (ADR-002 §4): sign `Genesis { owner: us }` as the room's
 /// first event and pin it. Idempotent: returns the pinned id if there is one.
 pub fn init_genesis(data: &DataDir, id: RoomId, agent: &str) -> Result<EventId, SessionError> {
+    hm_proto::names::check_name(agent)?;
     let key = node_key(data)?;
     let mut store = Store::open(data.events_db(&id), id)?;
     if let Some(g) = store.genesis() {
@@ -280,6 +283,8 @@ impl RoomSession {
         store: SharedStore,
     ) -> Result<Self, SessionError> {
         let cfg = data.load_room(&id)?;
+        // The name is signed into every event we author (N7).
+        hm_proto::names::check_name(&cfg.agent_name)?;
         let secret = data.load_secret(&id, &cfg)?;
         let known_peers = data.load_peers(&id)?;
         let key = node_key(data)?;

@@ -93,6 +93,7 @@ async fn mcp_backend_round_trips_through_a_running_daemon() {
         mcp(&data, &sock, "alice").await,
         mcp(&data, &sock, "bob").await,
     );
+    b.invoke("inbox", json!({})).await.unwrap(); // bob joins the room first
     a.invoke("ask", json!({"to": "bob", "question": "ready?"}))
         .await
         .unwrap();

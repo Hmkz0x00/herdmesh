@@ -21,7 +21,6 @@ use crate::ipc::{Call, ErrCode, Handler, Items, Request, Response};
 
 /// Author label for daemon-generated text (cards, briefs, acknowledgements).
 pub const DAEMON_AUTHOR: &str = "herdmesh";
-const AGENT_NAME_MAX: usize = 24;
 const MAX_BRIEF_TOKENS: usize = 4000;
 const INBOX_MAX: usize = 50;
 const SEARCH_WINDOW: u64 = 1000;
@@ -195,14 +194,98 @@ fn ping_for(
     })
 }
 
+/// Outcome of resolving an ask/handoff target.
+enum Target {
+    Found(AgentRef),
+    /// Not sent; the text tells the caller which agents exist.
+    Unknown(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Pick {
+    One(AgentRef),
+    None,
+    Many(Vec<AgentRef>),
+}
+
+/// Match `to` against the room's agents (ADR-004 section 1). In order:
+/// `node6/name` (hex prefix of the machine key), `person/agent` (the agent is
+/// named `person-agent...`), an exact agent name, then a unique name prefix.
+/// Never falls back to an agent that is not in the room.
+fn pick_target(agents: &[AgentRef], to: &str) -> Pick {
+    let narrow = |hits: Vec<&AgentRef>| match hits.as_slice() {
+        [] => None,
+        [one] => Some(Pick::One((*one).clone())),
+        many => Some(Pick::Many(many.iter().map(|a| (*a).clone()).collect())),
+    };
+    if let Some((left, right)) = to.split_once('/') {
+        let by_node: Vec<&AgentRef> = agents
+            .iter()
+            .filter(|a| {
+                left.len() >= 4 && a.agent_name == right && a.node.to_string().starts_with(left)
+            })
+            .collect();
+        if let Some(p) = narrow(by_node) {
+            return p;
+        }
+        let by_person: Vec<&AgentRef> = agents
+            .iter()
+            .filter(|a| {
+                a.agent_name
+                    .strip_prefix(left)
+                    .and_then(|r| r.strip_prefix('-'))
+                    .is_some_and(|kind| kind.starts_with(right))
+            })
+            .collect();
+        return narrow(by_person).unwrap_or(Pick::None);
+    }
+    let exact: Vec<&AgentRef> = agents.iter().filter(|a| a.agent_name == to).collect();
+    if let Some(p) = narrow(exact) {
+        return p;
+    }
+    let prefixed: Vec<&AgentRef> = agents
+        .iter()
+        .filter(|a| a.agent_name.starts_with(to))
+        .collect();
+    narrow(prefixed).unwrap_or(Pick::None)
+}
+
+/// `a, b, c` (distinct names; `name@node6` when a name repeats), capped.
+fn names_list(agents: &[AgentRef]) -> String {
+    const SHOWN: usize = 20;
+    let mut names: Vec<String> = agents
+        .iter()
+        .map(|a| {
+            let dup = agents
+                .iter()
+                .filter(|b| b.agent_name == a.agent_name)
+                .count()
+                > 1;
+            let name = clean(&a.agent_name, 40);
+            if dup {
+                format!("{name}@{}", &a.node.to_string()[..6])
+            } else {
+                name
+            }
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    let more = names.len().saturating_sub(SHOWN);
+    names.truncate(SHOWN);
+    let mut out = names.join(", ");
+    if out.is_empty() {
+        out.push_str("(none yet)");
+    }
+    if more > 0 {
+        out.push_str(&format!(", and {more} more"));
+    }
+    out
+}
+
 fn valid_agent(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= AGENT_NAME_MAX
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-        // Names are signed into every event and shown to peers (N7).
-        && !hm_proto::redact::contains_secret(name)
+    // One shared rule for every name; also rejects secret-looking names (N7).
+    hm_proto::names::valid_name(name)
 }
 
 fn parse_status(s: &str) -> Res<TaskStatus> {
@@ -597,30 +680,36 @@ impl Daemon {
             .map(|_| ())
     }
 
-    /// `node6/name`, a bare name known in the room, or a bare local name.
-    fn resolve(&self, st: &RoomState<'_>, to: &str) -> Res<AgentRef> {
-        let members = &st.store.views().members;
-        if let Some((node, name)) = to.split_once('/') {
-            if node.len() < 4 || !valid_agent(name) {
-                return Err(ErrCode::BadRequest);
-            }
-            let mut hits = members
-                .keys()
-                .filter(|a| a.agent_name == name && a.node.to_string().starts_with(node));
-            return match (hits.next(), hits.next()) {
-                (Some(a), None) => Ok(a.clone()),
-                _ => Err(ErrCode::NotFound),
-            };
-        }
-        if !valid_agent(to) {
+    /// Resolve an ask/handoff target; see [`pick_target`]. No match is not an
+    /// error code (the MCP layer would flatten it to "unavailable"): it is a
+    /// message listing the room's agents, and nothing is sent.
+    fn resolve(&self, st: &RoomState<'_>, to: &str) -> Res<Target> {
+        let to = to.trim();
+        let (left, right) = to.split_once('/').unwrap_or((to, ""));
+        let part_ok = |p: &str| {
+            !p.is_empty()
+                && p.len() <= 2 * hm_proto::names::NAME_MAX
+                && p.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                && !hm_proto::redact::contains_secret(p)
+        };
+        if !part_ok(left) || (to.contains('/') && !part_ok(right)) {
             return Err(ErrCode::BadRequest);
         }
-        let mut hits = members.keys().filter(|a| a.agent_name == to);
-        match (hits.next(), hits.next()) {
-            (Some(a), None) => Ok(a.clone()),
-            (None, _) => Ok(AgentRef::new(self.node, to)),
-            _ => Err(ErrCode::BadRequest),
-        }
+        let agents: Vec<AgentRef> = st.store.views().members.keys().cloned().collect();
+        Ok(match pick_target(&agents, to) {
+            Pick::One(a) => Target::Found(a),
+            Pick::None => Target::Unknown(format!(
+                "No agent matches '{}'. Agents in this room: {}. Nothing was sent.",
+                clean(to, 40),
+                names_list(&agents)
+            )),
+            Pick::Many(hits) => Target::Unknown(format!(
+                "'{}' matches several agents: {}. Use person/agent or node6/name. Nothing was sent.",
+                clean(to, 40),
+                names_list(&hits)
+            )),
+        })
     }
 
     fn call(&self, st: &mut RoomState<'_>, agent: &str, call: Call) -> Res<Items> {
@@ -636,7 +725,10 @@ impl Daemon {
             Call::Brief { max_tokens } => self.brief(st, &me, max_tokens as usize, now),
             Call::Inbox { ack } => Self::inbox(st, &me, ack),
             Call::Ask { to, question } => {
-                let to = self.resolve(st, &to)?;
+                let to = match self.resolve(st, &to)? {
+                    Target::Found(a) => a,
+                    Target::Unknown(msg) => return ok(msg),
+                };
                 let ev = self.emit(
                     st,
                     agent,
@@ -674,7 +766,11 @@ impl Daemon {
                 refs,
                 next_steps,
             } => {
-                let to = to.map(|t| self.resolve(st, &t)).transpose()?;
+                let to = match to.map(|t| self.resolve(st, &t)).transpose()? {
+                    None => None,
+                    Some(Target::Found(a)) => Some(a),
+                    Some(Target::Unknown(msg)) => return ok(msg),
+                };
                 let refs = parse_refs(&refs)?;
                 let ev = self.emit(
                     st,
@@ -1008,4 +1104,85 @@ fn fit_card(card: String) -> String {
         }
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    fn ag(node: u8, name: &str) -> AgentRef {
+        AgentRef::new(hm_proto::NodeId::from_bytes([node; 32]), name)
+    }
+    fn room() -> Vec<AgentRef> {
+        vec![
+            ag(0xa1, "alice-claude"),
+            ag(0xa1, "alice-codex"),
+            ag(0xb2, "bob-claude"),
+            ag(0xc3, "cli"),
+        ]
+    }
+
+    #[test]
+    fn exact_name_and_unique_prefix() {
+        assert_eq!(
+            pick_target(&room(), "bob-claude"),
+            Pick::One(ag(0xb2, "bob-claude"))
+        );
+        assert_eq!(
+            pick_target(&room(), "bob"),
+            Pick::One(ag(0xb2, "bob-claude"))
+        );
+        assert_eq!(pick_target(&room(), "cl"), Pick::One(ag(0xc3, "cli")));
+    }
+
+    #[test]
+    fn person_slash_agent() {
+        assert_eq!(
+            pick_target(&room(), "alice/claude"),
+            Pick::One(ag(0xa1, "alice-claude"))
+        );
+        assert_eq!(
+            pick_target(&room(), "alice/cod"),
+            Pick::One(ag(0xa1, "alice-codex"))
+        );
+        assert_eq!(pick_target(&room(), "bob/codex"), Pick::None);
+    }
+
+    #[test]
+    fn node_prefix_slash_name_still_works() {
+        assert_eq!(
+            pick_target(&room(), "b2b2/bob-claude"),
+            Pick::One(ag(0xb2, "bob-claude"))
+        );
+        assert_eq!(pick_target(&room(), "b2b2/alice-claude"), Pick::None);
+    }
+
+    #[test]
+    fn ambiguity_and_no_match_never_fall_back() {
+        assert!(matches!(pick_target(&room(), "alice"), Pick::Many(v) if v.len() == 2));
+        assert_eq!(pick_target(&room(), "claude"), Pick::None);
+        // The old behaviour addressed an unknown local name; now nothing matches.
+        assert_eq!(pick_target(&room(), "ghost"), Pick::None);
+        assert_eq!(pick_target(&[], "anyone"), Pick::None);
+    }
+
+    #[test]
+    fn same_name_on_two_machines_is_ambiguous_and_listed_with_nodes() {
+        let r = vec![ag(0xa1, "claude"), ag(0xb2, "claude")];
+        let Pick::Many(hits) = pick_target(&r, "claude") else {
+            panic!("expected Many");
+        };
+        assert_eq!(names_list(&hits), "claude@a1a1a1, claude@b2b2b2");
+        assert_eq!(
+            pick_target(&r, "b2b2/claude"),
+            Pick::One(ag(0xb2, "claude"))
+        );
+    }
+
+    #[test]
+    fn listing_is_capped_and_handles_empty() {
+        assert_eq!(names_list(&[]), "(none yet)");
+        let many: Vec<AgentRef> = (0..25).map(|i| ag(1, &format!("a{i:02}"))).collect();
+        assert!(names_list(&many).ends_with("and 5 more"));
+    }
 }

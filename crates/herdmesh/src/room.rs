@@ -7,7 +7,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use hm_net::{RoomSecret, RoomTicket};
-use hm_proto::{EventBody, NodeId, Role};
+use hm_proto::{EventBody, NodeId, Role, RoomId};
 use hm_store::Views;
 
 use crate::data::{DataDir, RoleName, RoomConfig};
@@ -50,8 +50,20 @@ fn ticket_block(t: &RoomTicket) -> String {
     format!("Ticket (secret, share only with room members):\n{t}\n")
 }
 
-/// `room create <name>`: new secret, local state, prints a ticket.
-pub async fn create(data: &DataDir, name: &str, agent: &str) -> Result<String, RoomError> {
+/// A room we just created.
+pub struct Created {
+    pub id: RoomId,
+    pub node: String,
+    pub ticket: RoomTicket,
+}
+
+/// Create a room: new secret, local state; returns the ticket.
+pub async fn create_with_ticket(
+    data: &DataDir,
+    name: &str,
+    agent: &str,
+) -> Result<Created, RoomError> {
+    hm_proto::names::check_name(agent).map_err(SessionError::from)?;
     let relay = data.load_config()?.relay()?;
     let secret = RoomSecret::generate()?;
     let id = data.create_room(&secret, &RoomConfig::new(name, RoleName::Owner, agent), &[])?;
@@ -60,15 +72,27 @@ pub async fn create(data: &DataDir, name: &str, agent: &str) -> Result<String, R
     let own = own_addr(&net, &relay, ONLINE_WAIT).await;
     let node = net.endpoint().id();
     net.shutdown().await;
-    let t = make_ticket(secret, genesis, own, vec![]);
+    let ticket = make_ticket(secret, genesis, own, vec![]);
+    Ok(Created {
+        id,
+        node: node.to_string(),
+        ticket,
+    })
+}
+
+/// `room create <name>`: new secret, local state, prints a ticket.
+pub async fn create(data: &DataDir, name: &str, agent: &str) -> Result<String, RoomError> {
+    let made = create_with_ticket(data, name, agent).await?;
     Ok(format!(
-        "Created room '{name}' (id: {id})\nNode: {node}\n{}Run `herdmesh room run {name}` to go online.\n",
-        ticket_block(&t)
+        "Created room '{name}' (id: {})\nNode: {}\n{}Run `herdmesh room run {name}` to go online.\n",
+        made.id,
+        made.node,
+        ticket_block(&made.ticket)
     ))
 }
 
 /// `room invite <room>`: ticket with our current address + known peers.
-pub async fn invite(data: &DataDir, room: &str) -> Result<String, RoomError> {
+pub async fn invite(data: &DataDir, room: &str, copy: bool) -> Result<String, RoomError> {
     let relay = data.load_config()?.relay()?;
     let (id, cfg) = data.resolve_room(room)?;
     let secret = data.load_secret(&id, &cfg)?;
@@ -77,7 +101,20 @@ pub async fn invite(data: &DataDir, room: &str) -> Result<String, RoomError> {
     let net = bind_net(data, relay.clone()).await?;
     let own = own_addr(&net, &relay, ONLINE_WAIT).await;
     net.shutdown().await;
-    Ok(ticket_block(&make_ticket(secret, genesis, own, peers)))
+    let ticket = make_ticket(secret, genesis, own, peers);
+    let mut out = ticket_block(&ticket);
+    if copy {
+        out.push_str(&copy_note(crate::clipboard::copy(&ticket.to_string())));
+    }
+    Ok(out)
+}
+
+/// One line telling the user whether the clipboard copy worked.
+pub fn copy_note(used: Option<&str>) -> String {
+    match used {
+        Some(_) => "Copied the ticket to the clipboard.\n".to_owned(),
+        None => "No clipboard tool found; copy the ticket above by hand.\n".to_owned(),
+    }
 }
 
 /// `room join <ticket> [--as <agent>] [--name <name>]`: local state only.
@@ -87,6 +124,7 @@ pub fn join(
     agent: &str,
     name: Option<&str>,
 ) -> Result<String, RoomError> {
+    hm_proto::names::check_name(agent).map_err(SessionError::from)?;
     let t: RoomTicket = ticket.trim().parse()?;
     let id = t.room_id;
     let name = name.map_or_else(|| format!("room-{}", &id.to_string()[..8]), str::to_owned);

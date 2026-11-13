@@ -769,6 +769,12 @@ mod tests {
     async fn event_detail_has_complete_text_and_unknown_is_404() {
         let d = daemon();
         let long = format!("<script>{}end", "word ".repeat(100));
+        // bob must be in the room: unknown ask targets are no longer addressed silently.
+        d.handle_request(Request {
+            agent: "bob".into(),
+            room: None,
+            call: Call::Inbox { ack: false },
+        });
         d.handle_request(Request {
             agent: "alice".into(),
             room: None,
