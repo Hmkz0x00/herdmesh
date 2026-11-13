@@ -689,7 +689,9 @@ impl Daemon {
         let part_ok = |p: &str| {
             !p.is_empty()
                 && p.len() <= 2 * hm_proto::names::NAME_MAX
-                && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && p.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                && !hm_proto::redact::contains_secret(p)
         };
         if !part_ok(left) || (to.contains('/') && !part_ok(right)) {
             return Err(ErrCode::BadRequest);
