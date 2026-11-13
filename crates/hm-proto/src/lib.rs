@@ -9,6 +9,7 @@ mod event;
 pub mod feed;
 mod ids;
 pub mod limits;
+pub mod names;
 pub mod redact;
 mod refs;
 
