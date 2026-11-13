@@ -145,6 +145,24 @@ impl DataDir {
         std::fs::rename(&tmp, &path).map_err(io_err(&path))
     }
 
+    /// Per-machine agent name locks (see `naming::claim_agent_name`).
+    pub fn agents_dir(&self) -> PathBuf {
+        self.root.join("agents")
+    }
+
+    /// Write `herdmesh.toml` (creates the data dir).
+    pub fn save_config(&self, cfg: &Config) -> Result<(), DataError> {
+        let path = self.config_file();
+        let text = toml::to_string(cfg).map_err(|e| DataError::Parse {
+            path: path.clone(),
+            msg: e.to_string(),
+        })?;
+        std::fs::create_dir_all(&self.root).map_err(io_err(&self.root))?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, text).map_err(io_err(&tmp))?;
+        std::fs::rename(&tmp, &path).map_err(io_err(&path))
+    }
+
     pub fn load_config(&self) -> Result<Config, DataError> {
         let path = self.config_file();
         match std::fs::read_to_string(&path) {
@@ -312,11 +330,18 @@ pub type SyncLog = BTreeMap<String, SyncRecord>;
 pub struct Config {
     /// Self-hosted relay; omitted = n0 public relays.
     pub relay_url: Option<String>,
+    /// Your name in rooms (ADR-004); omitted = derived from the OS user name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person: Option<String>,
 }
 
 impl Config {
     pub fn parse(s: &str) -> Result<Self, String> {
-        toml::from_str(s).map_err(|e| e.to_string())
+        let cfg: Self = toml::from_str(s).map_err(|e| e.to_string())?;
+        if let Some(p) = &cfg.person {
+            hm_proto::names::check_name(p).map_err(|e| format!("person: {e}"))?;
+        }
+        Ok(cfg)
     }
 
     pub fn relay(&self) -> Result<RelayChoice, DataError> {

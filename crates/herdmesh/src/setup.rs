@@ -1,0 +1,796 @@
+//! `herdmesh setup`: one command per person per project (ADR-004 section 2).
+//!
+//! Project-level files only, never user-level config:
+//! * `.mcp.json` (Claude Code), `.codex/config.toml` (Codex),
+//!   `.agents/mcp_config.json` (Antigravity), each running
+//!   `herdmesh mcp --kind <kind> --room <room>`, merged into what is there;
+//! * the collaboration snippet appended to `CLAUDE.md` / `AGENTS.md`;
+//! * `.herdmesh/room`, so room commands know the project's room.
+//!
+//! Every file change is shown as a diff and needs a yes unless `--yes`.
+//! Re-running changes nothing once everything is in place.
+
+use std::ffi::OsStr;
+use std::fmt::Write as _;
+use std::io::{BufRead as _, IsTerminal as _, Write as _};
+use std::path::{Path, PathBuf};
+
+use hm_net::RoomTicket;
+use serde_json::{Value, json};
+
+use crate::clipboard;
+use crate::daemon;
+use crate::data::DataDir;
+use crate::naming;
+use crate::project;
+use crate::room;
+
+const SNIPPET_DOC: &str = include_str!("../../../docs/snippets/herdmesh-collab.md");
+/// Heading of the snippet; its presence means the snippet is already installed.
+pub const SNIPPET_MARKER: &str = "## Herdmesh Collaboration";
+/// Name of the server entry written into every agent config.
+pub const SERVER_NAME: &str = "herdmesh";
+
+/// An agent CLI we can configure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Kind {
+    Claude,
+    Codex,
+    Agy,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 3] = [Kind::Claude, Kind::Codex, Kind::Agy];
+
+    /// Used both as the executable name and as `--kind`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Claude => "claude",
+            Kind::Codex => "codex",
+            Kind::Agy => "agy",
+        }
+    }
+
+    /// Project-relative config file, as path components.
+    fn config_parts(self) -> &'static [&'static str] {
+        match self {
+            Kind::Claude => &[".mcp.json"],
+            Kind::Codex => &[".codex", "config.toml"],
+            Kind::Agy => &[".agents", "mcp_config.json"],
+        }
+    }
+
+    pub fn config_path(self) -> PathBuf {
+        self.config_parts().iter().collect()
+    }
+
+    fn is_toml(self) -> bool {
+        self == Kind::Codex
+    }
+}
+
+/// The collaboration snippet: the fenced markdown block of the snippet doc.
+pub fn snippet() -> String {
+    let doc = SNIPPET_DOC.replace("\r\n", "\n");
+    let fence = "```markdown\n";
+    let Some(start) = doc.find(fence).map(|i| i + fence.len()) else {
+        return String::new();
+    };
+    let end = doc[start..].find("\n```").map_or(doc.len(), |i| start + i);
+    doc[start..end].trim_end().to_owned() + "\n"
+}
+
+/// Which agent CLIs are installed: an executable named after each kind in a
+/// `PATH` directory (trying each of `exts`, e.g. `.exe` on Windows).
+pub fn detect(path_var: &OsStr, exts: &[&str]) -> Vec<Kind> {
+    let dirs: Vec<PathBuf> = std::env::split_paths(path_var).collect();
+    Kind::ALL
+        .into_iter()
+        .filter(|k| {
+            dirs.iter().any(|d| {
+                exts.iter()
+                    .any(|e| d.join(format!("{}{e}", k.name())).is_file())
+            })
+        })
+        .collect()
+}
+
+/// Installed agent CLIs on this machine's `PATH`.
+pub fn detect_installed() -> Vec<Kind> {
+    let exts: &[&str] = if cfg!(windows) {
+        &[".exe", ".cmd", ".bat", ".com"]
+    } else {
+        &[""]
+    };
+    std::env::var_os("PATH").map_or_else(Vec::new, |p| detect(&p, exts))
+}
+
+fn server_args(kind: Kind, room: &str) -> Vec<String> {
+    ["mcp", "--kind", kind.name(), "--room", room]
+        .map(str::to_owned)
+        .to_vec()
+}
+
+fn server_entry_json(kind: Kind, room: &str) -> Value {
+    json!({ "command": "herdmesh", "args": server_args(kind, room) })
+}
+
+/// `existing` JSON config with our server entry set; everything else kept.
+pub fn merge_json(existing: Option<&str>, kind: Kind, room: &str) -> Result<String, String> {
+    let mut root: Value = match existing {
+        Some(t) if !t.trim().is_empty() => {
+            serde_json::from_str(t).map_err(|e| format!("not valid JSON ({e})"))?
+        }
+        _ => json!({}),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or("top level is not a JSON object")?;
+    let servers = obj.entry("mcpServers").or_insert_with(|| json!({}));
+    let servers = servers
+        .as_object_mut()
+        .ok_or("\"mcpServers\" is not an object")?;
+    servers.insert(SERVER_NAME.to_owned(), server_entry_json(kind, room));
+    let mut text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    text.push('\n');
+    Ok(text)
+}
+
+fn server_table_toml(kind: Kind, room: &str) -> toml::Table {
+    let mut entry = toml::Table::new();
+    entry.insert("command".into(), "herdmesh".into());
+    entry.insert(
+        "args".into(),
+        toml::Value::Array(
+            server_args(kind, room)
+                .into_iter()
+                .map(toml::Value::String)
+                .collect(),
+        ),
+    );
+    let mut servers = toml::Table::new();
+    servers.insert(SERVER_NAME.into(), toml::Value::Table(entry));
+    let mut root = toml::Table::new();
+    root.insert("mcp_servers".into(), toml::Value::Table(servers));
+    root
+}
+
+/// `existing` Codex TOML config with our server entry set. A missing entry is
+/// appended as text so comments and layout survive; a differing entry is
+/// replaced by re-serialising the file.
+pub fn merge_toml(existing: Option<&str>, kind: Kind, room: &str) -> Result<String, String> {
+    let wanted = server_table_toml(kind, room);
+    let text = existing.unwrap_or("");
+    let mut parsed: toml::Table = if text.trim().is_empty() {
+        toml::Table::new()
+    } else {
+        text.parse().map_err(|e| format!("not valid TOML ({e})"))?
+    };
+    let has_entry = parsed
+        .get("mcp_servers")
+        .and_then(|v| v.as_table())
+        .is_some_and(|t| t.contains_key(SERVER_NAME));
+    if !has_entry {
+        let mut out = text.to_owned();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&toml::to_string(&wanted).map_err(|e| e.to_string())?);
+        if out.parse::<toml::Table>().is_ok() {
+            return Ok(out);
+        }
+    }
+    // Replace (or the append produced invalid TOML, e.g. inline tables).
+    let servers = parsed
+        .entry("mcp_servers")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or("\"mcp_servers\" is not a table")?;
+    let entry = wanted
+        .get("mcp_servers")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get(SERVER_NAME))
+        .cloned()
+        .ok_or("internal: missing entry")?;
+    servers.insert(SERVER_NAME.to_owned(), entry);
+    toml::to_string(&parsed).map_err(|e| e.to_string())
+}
+
+/// True when both texts hold the same data (formatting differences ignored).
+fn same_data(kind: Kind, old: &str, new: &str) -> bool {
+    if kind.is_toml() {
+        matches!((old.parse::<toml::Table>(), new.parse::<toml::Table>()), (Ok(a), Ok(b)) if a == b)
+    } else {
+        matches!((serde_json::from_str::<Value>(old), serde_json::from_str::<Value>(new)), (Ok(a), Ok(b)) if a == b)
+    }
+}
+
+/// Minimal unified-style diff for showing the user what will change.
+pub fn unified_diff(path: &str, old: &str, new: &str) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let mut out = format!("--- {path}\n+++ {path} (after setup)\n");
+    if a.len().saturating_mul(b.len()) > 4_000_000 {
+        let _ = writeln!(
+            out,
+            "(file too large to diff; {} lines will be replaced)",
+            a.len()
+        );
+        return out;
+    }
+    // LCS table over lines.
+    let mut t = vec![vec![0u32; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            t[i][j] = if a[i] == b[j] {
+                t[i + 1][j + 1] + 1
+            } else {
+                t[i + 1][j].max(t[i][j + 1])
+            };
+        }
+    }
+    let mut ops: Vec<(char, &str)> = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            ops.push((' ', a[i]));
+            i += 1;
+            j += 1;
+        } else if t[i + 1][j] >= t[i][j + 1] {
+            ops.push(('-', a[i]));
+            i += 1;
+        } else {
+            ops.push(('+', b[j]));
+            j += 1;
+        }
+    }
+    ops.extend(a[i..].iter().map(|l| ('-', *l)));
+    ops.extend(b[j..].iter().map(|l| ('+', *l)));
+    const CONTEXT: usize = 2;
+    let keep: Vec<bool> = (0..ops.len())
+        .map(|k| {
+            let lo = k.saturating_sub(CONTEXT);
+            let hi = (k + CONTEXT).min(ops.len().saturating_sub(1));
+            ops[lo..=hi].iter().any(|(c, _)| *c != ' ')
+        })
+        .collect();
+    let mut gap = false;
+    for (k, (c, line)) in ops.iter().enumerate() {
+        if keep[k] {
+            let _ = writeln!(out, "{c} {line}");
+            gap = false;
+        } else if !gap {
+            out.push_str("  ...\n");
+            gap = true;
+        }
+    }
+    out
+}
+
+/// One file we would write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    /// Project-relative path.
+    pub path: PathBuf,
+    pub old: Option<String>,
+    pub new: String,
+}
+
+impl FileChange {
+    pub fn diff(&self) -> String {
+        unified_diff(
+            &self.path.display().to_string(),
+            self.old.as_deref().unwrap_or(""),
+            &self.new,
+        )
+    }
+}
+
+/// What setup would change, plus files it refuses to touch.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Plan {
+    pub changes: Vec<FileChange>,
+    /// `(path, reason)` for files we could not merge safely (left alone).
+    pub problems: Vec<(PathBuf, String)>,
+}
+
+fn read_opt(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s.replace("\r\n", "\n"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Which instruction file gets the snippet for `kinds`.
+fn instruction_targets(project: &Path, kinds: &[Kind]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for k in kinds {
+        let t = match k {
+            Kind::Claude => {
+                // CLAUDE.md that imports AGENTS.md is satisfied by AGENTS.md.
+                let imports = read_opt(&project.join("CLAUDE.md"))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| s.lines().any(|l| l.trim() == "@AGENTS.md"));
+                if imports { "AGENTS.md" } else { "CLAUDE.md" }
+            }
+            Kind::Codex | Kind::Agy => "AGENTS.md",
+        };
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Work out the file changes for `kinds` in `project` without writing anything.
+pub fn plan_files(project: &Path, kinds: &[Kind], room: &str) -> Plan {
+    let mut plan = Plan::default();
+    for &kind in kinds {
+        let rel = kind.config_path();
+        let abs = project.join(&rel);
+        let result = read_opt(&abs).and_then(|old| {
+            let new = if kind.is_toml() {
+                merge_toml(old.as_deref(), kind, room)
+            } else {
+                merge_json(old.as_deref(), kind, room)
+            }?;
+            Ok((old, new))
+        });
+        match result {
+            Ok((Some(old), new)) if same_data(kind, &old, &new) => {}
+            Ok((old, new)) => plan.changes.push(FileChange {
+                path: rel,
+                old,
+                new,
+            }),
+            Err(why) => plan.problems.push((rel, why)),
+        }
+    }
+    let snip = snippet();
+    for target in instruction_targets(project, kinds) {
+        let rel = PathBuf::from(target);
+        match read_opt(&project.join(target)) {
+            Ok(Some(old)) if old.contains(SNIPPET_MARKER) => {}
+            Ok(old) => {
+                let mut new = old.clone().unwrap_or_default();
+                if !new.is_empty() {
+                    if !new.ends_with('\n') {
+                        new.push('\n');
+                    }
+                    new.push('\n');
+                }
+                new.push_str(&snip);
+                plan.changes.push(FileChange {
+                    path: rel,
+                    old,
+                    new,
+                });
+            }
+            Err(why) => plan.problems.push((rel, why)),
+        }
+    }
+    plan
+}
+
+/// Result of applying a plan.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Applied {
+    pub written: Vec<PathBuf>,
+    pub declined: Vec<PathBuf>,
+}
+
+fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("herdmesh-tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Show each change's diff via `show`, ask `confirm`, write the accepted ones.
+pub fn apply(
+    project: &Path,
+    plan: &Plan,
+    confirm: &mut dyn FnMut(&FileChange) -> bool,
+    show: &mut dyn FnMut(&str),
+) -> std::io::Result<Applied> {
+    let mut done = Applied::default();
+    for ch in &plan.changes {
+        show(&ch.diff());
+        if confirm(ch) {
+            write_file(&project.join(&ch.path), &ch.new)?;
+            done.written.push(ch.path.clone());
+        } else {
+            done.declined.push(ch.path.clone());
+        }
+    }
+    Ok(done)
+}
+
+/// `y`/`yes` (any case) at the prompt.
+pub fn is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn ask_yes(prompt: &str) -> bool {
+    print!("{prompt} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).is_ok() && is_yes(&line)
+}
+
+/// Local room name for a project folder: the folder name as a valid name.
+pub fn room_name_for(project: &Path) -> String {
+    let folder = project
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    hm_proto::names::sanitize_name(folder, hm_proto::names::NAME_MAX)
+        .unwrap_or_else(|| "project".to_owned())
+}
+
+pub struct Opts<'a> {
+    pub data: &'a DataDir,
+    pub project: &'a Path,
+    /// `Some(ticket)`, or `Some("")` to read the ticket from the clipboard.
+    pub join: Option<String>,
+    pub name: Option<String>,
+    pub yes: bool,
+}
+
+/// Run setup, printing progress to stdout. Returns an error message on failure.
+pub async fn run(opts: Opts<'_>) -> Result<(), String> {
+    let interactive = std::io::stdin().is_terminal();
+    if !opts.yes && !interactive {
+        return Err(
+            "setup asks before changing files, and this is not a terminal; add --yes".to_owned(),
+        );
+    }
+    let data = opts.data;
+    // 1. person name.
+    let mut cfg = data.load_config().map_err(|e| e.to_string())?;
+    if let Some(n) = &opts.name {
+        cfg.person = Some(naming::validate("--name", n).map_err(|e| e.to_string())?);
+        data.save_config(&cfg).map_err(|e| e.to_string())?;
+    }
+    let person = naming::person(&cfg).map_err(|e| e.to_string())?;
+    println!("You are '{person}' (change with `herdmesh setup --name <you>`).");
+
+    // 2. the room.
+    let room_name = room_name_for(opts.project);
+    let cli_agent = naming::candidate(&person, "cli", 1).map_err(|e| e.to_string())?;
+    let rooms = data.list_rooms().map_err(|e| e.to_string())?;
+    let mut ticket_to_share: Option<RoomTicket> = None;
+    if rooms.iter().any(|(_, c)| c.name == room_name) {
+        println!("Room '{room_name}' already exists on this machine; reusing it.");
+    } else if let Some(arg) = &opts.join {
+        let raw = if arg.trim().is_empty() {
+            clipboard::paste()
+                .ok_or("no ticket given and the clipboard has none; pass --join <ticket>")?
+        } else {
+            arg.clone()
+        };
+        let out =
+            room::join(data, &raw, &cli_agent, Some(&room_name)).map_err(|e| e.to_string())?;
+        print!("{out}");
+    } else {
+        let made = room::create_with_ticket(data, &room_name, &cli_agent)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!("Created room '{room_name}' (id: {}).", made.id);
+        ticket_to_share = Some(made.ticket);
+    }
+
+    // 3. daemon (warning only: the agents start it too).
+    if let Err(e) = daemon::ensure_for_cli(
+        data,
+        &daemon::default_socket(),
+        || daemon::spawn_detached(data),
+        |m| eprintln!("herdmesh setup: {m}"),
+    )
+    .await
+    {
+        eprintln!("herdmesh setup: daemon not started ({e}); it starts with your first agent");
+    }
+
+    // 4. project files.
+    let kinds = detect_installed();
+    if kinds.is_empty() {
+        println!("No agent CLI (claude, codex, agy) found on PATH; skipped MCP config.");
+    } else {
+        let names: Vec<&str> = kinds.iter().map(|k| k.name()).collect();
+        println!("Found: {}.", names.join(", "));
+    }
+    let plan = plan_files(opts.project, &kinds, &room_name);
+    for (path, why) in &plan.problems {
+        eprintln!("herdmesh setup: leaving {} alone: {why}", path.display());
+    }
+    let yes = opts.yes;
+    let applied = apply(
+        opts.project,
+        &plan,
+        &mut |ch| {
+            yes || ask_yes(&format!(
+                "{} {}?",
+                if ch.old.is_some() { "Update" } else { "Create" },
+                ch.path.display()
+            ))
+        },
+        &mut |d| print!("{d}"),
+    )
+    .map_err(|e| e.to_string())?;
+    for p in &applied.written {
+        println!("wrote {}", p.display());
+    }
+    for p in &applied.declined {
+        println!("skipped {}", p.display());
+    }
+    if plan.changes.is_empty() && plan.problems.is_empty() {
+        println!("Project files are already set up.");
+    }
+    project::write_room(opts.project, &room_name).map_err(|e| e.to_string())?;
+
+    // 5. ticket and next steps.
+    if let Some(t) = &ticket_to_share {
+        let text = t.to_string();
+        println!("\nInvite ticket (a secret: share only with people who should join):\n{text}");
+        match clipboard::copy(&text) {
+            Some(_) => println!("(copied to the clipboard)"),
+            None => println!("(no clipboard tool found; copy it by hand)"),
+        }
+    }
+    println!("\nNext:");
+    match (&ticket_to_share, opts.join.is_some()) {
+        (Some(_), _) => println!(
+            "  1. Send the ticket to your teammate; they run `herdmesh setup --join` in their copy of this project."
+        ),
+        (None, true) => {
+            println!("  1. You joined; keep `herdmesh room run` going (or just start your agent).")
+        }
+        (None, false) => {
+            println!("  1. Need a ticket for someone else? `herdmesh room invite --copy`.")
+        }
+    }
+    println!(
+        "  2. Start your agent here (claude / codex / agy); it picks up the herdmesh MCP server."
+    );
+    println!("  3. Watch it live with `herdmesh view`.");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn all(plan: &Plan, project: &Path) -> Applied {
+        apply(project, plan, &mut |_| true, &mut |_| {}).unwrap()
+    }
+
+    #[test]
+    fn snippet_comes_from_the_docs_block() {
+        let s = snippet();
+        assert!(s.starts_with(SNIPPET_MARKER), "{s}");
+        assert!(s.contains("`claim`") && !s.contains("```"));
+        assert!(s.ends_with('\n'));
+    }
+
+    #[test]
+    fn detects_only_installed_clis() {
+        let t = tmp();
+        std::fs::write(t.path().join("codex.exe"), "").unwrap();
+        std::fs::write(t.path().join("claude"), "").unwrap();
+        std::fs::create_dir(t.path().join("agy")).unwrap(); // a folder is not a CLI
+        let path = std::env::join_paths([t.path()]).unwrap();
+        assert_eq!(
+            detect(&path, &["", ".exe"]),
+            vec![Kind::Claude, Kind::Codex]
+        );
+        assert_eq!(detect(&path, &[".cmd"]), vec![]);
+    }
+
+    #[test]
+    fn json_merge_keeps_other_servers_and_replaces_ours() {
+        let old =
+            r#"{"mcpServers":{"other":{"command":"x"},"herdmesh":{"command":"old"}},"keep":1}"#;
+        let new = merge_json(Some(old), Kind::Claude, "proj").unwrap();
+        let v: Value = serde_json::from_str(&new).unwrap();
+        assert_eq!(v["keep"], 1);
+        assert_eq!(v["mcpServers"]["other"]["command"], "x");
+        assert_eq!(v["mcpServers"]["herdmesh"]["command"], "herdmesh");
+        assert_eq!(
+            v["mcpServers"]["herdmesh"]["args"],
+            json!(["mcp", "--kind", "claude", "--room", "proj"])
+        );
+        assert!(new.ends_with('\n'));
+        assert!(merge_json(Some("{not json"), Kind::Claude, "p").is_err());
+        assert!(merge_json(Some("[1]"), Kind::Claude, "p").is_err());
+        assert!(merge_json(Some(r#"{"mcpServers":3}"#), Kind::Claude, "p").is_err());
+        assert!(merge_json(None, Kind::Agy, "p").unwrap().contains("--kind"));
+    }
+
+    #[test]
+    fn toml_merge_appends_and_keeps_comments() {
+        let old = "# my settings\nmodel = \"x\"\n\n[mcp_servers.other]\ncommand = \"y\"\n";
+        let new = merge_toml(Some(old), Kind::Codex, "proj").unwrap();
+        assert!(new.starts_with(old), "{new}");
+        let t: toml::Table = new.parse().unwrap();
+        let ours = &t["mcp_servers"]["herdmesh"];
+        assert_eq!(ours["command"].as_str(), Some("herdmesh"));
+        assert_eq!(ours["args"].as_array().unwrap().len(), 5);
+        assert!(t["mcp_servers"]["other"].is_table());
+    }
+
+    #[test]
+    fn toml_merge_replaces_a_stale_entry_and_handles_odd_layouts() {
+        let stale = "[mcp_servers.herdmesh]\ncommand = \"old\"\nargs = []\n";
+        let t: toml::Table = merge_toml(Some(stale), Kind::Codex, "r")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            t["mcp_servers"]["herdmesh"]["command"].as_str(),
+            Some("herdmesh")
+        );
+        // Inline table: appending a [mcp_servers.herdmesh] header would be invalid TOML.
+        let inline = "mcp_servers = { other = { command = \"y\" } }\n";
+        let t: toml::Table = merge_toml(Some(inline), Kind::Codex, "r")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(t["mcp_servers"]["other"].is_table() && t["mcp_servers"]["herdmesh"].is_table());
+        assert!(merge_toml(Some("= broken"), Kind::Codex, "r").is_err());
+        assert!(
+            merge_toml(None, Kind::Codex, "r")
+                .unwrap()
+                .contains("[mcp_servers.herdmesh]")
+        );
+    }
+
+    #[test]
+    fn diff_marks_only_changes_with_context() {
+        let d = unified_diff("f", "a\nb\nc\nd\ne\nf\ng\n", "a\nb\nc\nX\ne\nf\ng\n");
+        assert!(d.contains("- d\n") && d.contains("+ X\n"), "{d}");
+        assert!(d.contains("  c\n") && !d.contains("  a\n"), "{d}");
+        assert!(d.contains("  ...\n"));
+        let created = unified_diff("n", "", "one\ntwo\n");
+        assert!(created.contains("+ one\n+ two\n"));
+    }
+
+    #[test]
+    fn instruction_target_follows_agents_md_imports() {
+        let t = tmp();
+        assert_eq!(
+            instruction_targets(t.path(), &[Kind::Claude]),
+            vec!["CLAUDE.md"]
+        );
+        assert_eq!(
+            instruction_targets(t.path(), &[Kind::Claude, Kind::Codex, Kind::Agy]),
+            vec!["CLAUDE.md", "AGENTS.md"]
+        );
+        std::fs::write(t.path().join("CLAUDE.md"), "# x\n@AGENTS.md\n").unwrap();
+        assert_eq!(
+            instruction_targets(t.path(), &[Kind::Claude, Kind::Codex]),
+            vec!["AGENTS.md"]
+        );
+    }
+
+    #[test]
+    fn writes_merges_and_is_idempotent() {
+        let t = tmp();
+        let p = t.path();
+        std::fs::write(
+            p.join(".mcp.json"),
+            r#"{"mcpServers":{"other":{"command":"x"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(p.join("AGENTS.md"), "# Project rules\n- be nice").unwrap();
+        let kinds = [Kind::Claude, Kind::Codex, Kind::Agy];
+
+        let plan = plan_files(p, &kinds, "proj");
+        assert!(plan.problems.is_empty(), "{:?}", plan.problems);
+        let done = all(&plan, p);
+        assert_eq!(done.written.len(), 5, "{done:?}"); // 3 configs + CLAUDE.md + AGENTS.md
+
+        let mcp: Value =
+            serde_json::from_str(&std::fs::read_to_string(p.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(mcp["mcpServers"]["other"]["command"], "x");
+        assert_eq!(mcp["mcpServers"]["herdmesh"]["args"][2], "claude");
+        let codex = std::fs::read_to_string(p.join(".codex/config.toml")).unwrap();
+        assert!(codex.contains("--kind") && codex.contains("codex"));
+        assert!(
+            std::fs::read_to_string(p.join(".agents/mcp_config.json"))
+                .unwrap()
+                .contains("agy")
+        );
+        let agents = std::fs::read_to_string(p.join("AGENTS.md")).unwrap();
+        assert!(
+            agents.starts_with("# Project rules\n- be nice\n\n## Herdmesh Collaboration"),
+            "{agents}"
+        );
+        assert!(
+            std::fs::read_to_string(p.join("CLAUDE.md"))
+                .unwrap()
+                .starts_with(SNIPPET_MARKER)
+        );
+
+        // Second run: nothing to do, and the files are byte-identical.
+        let before: Vec<String> = [".mcp.json", ".codex/config.toml", "AGENTS.md", "CLAUDE.md"]
+            .iter()
+            .map(|f| std::fs::read_to_string(p.join(f)).unwrap())
+            .collect();
+        let again = plan_files(p, &kinds, "proj");
+        assert_eq!(again, Plan::default());
+        assert_eq!(all(&again, p), Applied::default());
+        let after: Vec<String> = [".mcp.json", ".codex/config.toml", "AGENTS.md", "CLAUDE.md"]
+            .iter()
+            .map(|f| std::fs::read_to_string(p.join(f)).unwrap())
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_changed_room_updates_only_the_entry() {
+        let t = tmp();
+        let p = t.path();
+        all(&plan_files(p, &[Kind::Claude], "one"), p);
+        let plan = plan_files(p, &[Kind::Claude], "two");
+        let cfg: Vec<_> = plan
+            .changes
+            .iter()
+            .filter(|c| c.path.ends_with(".mcp.json"))
+            .collect();
+        assert_eq!(cfg.len(), 1);
+        assert!(cfg[0].diff().contains("two"));
+    }
+
+    #[test]
+    fn declining_writes_nothing_and_broken_files_are_left_alone() {
+        let t = tmp();
+        let p = t.path();
+        std::fs::write(p.join(".mcp.json"), "{oops").unwrap();
+        let plan = plan_files(p, &[Kind::Claude], "r");
+        assert_eq!(plan.problems.len(), 1);
+        assert_eq!(plan.problems[0].0, Path::new(".mcp.json"));
+        let mut shown = String::new();
+        let done = apply(p, &plan, &mut |_| false, &mut |d| shown.push_str(d)).unwrap();
+        assert!(done.written.is_empty() && done.declined == vec![PathBuf::from("CLAUDE.md")]);
+        assert!(shown.contains("+++ CLAUDE.md"));
+        assert!(!p.join("CLAUDE.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(p.join(".mcp.json")).unwrap(),
+            "{oops"
+        );
+    }
+
+    #[test]
+    fn never_touches_user_level_config() {
+        let t = tmp();
+        let plan = plan_files(t.path(), &Kind::ALL, "r");
+        for c in &plan.changes {
+            assert!(c.path.is_relative(), "{}", c.path.display());
+            assert!(!c.path.components().any(|x| x.as_os_str() == ".."));
+        }
+    }
+
+    #[test]
+    fn room_name_follows_the_folder() {
+        assert_eq!(room_name_for(Path::new("/x/My Project")), "my-project");
+        assert_eq!(room_name_for(Path::new("/x/123")), "project");
+        assert_eq!(room_name_for(Path::new("/")), "project");
+    }
+
+    #[test]
+    fn yes_answers() {
+        assert!(is_yes("Y\n") && is_yes(" yes ") && !is_yes("") && !is_yes("no") && !is_yes("yep"));
+    }
+}

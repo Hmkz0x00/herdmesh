@@ -202,15 +202,6 @@ fn smoke_mcp_end_to_end() {
         "room_card should mention room alpha: {card}"
     );
 
-    // 'a' asks 'b'
-    let _ask = mcp_a.call_tool(
-        "ask",
-        json!({
-            "to": "b",
-            "question": "smoke test question from a to b"
-        }),
-    );
-
     // 4. Spawn 'herdmesh mcp --agent b'
     let mut mcp_b = McpClient::spawn(bin, &data_dir, &test_user, "b");
 
@@ -225,6 +216,18 @@ fn smoke_mcp_end_to_end() {
     );
     assert!(init_b["result"]["capabilities"]["tools"].is_object());
     mcp_b.notify("notifications/initialized", json!({}));
+
+    // 'b' joins the room (its first call), then 'a' asks it: an ask to an
+    // agent that is not in the room is no longer sent.
+    mcp_b.call_tool("room_card", json!({}));
+    // 'a' asks 'b'
+    let _ask = mcp_a.call_tool(
+        "ask",
+        json!({
+            "to": "b",
+            "question": "smoke test question from a to b"
+        }),
+    );
 
     // 'b' checks inbox: should see the ask from 'a' wrapped in <<peer-untrusted>>
     let inbox = mcp_b.call_tool("inbox", json!({}));
