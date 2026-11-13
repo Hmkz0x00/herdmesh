@@ -89,10 +89,16 @@ impl Default for SystemHerdrCli {
 impl HerdrCli for SystemHerdrCli {
     fn run(&self, args: &[&str]) -> Result<String> {
         tracing::debug!(bin = %self.bin_path.display(), ?args, "executing herdr command");
-        let output = Command::new(&self.bin_path)
-            .args(args)
-            .output()
-            .map_err(HerdrError::Io)?;
+        let mut cmd = Command::new(&self.bin_path);
+        cmd.args(args);
+        #[cfg(windows)]
+        {
+            // Never flash a console window for the periodic herdr polls.
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let output = cmd.output().map_err(HerdrError::Io)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();

@@ -324,9 +324,12 @@ pub fn spawn_detached(data: &DataDir) -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        // CREATE_NO_WINDOW (not DETACHED_PROCESS): the daemon gets a hidden
+        // console that its children (herdr polls) inherit. A console-less
+        // parent makes Windows flash a new console window per child.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
     cmd.spawn().map(|_| ())
 }
