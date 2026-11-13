@@ -673,7 +673,15 @@ mod tests {
         assert_eq!(
             keys(&v),
             [
-                "cursor", "events", "leases", "members", "now_ms", "room", "tasks", "you"
+                "cursor",
+                "events",
+                "leases",
+                "members",
+                "now_ms",
+                "room",
+                "tasks",
+                "truncated",
+                "you"
             ]
         );
         assert_eq!(

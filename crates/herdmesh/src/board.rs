@@ -31,6 +31,8 @@ pub const TOKEN_FILE: &str = "ipc.token";
 /// when rendered.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BoardState {
+    pub messages: Vec<String>,
+    pub truncated: bool,
     pub room: String,
     /// `(agent label, status)`
     pub members: Vec<(String, String)>,
@@ -112,7 +114,25 @@ pub fn render(state: &BoardState) -> Vec<String> {
             })
             .collect(),
     );
-    out.push(format!("inbox: {}", state.inbox));
+    out.push(format!("recent incoming: {}", state.inbox));
+    out.push(format!("conversation ({})", state.messages.len().min(10)));
+    for message in state
+        .messages
+        .iter()
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        out.push(format!(
+            "  {}",
+            sanitize_display(&hm_proto::redact::redact(message).text, TEXT_MAX)
+        ));
+    }
+    if state.truncated {
+        out.push("  [snapshot truncated]".to_owned());
+    }
     out.push(String::new());
     out.push("q quit".to_owned());
     out
@@ -153,6 +173,59 @@ pub fn apply_tasks(state: &mut BoardState, items: &[(String, String)]) {
         .collect();
 }
 
+/// Apply the bounded read-only feed; polling never joins the board agent or
+/// decodes the entire history through the old card/task/inbox calls.
+pub fn apply_feed(state: &mut BoardState, feed: &hm_proto::feed::Feed) {
+    state.room = feed.room.clone();
+    state.members = feed
+        .members
+        .iter()
+        .map(|m| (m.id.clone(), m.status.clone()))
+        .collect();
+    state.leases = feed
+        .leases
+        .iter()
+        .map(|l| (l.holder.clone(), l.paths.join(", ")))
+        .collect();
+    state.tasks = feed
+        .tasks
+        .iter()
+        .map(|t| (t.id.clone(), t.status.clone(), t.title.clone()))
+        .collect();
+    // Count recent incoming messages, not unread inbox state (which needs a write).
+    state.inbox = feed
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(e.kind.as_str(), "ask" | "handoff")
+                && e.to.as_deref() == Some(feed.you.as_str())
+        })
+        .count();
+    state.messages = feed
+        .events
+        .iter()
+        .rev()
+        .filter(|e| {
+            matches!(
+                e.kind.as_str(),
+                "ask" | "answer" | "handoff" | "decide" | "note"
+            )
+        })
+        .take(10)
+        .map(|e| {
+            format!(
+                "{} -> {} [{}] {}",
+                e.from,
+                e.to.as_deref().unwrap_or("*"),
+                e.kind,
+                e.text
+            )
+        })
+        .collect();
+    state.messages.reverse();
+    state.truncated = feed.truncated;
+}
+
 async fn ask(client: &Client, agent: &str, call: Call) -> Result<Vec<(String, String)>, String> {
     let req = Request {
         agent: agent.to_owned(),
@@ -170,13 +243,21 @@ async fn ask(client: &Client, agent: &str, call: Call) -> Result<Vec<(String, St
 pub async fn fetch(client: &Client, agent: &str) -> BoardState {
     let mut state = BoardState::default();
     let result: Result<(), String> = async {
-        let card = ask(client, agent, Call::RoomCard).await?;
-        for (_, text) in &card {
-            apply_card(&mut state, text);
-        }
-        let tasks = ask(client, agent, Call::TaskList { filter: None }).await?;
-        apply_tasks(&mut state, &tasks);
-        state.inbox = ask(client, agent, Call::Inbox { ack: false }).await?.len();
+        let items = ask(
+            client,
+            agent,
+            Call::Feed {
+                since: 0,
+                limit: 200,
+            },
+        )
+        .await?;
+        let [(_, json)] = items.as_slice() else {
+            return Err("invalid feed response".into());
+        };
+        let feed: hm_proto::feed::Feed =
+            serde_json::from_str(json).map_err(|_| "invalid feed JSON")?;
+        apply_feed(&mut state, &feed);
         Ok(())
     }
     .await;
@@ -263,6 +344,8 @@ mod tests {
             leases: vec![("26b934/claude".into(), "crates/hm-brief/**".into())],
             tasks: vec![("t-brief".into(), "blocked".into(), "build L1 brief".into())],
             inbox: 2,
+            messages: vec![],
+            truncated: false,
             error: None,
         }
     }
@@ -279,7 +362,8 @@ mod tests {
             "  26b934/claude crates/hm-brief/**",
             "open tasks (1)",
             "  t-brief [blocked] build L1 brief",
-            "inbox: 2",
+            "recent incoming: 2",
+            "conversation (0)",
             "",
             "q quit",
         ];
@@ -296,7 +380,7 @@ mod tests {
         let lines = render(&s);
         assert_eq!(lines[1], "! daemon unreachable: refused");
         assert!(lines.contains(&"members (0)".to_owned()));
-        assert!(lines.contains(&"inbox: 0".to_owned()));
+        assert!(lines.contains(&"recent incoming: 0".to_owned()));
     }
 
     #[test]
@@ -400,6 +484,79 @@ mod tests {
         assert_eq!(
             build.iter().filter_map(|a| a.as_str()).collect::<Vec<_>>(),
             ["cargo", "build", "--release", "-p", "herdmesh"]
+        );
+    }
+
+    #[test]
+    fn board_shows_last_ten_conversation_messages() {
+        let mut state = BoardState::default();
+        let events: Vec<_> = (0..15)
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.to_string(), "lamport": n, "ts_ms": n,
+                    "kind": "ask", "from": "node/alice", "to": "node/bob",
+                    "text": format!("question {n}"), "full": true, "ref": null
+                })
+            })
+            .collect();
+        let feed: hm_proto::feed::Feed = serde_json::from_value(serde_json::json!({
+            "room": "alpha", "you": "node/bob", "now_ms": 0, "cursor": 15,
+            "members": [], "leases": [], "tasks": [], "events": events, "truncated": true
+        }))
+        .unwrap();
+        apply_feed(&mut state, &feed);
+        let lines = render(&state);
+        assert_eq!(state.messages.len(), 10);
+        assert!(lines.iter().any(|l| l.contains("question 5")));
+        assert!(lines.iter().any(|l| l.contains("question 14")));
+        assert!(!lines.iter().any(|l| l.ends_with("question 4")));
+        assert!(lines.iter().any(|l| l.contains("truncated")));
+    }
+
+    #[test]
+    fn plugin_adr004_actions_use_project_room_and_conversation_pane() {
+        let manifest: toml::Table = include_str!("../../../plugin/herdr-plugin.toml")
+            .parse()
+            .unwrap();
+        let argv = |section: &str, id: &str| -> Vec<&str> {
+            manifest[section]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|x| x["id"].as_str() == Some(id))
+                .unwrap_or_else(|| panic!("missing {section}/{id}"))["command"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a.as_str().unwrap())
+                .collect()
+        };
+        assert_eq!(argv("actions", "setup-project"), ["herdmesh", "setup"]);
+        assert_eq!(
+            argv("actions", "join-from-clipboard"),
+            ["herdmesh", "setup", "--join"]
+        );
+        assert_eq!(argv("actions", "open-live-view"), ["herdmesh", "view"]);
+        assert_eq!(
+            argv("actions", "room-invite"),
+            ["herdmesh", "room", "invite", "--copy"]
+        );
+        assert_eq!(
+            argv("actions", "open-conversation"),
+            [
+                "herdr",
+                "plugin",
+                "pane",
+                "open",
+                "--plugin",
+                "herdmesh",
+                "--entrypoint",
+                "conversation"
+            ]
+        );
+        assert_eq!(
+            argv("panes", "conversation"),
+            ["herdmesh", "room", "log", "--follow"]
         );
     }
 }

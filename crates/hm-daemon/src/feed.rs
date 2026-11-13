@@ -4,9 +4,8 @@
 //! Free-text fields are redacted, escaped with `sanitize_display`, and
 //! capped here before being served over authenticated local IPC.
 //!
-//! Cost: one pass over the room log per call (rooms are small in v1; the
-//! page polls every few seconds). Nothing is written, nobody is made a
-//! member.
+//! Polling decodes only bounded, indexed history windows. Nothing is written,
+//! nobody is made a member; collections and total IPC JSON bytes are capped.
 
 use std::collections::BTreeMap;
 
@@ -23,6 +22,13 @@ pub const EVENTS_MAX: usize = 200;
 pub const TEXT_MAX: usize = 200;
 /// Most leases / open tasks listed.
 const LIST_MAX: usize = 100;
+/// Nested paths and references per object.
+const PATHS_MAX: usize = 16;
+const REFS_MAX: usize = 16;
+/// JSON byte ceiling, leaving ample room for the IPC envelope (1 MiB).
+pub const FEED_JSON_MAX: usize = 128 * 1024;
+/// Recent arrivals inspected for member activity and initial state.
+const HISTORY_MAX: usize = 256;
 /// Hex chars of an event id shown to the page.
 const SHORT_ID: usize = 6;
 /// Longest part of an activity line, in chars.
@@ -47,7 +53,10 @@ fn short(id: &EventId) -> String {
 }
 
 fn who(a: &AgentRef) -> String {
-    agent_label(&AgentRef::new(a.node, redact(&a.agent_name).text))
+    agent_label(&AgentRef::new(
+        a.node,
+        sanitize_display(&redact(&a.agent_name).text, 32),
+    ))
 }
 
 fn role_str(r: Role) -> &'static str {
@@ -88,15 +97,25 @@ struct Parts {
     to: Option<String>,
     /// Full ids / refs this message points at.
     refs: Vec<String>,
+    truncated: bool,
 }
 
 fn parts(e: &Event) -> Option<Parts> {
+    let truncated = match &e.body {
+        EventBody::Handoff {
+            refs, next_steps, ..
+        } => refs.len() > REFS_MAX || next_steps.len() > REFS_MAX,
+        EventBody::Decision { refs, .. } => refs.len() > REFS_MAX,
+        EventBody::LeaseClaim { paths, .. } => paths.len() > PATHS_MAX,
+        _ => false,
+    };
     let p = |kind, raw: String, reference: Option<String>, to, refs| Parts {
         kind,
         raw,
         reference,
         to,
         refs,
+        truncated,
     };
     Some(match &e.body {
         EventBody::Join { .. } => p("join", String::new(), None, None, vec![]),
@@ -123,21 +142,36 @@ fn parts(e: &Event) -> Option<Parts> {
             next_steps,
         } => {
             let mut t = summary.clone();
-            for s in next_steps {
+            for s in next_steps.iter().take(REFS_MAX) {
                 t.push_str("\nnext: ");
                 t.push_str(s);
             }
             p(
                 "handoff",
                 t,
-                None,
+                refs.iter().take(REFS_MAX).find_map(|r| match r {
+                    hm_proto::Ref::Event(id) => Some(id.to_string()),
+                    _ => None,
+                }),
                 to.as_ref().map(who),
-                refs.iter().map(ToString::to_string).collect(),
+                refs.iter()
+                    .take(REFS_MAX)
+                    .map(ToString::to_string)
+                    .collect(),
             )
         }
-        EventBody::LeaseClaim { paths, .. } => {
-            p("claim", paths.join(" "), Some(short(&e.id)), None, vec![])
-        }
+        EventBody::LeaseClaim { paths, .. } => p(
+            "claim",
+            paths
+                .iter()
+                .take(PATHS_MAX)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+            Some(short(&e.id)),
+            None,
+            vec![],
+        ),
         EventBody::LeaseRelease { claim } => p(
             "release",
             String::new(),
@@ -169,7 +203,10 @@ fn parts(e: &Event) -> Option<Parts> {
             format!("{title}\n{rationale}"),
             None,
             None,
-            refs.iter().map(ToString::to_string).collect(),
+            refs.iter()
+                .take(REFS_MAX)
+                .map(ToString::to_string)
+                .collect(),
         ),
         EventBody::Note { text: t, .. } => p("note", t.clone(), None, None, vec![]),
         EventBody::Digest { .. } | EventBody::Genesis { .. } | EventBody::RoleGrant { .. } => {
@@ -203,7 +240,9 @@ pub fn full_event(e: &Event) -> Option<FullEvent> {
         to: p.to,
         ts_ms: e.ts,
         text: cap_bytes(sanitize_display(&redact(&p.raw).text, usize::MAX), FULL_MAX),
-        refs: p.refs.iter().map(|r| text(r)).collect(),
+        refs: p.refs.iter().map(|r| reference(r)).collect(),
+        truncated: p.truncated
+            || sanitize_display(&redact(&p.raw).text, usize::MAX).len() > FULL_MAX,
     })
 }
 
@@ -214,13 +253,35 @@ pub fn event_json(store: &Store, id: &str) -> Result<Option<String>, hm_store::S
     if id.len() < SHORT_ID || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Ok(None);
     }
-    let all = store.events_since(hm_proto::Lamport(0))?;
-    let mut hits = all.iter().filter(|e| e.id.to_string().starts_with(&id));
-    let found = match (hits.next(), hits.next()) {
-        (Some(e), None) => full_event(e),
-        _ => None,
+    let Some(e) = store.event_by_prefix(&id)? else {
+        return Ok(None);
     };
-    Ok(found.and_then(|f| serde_json::to_string(&f).ok()))
+    let Some(mut f) = full_event(&e) else {
+        return Ok(None);
+    };
+    f.to = recipient(store, &e)?;
+    Ok(serde_json::to_string(&f).ok())
+}
+
+// Structured event identifiers are references, never secret-looking free text.
+fn reference(s: &str) -> String {
+    let hex = s.strip_prefix("event:").unwrap_or(s);
+    if EventId::from_hex(hex).is_some() {
+        s.to_owned()
+    } else {
+        text(s)
+    }
+}
+
+fn recipient(store: &Store, e: &Event) -> Result<Option<String>, hm_store::StoreError> {
+    match &e.body {
+        EventBody::Answer { ask_id, .. } => Ok(store
+            .event_by_prefix(&ask_id.to_string())?
+            .filter(|q| matches!(q.body, EventBody::Ask { .. }))
+            .map(|q| who(&q.author))),
+        EventBody::Ask { to, .. } | EventBody::Handoff { to, .. } => Ok(to.as_ref().map(who)),
+        _ => Ok(None),
+    }
 }
 
 fn task_status(s: TaskStatus) -> &'static str {
@@ -273,8 +334,7 @@ fn cut(s: &str) -> String {
     }
 }
 
-/// Build the snapshot. `events_since` is read from the log; `you` is the
-/// viewing agent (never added to the room).
+/// Build a bounded snapshot; `you` is never added to the room.
 pub fn build(
     name: &str,
     store: &Store,
@@ -284,26 +344,41 @@ pub fn build(
     limit: usize,
 ) -> Result<Feed, hm_store::StoreError> {
     let views = store.views();
-    let all = store.events_since(hm_proto::Lamport(0))?;
-    let by_id: BTreeMap<EventId, &Event> = all.iter().map(|e| (e.id, e)).collect();
+    let mut recent = store.recent_events(HISTORY_MAX + 1)?;
+    let mut truncated = recent.len() > HISTORY_MAX || views.members.len() > LIST_MAX;
+    if recent.len() > HISTORY_MAX {
+        recent.remove(0);
+    }
+    let all: Vec<&Event> = recent.iter().map(|(_, e)| e).collect();
+    let by_id: BTreeMap<EventId, &Event> = all.iter().map(|&e| (e.id, e)).collect();
     let limit = limit.clamp(1, EVENTS_MAX);
 
     // Leases still alive.
     let mut leases = Vec::new();
     let mut held: BTreeMap<AgentRef, Vec<String>> = BTreeMap::new();
-    for c in views.leases.claims() {
+    truncated |= views.leases.claims().nth(HISTORY_MAX).is_some();
+    for c in views.leases.claims().take(HISTORY_MAX) {
+        if leases.len() == LIST_MAX {
+            truncated = true;
+            break;
+        }
         let state = match views.claim_state(&c.id, now) {
             Some(ClaimState::Pending) => "pending",
             Some(ClaimState::Granted) => "granted",
             _ => continue,
         };
-        held.entry(c.holder.clone())
-            .or_default()
-            .push(c.paths.join(", "));
+        truncated |= c.paths.len() > PATHS_MAX;
+        let paths: Vec<String> = c.paths.iter().take(PATHS_MAX).map(|p| text(p)).collect();
+        let held_paths = held.entry(c.holder.clone()).or_default();
+        if held_paths.len() < PATHS_MAX {
+            held_paths.push(cut(&paths.join(", ")));
+        } else {
+            truncated = true;
+        }
         if leases.len() < LIST_MAX {
             leases.push(FeedLease {
                 id: short(&c.id),
-                paths: c.paths.iter().map(|p| text(p)).collect(),
+                paths,
                 holder: who(&c.holder),
                 state: state.to_owned(),
                 expires_ms: c.expires_at_ms(),
@@ -314,19 +389,27 @@ pub fn build(
     // Open tasks; the owner is whoever made the latest change.
     let mut tasks = Vec::new();
     let mut doing: BTreeMap<AgentRef, Vec<String>> = BTreeMap::new();
-    for (id, t) in &views.board {
+    truncated |= views.board.len() > HISTORY_MAX;
+    for (id, t) in views.board.iter().take(HISTORY_MAX) {
         if matches!(t.status, TaskStatus::Done | TaskStatus::Dropped) {
             continue;
         }
-        let owner = by_id.get(&t.updated).map(|e| e.author.clone());
+        if tasks.len() == LIST_MAX {
+            truncated = true;
+            break;
+        }
+        let owner = store
+            .event_by_prefix(&t.updated.to_string())?
+            .map(|e| e.author);
         if matches!(t.status, TaskStatus::InProgress | TaskStatus::Blocked)
             && let Some(o) = &owner
         {
-            doing.entry(o.clone()).or_default().push(format!(
-                "{} {}",
-                id.as_str(),
-                task_status(t.status)
-            ));
+            let actions = doing.entry(o.clone()).or_default();
+            if actions.len() < PATHS_MAX {
+                actions.push(format!("{} {}", text(id.as_str()), task_status(t.status)));
+            } else {
+                truncated = true;
+            }
         }
         if tasks.len() < LIST_MAX {
             tasks.push(FeedTask {
@@ -352,6 +435,7 @@ pub fn build(
     let members = views
         .members
         .iter()
+        .take(LIST_MAX)
         .map(|(a, m)| {
             let mut parts = Vec::new();
             if let Some(h) = held.get(a) {
@@ -386,56 +470,121 @@ pub fn build(
 
     // Initial load shows the newest arrivals; subsequent pages use local
     // insertion positions, including late and equal-Lamport peer events.
-    let arrivals = store.events_after(since, usize::MAX)?;
+    let mut arrivals = if since == 0 {
+        store.recent_events(EVENTS_MAX + 1)?
+    } else {
+        store.events_after(since, HISTORY_MAX + 1)?
+    };
+    if arrivals.len() > HISTORY_MAX {
+        arrivals.pop();
+        truncated = true;
+    }
     let head = arrivals.last().map_or(since, |(position, _)| *position);
     let shown: Vec<_> = arrivals
         .iter()
         .filter(|(_, e)| parts(e).is_some())
         .collect();
-    let more = since != 0 && shown.len() > limit;
+    let more = shown.len() > limit;
+    truncated |= more;
     let page: Vec<_> = if since == 0 {
         shown[shown.len().saturating_sub(limit)..].to_vec()
     } else {
         shown.into_iter().take(limit).collect()
     };
     let cursor = match page.last() {
-        Some((position, _)) if more => *position,
+        Some((position, _)) if since != 0 && more => *position,
         _ => head,
     };
-    let events = page
-        .iter()
-        .filter_map(|(_, e)| {
-            let p = parts(e)?;
-            let (t, full) = text_full(&p.raw);
-            Some(FeedEvent {
-                id: e.id.to_string(),
-                lamport: e.lamport.0,
-                ts_ms: e.ts,
-                kind: p.kind.to_owned(),
-                from: who(&e.author),
-                to: p.to,
-                text: t,
-                full,
-                reference: p.reference.map(|r| text(&r)),
-            })
-        })
-        .collect();
-
-    Ok(Feed {
+    let mut events = Vec::new();
+    for (_, e) in &page {
+        let Some(p) = parts(e) else { continue };
+        let (t, full) = text_full(&p.raw);
+        truncated |= p.truncated;
+        events.push(FeedEvent {
+            id: e.id.to_string(),
+            lamport: e.lamport.0,
+            ts_ms: e.ts,
+            kind: p.kind.to_owned(),
+            from: who(&e.author),
+            to: recipient(store, e)?,
+            text: t,
+            full: full && !p.truncated,
+            reference: p.reference.map(|r| reference(&r)),
+        });
+    }
+    let mut feed = Feed {
         room: text(name),
         you: who(me),
         now_ms: now,
         cursor,
+        truncated,
         members,
         leases,
         tasks,
         events,
-    })
+    };
+    let before = feed.events.len();
+    fit_bytes(&mut feed);
+    if since != 0 && feed.events.len() < before {
+        // A byte-limited incremental page must not skip the dropped tail.
+        feed.cursor = feed
+            .events
+            .last()
+            .and_then(|e| {
+                arrivals
+                    .iter()
+                    .find(|(_, raw)| raw.id.to_string() == e.id)
+                    .map(|(p, _)| *p)
+            })
+            .unwrap_or(since);
+    }
+    Ok(feed)
+}
+
+// Count serialized bytes, including JSON escaping, rather than Unicode chars.
+// Removing whole tail items keeps the result parseable and references intact.
+fn fit_bytes(feed: &mut Feed) {
+    let Ok(bytes) = serde_json::to_vec(feed) else {
+        return;
+    };
+    let mut size = bytes.len();
+    fn trim<T: serde::Serialize>(items: &mut Vec<T>, size: &mut usize) -> bool {
+        let mut changed = false;
+        while *size > FEED_JSON_MAX {
+            let Some(item) = items.pop() else { break };
+            if let Ok(bytes) = serde_json::to_vec(&item) {
+                *size = size.saturating_sub(bytes.len());
+            }
+            changed = true;
+        }
+        changed
+    }
+    feed.truncated |= trim(&mut feed.leases, &mut size);
+    feed.truncated |= trim(&mut feed.tasks, &mut size);
+    feed.truncated |= trim(&mut feed.members, &mut size);
+    feed.truncated |= trim(&mut feed.events, &mut size);
 }
 
 /// Complete terminal-safe conversation entry; unlike HTTP detail, no text cap.
 pub fn log_line(e: &Event) -> Option<String> {
-    let p = parts(e)?;
+    let mut p = parts(e)?;
+    // The terminal log is an explicit full-message reader, not a polling IPC
+    // snapshot: retain the complete handoff/claim within the event's wire cap.
+    match &e.body {
+        EventBody::Handoff {
+            summary,
+            next_steps,
+            ..
+        } => {
+            p.raw.clone_from(summary);
+            for step in next_steps {
+                p.raw.push_str("\nnext: ");
+                p.raw.push_str(step);
+            }
+        }
+        EventBody::LeaseClaim { paths, .. } => p.raw = paths.join(" "),
+        _ => {}
+    }
     let ms = e.ts % 86_400_000;
     Some(format!(
         "{:02}:{:02}:{:02}.{:03}Z {} -> {} [{}] {}",
@@ -448,4 +597,223 @@ pub fn log_line(e: &Event) -> Option<String> {
         p.kind,
         sanitize_display(&redact(&p.raw).text, usize::MAX)
     ))
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use hm_proto::{NodeId, Ref, RoomId, TaskId};
+
+    fn append(store: &mut Store, name: &str, body: EventBody) -> Event {
+        let key = SigningKey::from_bytes(&[8; 32]);
+        let node = NodeId::from_verifying_key(&key.verifying_key());
+        let e = Event::sign(
+            &key,
+            store.room(),
+            name,
+            store.next_seq(&node).unwrap(),
+            store.next_lamport().unwrap(),
+            0,
+            body,
+        )
+        .unwrap();
+        store.append_at(&e, 0).unwrap();
+        e
+    }
+
+    fn snapshot(store: &Store, since: u64, limit: usize) -> Feed {
+        build(
+            "test",
+            store,
+            &AgentRef::new(NodeId::from_bytes([9; 32]), "viewer"),
+            1000,
+            since,
+            limit,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn caps_peer_collections_and_serialized_ipc_bytes() {
+        let mut store = Store::open_in_memory(RoomId::from_bytes([1; 32])).unwrap();
+        for n in 0..110 {
+            let name = format!("agent-{n}");
+            append(&mut store, &name, EventBody::Join { role: Role::Member });
+            if n == 0 {
+                append(
+                    &mut store,
+                    &name,
+                    EventBody::LeaseClaim {
+                        paths: (0..20)
+                            .map(|i| format!("src/{n}/{i}/{}", "\u{754c}".repeat(190)))
+                            .collect(),
+                        ttl_secs: 600,
+                    },
+                );
+            }
+            append(
+                &mut store,
+                &name,
+                EventBody::TaskAdd {
+                    task: TaskId::new(format!("t-{n}")).unwrap(),
+                    title: "\u{754c}".repeat(200),
+                    paths: vec![],
+                },
+            );
+        }
+        let feed = snapshot(&store, 0, usize::MAX);
+        assert!(feed.truncated);
+        assert!(feed.members.len() <= LIST_MAX);
+        assert!(feed.leases.len() <= LIST_MAX);
+        assert!(feed.tasks.len() <= LIST_MAX);
+        assert!(feed.events.len() <= EVENTS_MAX);
+        assert!(feed.leases.iter().all(|l| l.paths.len() <= PATHS_MAX));
+        let json = serde_json::to_string(&feed).unwrap();
+        assert!(json.len() <= FEED_JSON_MAX, "{}", json.len());
+        let response = crate::ipc::Response::Ok(vec![("feed".into(), json)]);
+        assert!(postcard::to_allocvec(&response).unwrap().len() < crate::ipc::MAX_FRAME);
+    }
+
+    #[test]
+    fn answer_and_handoff_keep_event_links_but_scrub_secret_text() {
+        let mut store = Store::open_in_memory(RoomId::from_bytes([1; 32])).unwrap();
+        let key = SigningKey::from_bytes(&[8; 32]);
+        let bob = AgentRef::new(NodeId::from_verifying_key(&key.verifying_key()), "bob");
+        let ask = append(
+            &mut store,
+            "alice",
+            EventBody::Ask {
+                to: Some(bob),
+                q: "what OS?".into(),
+            },
+        );
+        let answer = append(
+            &mut store,
+            "bob",
+            EventBody::Answer {
+                ask_id: ask.id,
+                a: "Windows".into(),
+            },
+        );
+        let handoff = append(
+            &mut store,
+            "bob",
+            EventBody::Handoff {
+                to: Some(ask.author.clone()),
+                summary: "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8".into(),
+                refs: vec![Ref::Event(ask.id)],
+                next_steps: vec![],
+            },
+        );
+        let feed = snapshot(&store, 0, 200);
+        let a = feed
+            .events
+            .iter()
+            .find(|e| e.id == answer.id.to_string())
+            .unwrap();
+        assert_eq!(a.reference.as_deref(), Some(ask.id.to_string().as_str()));
+        assert_eq!(a.to.as_deref(), Some(who(&ask.author).as_str()));
+        let h = feed
+            .events
+            .iter()
+            .find(|e| e.id == handoff.id.to_string())
+            .unwrap();
+        assert_eq!(h.reference.as_deref(), Some(ask.id.to_string().as_str()));
+        assert!(!h.text.contains("ghp_"));
+        for e in [answer, handoff] {
+            let detail: FullEvent =
+                serde_json::from_str(&event_json(&store, &e.id.to_string()).unwrap().unwrap())
+                    .unwrap();
+            assert!(detail.refs.iter().any(|r| r.contains(&ask.id.to_string())));
+        }
+    }
+
+    #[test]
+    fn byte_budget_counts_escaped_json_and_keeps_messages() {
+        let store = Store::open_in_memory(RoomId::from_bytes([1; 32])).unwrap();
+        let mut feed = snapshot(&store, 0, 200);
+        feed.leases = (0..LIST_MAX)
+            .map(|i| FeedLease {
+                id: i.to_string(),
+                holder: "a".into(),
+                state: "pending".into(),
+                expires_ms: 0,
+                paths: vec!["\"\u{754c}".repeat(100); PATHS_MAX],
+            })
+            .collect();
+        assert!(serde_json::to_vec(&feed).unwrap().len() > FEED_JSON_MAX);
+        fit_bytes(&mut feed);
+        assert!(feed.truncated);
+        assert!(serde_json::to_vec(&feed).unwrap().len() <= FEED_JSON_MAX);
+    }
+
+    #[test]
+    fn detail_caps_nested_refs_and_reports_truncation() {
+        let mut store = Store::open_in_memory(RoomId::from_bytes([1; 32])).unwrap();
+        let event = append(
+            &mut store,
+            "alice",
+            EventBody::Handoff {
+                to: None,
+                summary: "message ".repeat(2000),
+                refs: vec![Ref::Event(EventId::from_bytes([0xab; 32])); REFS_MAX + 10],
+                next_steps: vec!["next".into(); REFS_MAX + 10],
+            },
+        );
+        let detail = full_event(&event).unwrap();
+        assert!(detail.truncated);
+        assert_eq!(detail.refs.len(), REFS_MAX);
+        assert!(detail.text.len() <= FULL_MAX);
+        assert!(serde_json::to_vec(&detail).unwrap().len() < FEED_JSON_MAX);
+    }
+
+    #[test]
+    fn incremental_byte_limited_pages_never_skip_messages() {
+        let mut store = Store::open_in_memory(RoomId::from_bytes([1; 32])).unwrap();
+        append(&mut store, "alice", EventBody::Join { role: Role::Member });
+        for _ in 0..210 {
+            append(
+                &mut store,
+                "alice",
+                EventBody::Note {
+                    scope: "test".into(),
+                    text: "\"\u{754c}".repeat(100),
+                },
+            );
+        }
+        let mut cursor = 1;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut byte_limited = false;
+        loop {
+            let feed = snapshot(&store, cursor, EVENTS_MAX);
+            assert!(serde_json::to_vec(&feed).unwrap().len() <= FEED_JSON_MAX);
+            byte_limited |= feed.truncated && feed.events.len() < EVENTS_MAX;
+            for event in &feed.events {
+                assert!(seen.insert(event.id.clone()), "no duplicate event");
+            }
+            if feed.cursor == cursor {
+                break;
+            }
+            cursor = feed.cursor;
+        }
+        assert!(byte_limited);
+        assert_eq!(seen.len(), 210);
+    }
+
+    #[test]
+    fn conversation_log_keeps_all_handoff_steps() {
+        let mut store = Store::open_in_memory(RoomId::from_bytes([1; 32])).unwrap();
+        let event = append(
+            &mut store,
+            "alice",
+            EventBody::Handoff {
+                to: None,
+                summary: "take over".into(),
+                refs: vec![],
+                next_steps: (0..20).map(|i| format!("step {i}")).collect(),
+            },
+        );
+        assert!(log_line(&event).unwrap().contains("step 19"));
+    }
 }

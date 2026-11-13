@@ -6,6 +6,7 @@ pub mod clipboard;
 pub mod daemon;
 pub mod data;
 pub mod display;
+pub mod herdr_notify;
 pub mod naming;
 pub mod notify;
 pub mod project;

@@ -1291,3 +1291,174 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod feed_query_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn populated() -> (Store, Vec<Event>) {
+        let mut store = Store::open_in_memory(RoomId::from_bytes([42; 32])).unwrap();
+        let key = SigningKey::from_bytes(&[4; 32]);
+        let events: Vec<_> = (1..=20)
+            .map(|seq| {
+                Event::sign(
+                    &key,
+                    store.room(),
+                    "alice",
+                    seq,
+                    Lamport(seq),
+                    0,
+                    EventBody::Note {
+                        scope: "test".into(),
+                        text: format!("message {seq}"),
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        for e in &events {
+            store.append(e).unwrap();
+        }
+        (store, events)
+    }
+
+    #[test]
+    fn recent_and_detail_queries_do_not_decode_unrelated_history() {
+        let (store, events) = populated();
+        store.conn.execute("UPDATE blobs SET body = x'ff' WHERE hash IN (SELECT body_hash FROM events WHERE id = ?1)",
+            params![events[0].id.as_bytes().to_vec()]).unwrap();
+        assert!(
+            store.events_since(Lamport(0)).is_err(),
+            "corrupt old body proves the probe"
+        );
+        let recent = store.recent_events(2).unwrap();
+        assert_eq!(
+            recent.iter().map(|(_, e)| e.id).collect::<Vec<_>>(),
+            [events[18].id, events[19].id]
+        );
+        let id = events[19].id.to_string();
+        for n in [6, 7, 63, 64] {
+            assert_eq!(
+                store.event_by_prefix(&id[..n]).unwrap().unwrap().id,
+                events[19].id
+            );
+        }
+        assert!(store.recent_events(0).unwrap().is_empty());
+        for bad in ["", "abcd", "not-hex", &"f".repeat(65)] {
+            assert!(store.event_by_prefix(bad).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn ambiguous_prefix_is_rejected_before_body_decode() {
+        let (store, events) = populated();
+        for (i, e) in events.iter().take(2).enumerate() {
+            let mut id = [0xab; 32];
+            id[31] = u8::try_from(i).unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE events SET id = ?1 WHERE id = ?2",
+                    params![id.to_vec(), e.id.as_bytes().to_vec()],
+                )
+                .unwrap();
+        }
+        store
+            .conn
+            .execute("UPDATE blobs SET body = x'ff'", [])
+            .unwrap();
+        assert!(store.event_by_prefix("ababab").unwrap().is_none());
+    }
+}
+
+// Read-only view queries. Keep the arrival/ID indexes in charge of the scan;
+// LIMIT is applied in SQL before any peer body is decoded.
+const RECENT_FEED_SQL: &str = "SELECT e.id, e.author_node, e.seq, e.lamport, e.agent_name, e.ts,
+    b.body, e.sig, a.position FROM event_arrivals a
+    CROSS JOIN events e ON e.id = a.id CROSS JOIN blobs b ON b.hash = e.body_hash
+    WHERE a.position >= 0 ORDER BY a.position DESC LIMIT ?1";
+const PREFIX_FEED_SQL: &str =
+    "SELECT id FROM events WHERE id >= ?1 AND id <= ?2 ORDER BY id LIMIT 2";
+
+impl Store {
+    /// Newest local arrivals, returned oldest first. Decodes at most `limit`
+    /// bodies (hard ceiling 512); work never grows with room history.
+    pub fn recent_events(&self, limit: usize) -> Result<Vec<(u64, Event)>, StoreError> {
+        let limit = i64::try_from(limit.min(512)).unwrap_or(512);
+        let mut stmt = self.conn.prepare_cached(RECENT_FEED_SQL)?;
+        let mut rows = stmt.query(params![limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let position = u64::try_from(row.get::<_, i64>(8)?)
+                .map_err(|_| StoreError::Corrupt("arrival position"))?;
+            out.push((position, row_event(row, self.room)?));
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    /// Full or unique-prefix (6..=64 hex digits) event lookup. The primary-key
+    /// range reads at most two IDs; only a unique match's body is decoded.
+    pub fn event_by_prefix(&self, prefix: &str) -> Result<Option<Event>, StoreError> {
+        if !(6..=64).contains(&prefix.len()) || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+        let prefix = prefix.to_ascii_lowercase();
+        let padding = 64 - prefix.len();
+        let (Some(low), Some(high)) = (
+            EventId::from_hex(&format!("{prefix}{}", "0".repeat(padding))),
+            EventId::from_hex(&format!("{prefix}{}", "f".repeat(padding))),
+        ) else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare_cached(PREFIX_FEED_SQL)?;
+        let mut rows = stmt.query(params![low.as_bytes().to_vec(), high.as_bytes().to_vec()])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let id: Vec<u8> = row.get(0)?;
+        if rows.next()?.is_some() {
+            return Ok(None);
+        }
+        Ok(query_events(
+            &self.conn,
+            self.room,
+            "WHERE e.id = ?1 LIMIT 1",
+            params![id],
+        )?
+        .pop())
+    }
+}
+
+#[cfg(test)]
+mod feed_query_plan_tests {
+    use super::*;
+    #[test]
+    fn polling_and_detail_use_arrival_and_primary_key_indexes() {
+        let store = Store::open_in_memory(RoomId::from_bytes([1; 32])).unwrap();
+        for sql in [RECENT_FEED_SQL, PREFIX_FEED_SQL] {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let mut rows = stmt.raw_query();
+            let mut plan: Vec<String> = Vec::new();
+            while let Some(row) = rows.next().unwrap() {
+                plan.push(row.get(3).unwrap());
+            }
+            assert!(
+                !plan.iter().any(|p| p.contains("SCAN e")
+                    || p.contains("SCAN events")
+                    || p.contains("TEMP B-TREE")),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|p| p.contains("SEARCH")
+                        && (p.contains("PRIMARY KEY") || p.contains("INDEX"))),
+                "{plan:?}"
+            );
+        }
+    }
+}
