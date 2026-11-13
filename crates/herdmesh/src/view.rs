@@ -9,7 +9,7 @@
 //! - GET only, else 405; no CORS headers;
 //! - every response carries the CSP, `nosniff` and `no-store` headers;
 //! - assets are embedded; room state comes from the daemon's read-only
-//!   `Feed` IPC call and every string in it passes `sanitize_display` again.
+//!   `Feed` IPC call, which sanitizes and redacts peer-authored text.
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -29,7 +29,7 @@ use tokio::time::timeout;
 
 use crate::board::TOKEN_FILE;
 use crate::data::DataDir;
-use crate::display::sanitize_display;
+
 use crate::room::DEFAULT_AGENT;
 
 const INDEX_HTML: &str = include_str!("../assets/view/index.html");
@@ -44,9 +44,6 @@ const READ_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_CONNS: usize = 32;
 /// Events per poll (the daemon caps at 200 too).
 const FEED_LIMIT: u32 = 200;
-/// Cap for every string served (names, paths, event text).
-const STRING_MAX: usize = 200;
-
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
                    connect-src 'self'; base-uri 'none'; frame-ancestors 'none'";
 
@@ -55,8 +52,15 @@ const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-
 pub struct StateError;
 
 /// Source of the room-state JSON for a `since` cursor.
-pub type StateFn =
-    Arc<dyn Fn(u64) -> Pin<Box<dyn Future<Output = Result<String, StateError>> + Send>> + Send + Sync>;
+pub type StateFn = Arc<
+    dyn Fn(u64) -> Pin<Box<dyn Future<Output = Result<String, StateError>> + Send>> + Send + Sync,
+>;
+
+type EventFn = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<Option<String>, StateError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// A 128-bit random URL token, lowercase hex.
 pub fn random_token() -> std::io::Result<String> {
@@ -70,6 +74,7 @@ pub fn random_token() -> std::io::Result<String> {
 enum Action {
     Static(&'static str, &'static str),
     State { since: u64 },
+    Event { id: String },
     Deny(u16),
 }
 
@@ -129,6 +134,13 @@ fn decide(head: &str, token: &str, port: u16) -> Action {
         "" | "index.html" => Action::Static("text/html; charset=utf-8", INDEX_HTML),
         "view.css" => Action::Static("text/css; charset=utf-8", VIEW_CSS),
         "view.js" => Action::Static("text/javascript; charset=utf-8", VIEW_JS),
+        "api/event" => Action::Event {
+            id: query
+                .split('&')
+                .find_map(|q| q.strip_prefix("id="))
+                .unwrap_or("")
+                .to_owned(),
+        },
         "api/state" => {
             let since = query
                 .split('&')
@@ -167,20 +179,10 @@ fn render(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Terminal-safe, length-capped copy of every string in `v` (defence in
-/// depth on top of the daemon's own redaction and truncation).
-fn sanitize_json(v: &mut Value) {
-    match v {
-        Value::String(s) => *s = sanitize_display(s, STRING_MAX),
-        Value::Array(a) => a.iter_mut().for_each(sanitize_json),
-        Value::Object(o) => o.values_mut().for_each(sanitize_json),
-        _ => {}
-    }
-}
-
+// The authenticated daemon applies redaction and display escaping. Do not
+// escape again here: that would double backslashes and invalidate `full`.
 fn sanitized_state(json: &str) -> Option<Vec<u8>> {
-    let mut v: Value = serde_json::from_str(json).ok()?;
-    sanitize_json(&mut v);
+    let v: Value = serde_json::from_str(json).ok()?;
     serde_json::to_vec(&v).ok()
 }
 
@@ -189,6 +191,9 @@ async fn read_head(conn: &mut TcpStream) -> Option<String> {
     let mut chunk = [0u8; 1024];
     loop {
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            if i > HEAD_MAX {
+                return None;
+            }
             buf.truncate(i);
             return String::from_utf8(buf).ok();
         }
@@ -203,7 +208,7 @@ async fn read_head(conn: &mut TcpStream) -> Option<String> {
     }
 }
 
-async fn handle(mut conn: TcpStream, token: &str, port: u16, state: &StateFn) {
+async fn handle(mut conn: TcpStream, token: &str, port: u16, state: &StateFn, event: &EventFn) {
     let reply = match timeout(READ_DEADLINE, read_head(&mut conn)).await {
         Ok(Some(head)) => match decide(&head, token, port) {
             Action::Static(ct, body) => render(200, ct, body.as_bytes()),
@@ -214,7 +219,17 @@ async fn handle(mut conn: TcpStream, token: &str, port: u16, state: &StateFn) {
                 },
                 Err(StateError) => render(502, "text/plain; charset=utf-8", b"daemon unavailable"),
             },
-            Action::Deny(code) => render(code, "text/plain; charset=utf-8", reason(code).as_bytes()),
+            Action::Event { id } => match event(id).await {
+                Ok(Some(json)) => match sanitized_state(&json) {
+                    Some(body) => render(200, "application/json; charset=utf-8", &body),
+                    None => render(502, "text/plain; charset=utf-8", b"bad event"),
+                },
+                Ok(None) => render(404, "text/plain; charset=utf-8", b"Not Found"),
+                Err(StateError) => render(502, "text/plain; charset=utf-8", b"daemon unavailable"),
+            },
+            Action::Deny(code) => {
+                render(code, "text/plain; charset=utf-8", reason(code).as_bytes())
+            }
         },
         Ok(None) | Err(_) => render(400, "text/plain; charset=utf-8", b"Bad Request"),
     };
@@ -235,6 +250,7 @@ pub async fn serve(
     listener: TcpListener,
     token: String,
     state: StateFn,
+    event: EventFn,
     shutdown: impl Future<Output = ()>,
 ) {
     let port = listener.local_addr().map_or(0, |a| a.port());
@@ -249,9 +265,9 @@ pub async fn serve(
                 let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
                     continue; // over capacity: drop the connection
                 };
-                let (token, state) = (Arc::clone(&token), Arc::clone(&state));
+                let (token, state, event) = (Arc::clone(&token), Arc::clone(&state), Arc::clone(&event));
                 tokio::spawn(async move {
-                    handle(conn, &token, port, &state).await;
+                    handle(conn, &token, port, &state, &event).await;
                     drop(permit);
                 });
             }
@@ -284,6 +300,31 @@ pub fn daemon_state(client: Client, room: Option<RoomId>) -> StateFn {
                 },
             };
             state_from_response(client.request(&req).await)
+        })
+    })
+}
+
+fn event_from_response(resp: Result<Response, impl Sized>) -> Result<Option<String>, StateError> {
+    match resp {
+        Ok(Response::Err(hm_daemon::ipc::ErrCode::NotFound)) => Ok(None),
+        other => state_from_response(other).map(Some),
+    }
+}
+
+fn daemon_event(client: Client, room: Option<RoomId>) -> EventFn {
+    let client = Arc::new(client);
+    Arc::new(move |id| {
+        let client = Arc::clone(&client);
+        Box::pin(async move {
+            event_from_response(
+                client
+                    .request(&Request {
+                        agent: DEFAULT_AGENT.into(),
+                        room,
+                        call: Call::FeedEvent { id },
+                    })
+                    .await,
+            )
         })
     })
 }
@@ -346,7 +387,15 @@ async fn run_async(data: &DataDir, room: Option<&str>, open: bool) -> Result<(),
             std::future::pending::<()>().await;
         }
     };
-    serve(listener, url_token, daemon_state(client, room), ctrl_c).await;
+    let event = daemon_event(client.clone(), room);
+    serve(
+        listener,
+        url_token,
+        daemon_state(client, room),
+        event,
+        ctrl_c,
+    )
+    .await;
     Ok(())
 }
 
@@ -476,9 +525,15 @@ mod tests {
     async fn spawn(state: StateFn) -> (u16, tokio::sync::oneshot::Sender<()>) {
         let (l, port) = bind().await.unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(serve(l, TOKEN.to_owned(), state, async {
-            let _ = rx.await;
-        }));
+        tokio::spawn(serve(
+            l,
+            TOKEN.to_owned(),
+            state,
+            Arc::new(|_| Box::pin(async { Ok(None) })),
+            async {
+                let _ = rx.await;
+            },
+        ));
         (port, tx)
     }
 
@@ -636,7 +691,9 @@ mod tests {
         );
         assert_eq!(
             keys(&v["events"][0]),
-            ["from", "id", "kind", "lamport", "ref", "text", "to", "ts_ms"]
+            [
+                "from", "full", "id", "kind", "lamport", "ref", "text", "to", "ts_ms"
+            ]
         );
         assert_eq!(v["room"], "alpha");
         assert_eq!(v["members"][0]["role"], "owner");
@@ -711,6 +768,62 @@ mod tests {
         assert_secure_headers(&r);
     }
 
+    #[tokio::test]
+    async fn event_detail_has_complete_text_and_unknown_is_404() {
+        let d = daemon();
+        let long = format!("<script>{}end", "word ".repeat(100));
+        d.handle_request(Request {
+            agent: "alice".into(),
+            room: None,
+            call: Call::Ask {
+                to: "bob".into(),
+                question: long.clone(),
+            },
+        });
+        let v: Value = serde_json::from_str(
+            &state_from_response(Ok::<_, ()>(d.handle_request(feed_req(0)))).unwrap(),
+        )
+        .unwrap();
+        let id = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "ask")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap();
+        let source = Arc::clone(&d);
+        let event: EventFn = Arc::new(move |id| {
+            let response = source.handle_request(Request {
+                agent: "viewer".into(),
+                room: None,
+                call: Call::FeedEvent { id },
+            });
+            Box::pin(async move { event_from_response(Ok::<_, ()>(response)) })
+        });
+        let (listener, port) = bind().await.unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(serve(listener, TOKEN.into(), state_of(d), event, async {
+            let _ = rx.await;
+        }));
+        let r = get(port, &format!("/{TOKEN}/api/event?id={id}")).await;
+        assert_eq!(r.status, 200);
+        assert_secure_headers(&r);
+        let e: Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(e["text"], long);
+        assert_eq!(e["id"], id);
+        for query in [
+            "",
+            "?id=unknown",
+            "?id=0000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            let r = get(port, &format!("/{TOKEN}/api/event{query}")).await;
+            assert_eq!(r.status, 404);
+            assert_secure_headers(&r);
+        }
+        drop(tx);
+    }
+
     #[test]
     fn tokens_are_random_128_bit_hex() {
         let (a, b) = (random_token().unwrap(), random_token().unwrap());
@@ -726,7 +839,10 @@ mod tests {
         let html = INDEX_HTML.to_ascii_lowercase();
         assert!(!html.contains("<script>") && !html.contains("style="));
         for a in [INDEX_HTML, VIEW_CSS, VIEW_JS] {
-            assert!(!a.contains("https://") && !a.contains("http://"), "external");
+            assert!(
+                !a.contains("https://") && !a.contains("http://"),
+                "external"
+            );
         }
     }
 }

@@ -67,6 +67,38 @@ pub fn short_agent(a: &AgentRef) -> String {
     )
 }
 
+fn route_label(direct: bool, relay: bool) -> &'static str {
+    match (direct, relay) {
+        (true, true) => "direct + relay",
+        (true, false) => "direct",
+        (false, true) => "via relay",
+        (false, false) => "route pending",
+    }
+}
+
+// iroh 1.4.1: remote_info -> addrs -> usage (Active), not merely known addresses.
+// https://docs.rs/iroh/1.4.1/iroh/endpoint/struct.RemoteInfo.html
+async fn peer_route(endpoint: &iroh::Endpoint, peer: NodeId) -> &'static str {
+    let Ok(id) = endpoint_id_from_node(peer) else {
+        return "route pending";
+    };
+    let Some(info) = endpoint.remote_info(id).await else {
+        return "route pending";
+    };
+    let (mut direct, mut relay) = (false, false);
+    for addr in info
+        .addrs()
+        .filter(|a| matches!(a.usage(), iroh::endpoint::TransportAddrUsage::Active))
+    {
+        match addr.addr() {
+            iroh::TransportAddr::Ip(_) => direct = true,
+            iroh::TransportAddr::Relay(_) => relay = true,
+            _ => {}
+        }
+    }
+    route_label(direct, relay)
+}
+
 /// Error text for the terminal: it may embed a peer's close reason.
 fn show_err(e: &impl std::fmt::Display) -> String {
     sanitize_display(&e.to_string(), ERROR_MAX)
@@ -442,7 +474,11 @@ impl RoomSession {
                 if self.repair.up(n) {
                     self.spawn_sync(n);
                 }
-                Ok(format!("peer up   {}", short_node(&n)))
+                Ok(format!(
+                    "peer up   {} ({})",
+                    short_node(&n),
+                    peer_route(self.net.endpoint(), n).await
+                ))
             }
             RoomEvent::NeighborDown(n) => {
                 self.repair.down(n);
@@ -595,6 +631,14 @@ mod tests {
 
     fn agent(n: u8, name: &str) -> AgentRef {
         AgentRef::new(NodeId::from_bytes([n; 32]), name)
+    }
+
+    #[test]
+    fn route_labels_distinguish_active_transports() {
+        assert_eq!(route_label(true, false), "direct");
+        assert_eq!(route_label(false, true), "via relay");
+        assert_eq!(route_label(true, true), "direct + relay");
+        assert_eq!(route_label(false, false), "route pending");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 mod doctor;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -56,6 +57,13 @@ enum Cmd {
         #[arg(long = "as", default_value = DEFAULT_AGENT)]
         agent: String,
     },
+    /// Open a read-only local web view of room activity.
+    View {
+        #[arg(long)]
+        room: Option<String>,
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Check the local environment (herdr binary, data dir).
     Doctor,
 }
@@ -95,6 +103,14 @@ enum RoomCmd {
     },
     /// Show members, leases and open tasks from the local store.
     Status { room: String },
+    /// Print full conversation entries; optionally follow new events.
+    Log {
+        room: String,
+        #[arg(long)]
+        follow: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Go online in the foreground until Ctrl+C.
     Run { room: String },
 }
@@ -130,6 +146,22 @@ fn room_main(data: Option<DataDir>, cmd: RoomCmd) -> ExitCode {
             RoomCmd::Leave { room, yes } => room::leave(&data, &room, yes).await,
             RoomCmd::Grant { room, node, role } => room::grant(&data, &room, &node, &role).await,
             RoomCmd::Status { room } => room::status(&data, &room),
+            RoomCmd::Log {
+                room,
+                follow,
+                limit,
+            } => room::log(
+                &data,
+                &room,
+                follow,
+                limit,
+                async {
+                    let _ = tokio::signal::ctrl_c().await;
+                },
+                |line| println!("{line}"),
+            )
+            .await
+            .map(|()| String::new()),
             RoomCmd::Run { room } => {
                 let ctrl_c = async {
                     // If the handler cannot be installed, run until killed.
@@ -225,10 +257,18 @@ fn mcp_main(data: Option<DataDir>, agent: &str, room: Option<&str>) -> ExitCode 
     })
 }
 
+fn stderr_supports_ansi() -> bool {
+    std::io::stderr().is_terminal()
+        && !anstyle_query::no_color()
+        && anstyle_query::windows::enable_ansi_colors()
+            .unwrap_or_else(anstyle_query::term_supports_ansi_color)
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
+        .with_ansi(stderr_supports_ansi())
         .init();
 
     let cli = Cli::parse();
@@ -248,6 +288,9 @@ fn main() -> ExitCode {
             &agent,
             room.as_deref(),
         ),
+        Cmd::View { room, no_open } => {
+            herdmesh::view::run(data_dir(cli.data_dir), room.as_deref(), no_open)
+        }
         Cmd::Board { agent } => herdmesh::board::run(data_dir(cli.data_dir), &agent),
         Cmd::Doctor => {
             let mut cfg = doctor::DoctorConfig::from_env();
@@ -269,6 +312,19 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn parses_view_and_room_log() {
+        let c = Cli::try_parse_from(["herdmesh", "view", "--room", "alpha", "--no-open"]).unwrap();
+        assert!(matches!(c.command, Cmd::View { room: Some(r), no_open: true } if r == "alpha"));
+        let c = Cli::try_parse_from([
+            "herdmesh", "room", "log", "alpha", "--follow", "--limit", "7",
+        ])
+        .unwrap();
+        assert!(
+            matches!(c.command, Cmd::Room { cmd: RoomCmd::Log { room, follow: true, limit: 7 } } if room == "alpha")
+        );
+    }
 
     #[test]
     fn cli_definition_is_valid() {

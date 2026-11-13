@@ -264,6 +264,43 @@ pub async fn run(
     res
 }
 
+/// Print the newest `limit` messages, then optionally follow local store updates.
+/// Tracking ids also catches events synced later with an older Lamport clock.
+pub async fn log(
+    data: &DataDir,
+    room: &str,
+    follow: bool,
+    limit: usize,
+    shutdown: impl Future<Output = ()>,
+    mut out: impl FnMut(&str),
+) -> Result<(), RoomError> {
+    let (id, _) = data.resolve_room(room)?;
+    let store = hm_store::Store::open(data.events_db(&id), id)?;
+    let initial = store.events_since(hm_proto::Lamport(0))?;
+    let mut seen: std::collections::BTreeSet<_> = initial.iter().map(|e| e.id).collect();
+    let lines: Vec<_> = initial
+        .iter()
+        .filter_map(hm_daemon::feed::log_line)
+        .collect();
+    for line in &lines[lines.len().saturating_sub(limit)..] {
+        out(line);
+    }
+    if !follow {
+        return Ok(());
+    }
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => return Ok(()),
+            () = tokio::time::sleep(Duration::from_millis(500)) => {
+                for e in store.events_since(hm_proto::Lamport(0))? {
+                    if seen.insert(e.id) && let Some(line) = hm_daemon::feed::log_line(&e) { out(&line); }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +328,75 @@ mod tests {
             );
         }
         v
+    }
+
+    #[tokio::test]
+    async fn log_limits_initial_history_and_follows_new_events_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = DataDir::new(temp.path().join("data"));
+        let id = data
+            .create_room(
+                &RoomSecret::generate().unwrap(),
+                &RoomConfig::new("alpha", RoleName::Owner, "alice"),
+                &[],
+            )
+            .unwrap();
+        let mut store = hm_store::Store::open(data.events_db(&id), id).unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let event = |seq, text: &str| {
+            hm_proto::Event::sign(
+                &key,
+                id,
+                "alice",
+                seq,
+                Lamport(seq),
+                seq * 1000,
+                EventBody::Note {
+                    scope: "test".into(),
+                    text: text.into(),
+                },
+            )
+            .unwrap()
+        };
+        store.append(&event(1, "first")).unwrap();
+        store.append(&event(2, "second")).unwrap();
+        let mut initial = Vec::new();
+        log(&data, "alpha", false, 1, std::future::pending(), |l| {
+            initial.push(l.to_owned())
+        })
+        .await
+        .unwrap();
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].ends_with("[note] second"));
+        let mut lines = Vec::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut stop = Some(tx);
+        let run = log(
+            &data,
+            "alpha",
+            true,
+            1,
+            async {
+                let _ = rx.await;
+            },
+            |l| {
+                lines.push(l.to_owned());
+                if lines.len() == 1 {
+                    store.append(&event(3, "third")).unwrap();
+                }
+                if lines.len() == 2
+                    && let Some(tx) = stop.take()
+                {
+                    let _ = tx.send(());
+                }
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with("[note] third"));
     }
 
     #[test]

@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+getrandom.workspace = true
+anstyle-query = "1.1.5"
 clap.workspace = true
 dirs.workspace = true
 thiserror.workspace = true
