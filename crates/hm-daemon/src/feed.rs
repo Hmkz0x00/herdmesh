@@ -1,9 +1,8 @@
 //! Read-only room snapshot for `herdmesh view` (ADR-003).
 //!
 //! [`Feed`] serializes to exactly the JSON of `GET /<token>/api/state`.
-//! Every free-text field is peer-authored: it is redacted, flattened to one
-//! line and cut to [`TEXT_MAX`] chars here. `herdmesh view` additionally runs
-//! its terminal-safe `sanitize_display` over every string it serves.
+//! Free-text fields are redacted, escaped with `sanitize_display`, and
+//! capped here before being served over authenticated local IPC.
 //!
 //! Cost: one pass over the room log per call (rooms are small in v1; the
 //! page polls every few seconds). Nothing is written, nobody is made a
@@ -11,11 +10,12 @@
 
 use std::collections::BTreeMap;
 
-use hm_brief::{agent_label, clean};
+use crate::display::sanitize_display;
+use hm_brief::agent_label;
+pub use hm_proto::feed::{Feed, FeedEvent, FeedLease, FeedMember, FeedTask, FullEvent};
 use hm_proto::redact::redact;
 use hm_proto::{AgentRef, AgentStatus, Event, EventBody, EventId, Role, TaskStatus};
 use hm_store::{ClaimState, Store};
-use serde::{Deserialize, Serialize};
 
 /// Most events per response.
 pub const EVENTS_MAX: usize = 200;
@@ -28,74 +28,16 @@ const SHORT_ID: usize = 6;
 /// Longest part of an activity line, in chars.
 const PART_MAX: usize = 60;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FeedMember {
-    pub id: String,
-    pub node: String,
-    pub name: String,
-    pub role: String,
-    pub local: bool,
-    pub present: bool,
-    pub status: String,
-    pub activity: String,
-    pub last_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FeedLease {
-    pub id: String,
-    pub paths: Vec<String>,
-    pub holder: String,
-    pub state: String,
-    pub expires_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FeedTask {
-    pub id: String,
-    pub title: String,
-    pub status: String,
-    pub owner: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FeedEvent {
-    /// Full hex id (use it with `Call::FeedEvent`).
-    pub id: String,
-    pub lamport: u64,
-    pub ts_ms: u64,
-    pub kind: String,
-    pub from: String,
-    pub to: Option<String>,
-    pub text: String,
-    /// `false` when `text` was cut at [`TEXT_MAX`] chars.
-    pub full: bool,
-    #[serde(rename = "ref")]
-    pub reference: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Feed {
-    pub room: String,
-    pub you: String,
-    pub now_ms: u64,
-    pub cursor: u64,
-    pub members: Vec<FeedMember>,
-    pub leases: Vec<FeedLease>,
-    pub tasks: Vec<FeedTask>,
-    pub events: Vec<FeedEvent>,
-}
-
 /// Redacted, one-line, `TEXT_MAX`-capped copy of peer text.
 fn text(s: &str) -> String {
-    clean(&redact(s).text, TEXT_MAX - 1)
+    sanitize_display(&redact(s).text, TEXT_MAX)
 }
 
 /// Like [`text`], also saying whether nothing was cut.
 fn text_full(s: &str) -> (String, bool) {
     let r = redact(s).text;
-    let cut = clean(&r, TEXT_MAX - 1);
-    let whole = clean(&r, usize::MAX / 8);
+    let cut = sanitize_display(&r, TEXT_MAX);
+    let whole = sanitize_display(&r, usize::MAX);
     let full = cut == whole;
     (cut, full)
 }
@@ -105,7 +47,7 @@ fn short(id: &EventId) -> String {
 }
 
 fn who(a: &AgentRef) -> String {
-    agent_label(a)
+    agent_label(&AgentRef::new(a.node, redact(&a.agent_name).text))
 }
 
 fn role_str(r: Role) -> &'static str {
@@ -239,19 +181,6 @@ fn parts(e: &Event) -> Option<Parts> {
 /// Longest text served by [`full_event`], in bytes.
 pub const FULL_MAX: usize = 8 * 1024;
 
-/// One message with its complete (redacted, 8 KiB-capped) text, for
-/// `GET /<token>/api/event` and `herdmesh room log`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FullEvent {
-    pub id: String,
-    pub kind: String,
-    pub from: String,
-    pub to: Option<String>,
-    pub ts_ms: u64,
-    pub text: String,
-    pub refs: Vec<String>,
-}
-
 fn cap_bytes(mut s: String, max: usize) -> String {
     if s.len() > max {
         let mut n = max.saturating_sub('…'.len_utf8());
@@ -273,8 +202,8 @@ pub fn full_event(e: &Event) -> Option<FullEvent> {
         from: who(&e.author),
         to: p.to,
         ts_ms: e.ts,
-        text: cap_bytes(redact(&p.raw).text, FULL_MAX),
-        refs: p.refs,
+        text: cap_bytes(sanitize_display(&redact(&p.raw).text, usize::MAX), FULL_MAX),
+        refs: p.refs.iter().map(|r| text(r)).collect(),
     })
 }
 
@@ -306,7 +235,7 @@ fn task_status(s: TaskStatus) -> &'static str {
 
 /// Short phrase for the last action of an agent, e.g. `answered bob`.
 fn action(e: &Event, by_id: &BTreeMap<EventId, &Event>) -> Option<String> {
-    let name = |a: &AgentRef| text(&a.agent_name);
+    let name = |a: &AgentRef| a.agent_name.clone();
     Some(match &e.body {
         EventBody::Ask { to, .. } => match to {
             Some(t) => format!("asked {}", name(t)),
@@ -322,9 +251,9 @@ fn action(e: &Event, by_id: &BTreeMap<EventId, &Event>) -> Option<String> {
         },
         EventBody::LeaseClaim { .. } => "claimed".to_owned(),
         EventBody::LeaseRelease { .. } => "released".to_owned(),
-        EventBody::TaskAdd { task, .. } => format!("added {}", text(task.as_str())),
+        EventBody::TaskAdd { task, .. } => format!("added {}", task.as_str()),
         EventBody::TaskUpdate { task, status, .. } => {
-            format!("{} {}", text(task.as_str()), task_status(*status))
+            format!("{} {}", task.as_str(), task_status(*status))
         }
         EventBody::Decision { .. } => "decided".to_owned(),
         EventBody::Note { .. } => "noted".to_owned(),
@@ -333,7 +262,15 @@ fn action(e: &Event, by_id: &BTreeMap<EventId, &Event>) -> Option<String> {
 }
 
 fn cut(s: &str) -> String {
-    clean(s, PART_MAX)
+    let redacted = redact(s).text;
+    if redacted.chars().count() > PART_MAX {
+        format!(
+            "{}\u{2026}",
+            redacted.chars().take(PART_MAX - 1).collect::<String>()
+        )
+    } else {
+        redacted
+    }
 }
 
 /// Build the snapshot. `events_since` is read from the log; `you` is the
@@ -385,10 +322,11 @@ pub fn build(
         if matches!(t.status, TaskStatus::InProgress | TaskStatus::Blocked)
             && let Some(o) = &owner
         {
-            doing
-                .entry(o.clone())
-                .or_default()
-                .push(format!("{} {}", text(id.as_str()), task_status(t.status)));
+            doing.entry(o.clone()).or_default().push(format!(
+                "{} {}",
+                id.as_str(),
+                task_status(t.status)
+            ));
         }
         if tasks.len() < LIST_MAX {
             tasks.push(FeedTask {
@@ -440,7 +378,7 @@ pub fn build(
                 local: a.node == me.node,
                 present: m.present,
                 status: status_str(m.status).to_owned(),
-                activity,
+                activity: text(&activity),
                 last_ms: last_ms.get(a).copied().unwrap_or(0),
             }
         })
@@ -478,7 +416,7 @@ pub fn build(
                 to: p.to,
                 text: t,
                 full,
-                reference: p.reference,
+                reference: p.reference.map(|r| text(&r)),
             })
         })
         .collect();
@@ -493,4 +431,21 @@ pub fn build(
         tasks,
         events,
     })
+}
+
+/// Complete terminal-safe conversation entry; unlike HTTP detail, no text cap.
+pub fn log_line(e: &Event) -> Option<String> {
+    let p = parts(e)?;
+    let ms = e.ts % 86_400_000;
+    Some(format!(
+        "{:02}:{:02}:{:02}.{:03}Z {} -> {} [{}] {}",
+        ms / 3_600_000,
+        ms / 60_000 % 60,
+        ms / 1_000 % 60,
+        ms % 1_000,
+        who(&e.author),
+        p.to.as_deref().unwrap_or("*"),
+        p.kind,
+        sanitize_display(&redact(&p.raw).text, usize::MAX)
+    ))
 }

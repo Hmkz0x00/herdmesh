@@ -16,3 +16,5 @@ pub use core::{
 
 /// Crate name, used by `herdmesh doctor` and tests to prove linkage.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+
+pub mod display;

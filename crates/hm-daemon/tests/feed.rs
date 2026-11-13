@@ -68,9 +68,19 @@ fn member<'a>(v: &'a Value, name: &str) -> &'a Value {
 fn feed_is_read_only_and_matches_the_adr_shape() {
     let (d, room, _) = setup();
     ok(&d, "alice", Call::RoomCard);
-    let before = d.store_for_test(room).lock().unwrap().event_count().unwrap();
+    let before = d
+        .store_for_test(room)
+        .lock()
+        .unwrap()
+        .event_count()
+        .unwrap();
     let v = feed(&d, 0, 50);
-    let after = d.store_for_test(room).lock().unwrap().event_count().unwrap();
+    let after = d
+        .store_for_test(room)
+        .lock()
+        .unwrap()
+        .event_count()
+        .unwrap();
     assert_eq!(before, after, "Feed must not append anything");
     // the viewer is not made a member
     assert!(
@@ -98,7 +108,9 @@ fn feed_is_read_only_and_matches_the_adr_shape() {
         assert!(v[k].is_array(), "{k}");
     }
     let e = &v["events"][0];
-    for k in ["id", "lamport", "ts_ms", "kind", "from", "to", "text", "full", "ref"] {
+    for k in [
+        "id", "lamport", "ts_ms", "kind", "from", "to", "text", "full", "ref",
+    ] {
         assert!(e.get(k).is_some(), "event.{k} in {e}");
     }
     assert_eq!(e["kind"], "join");
@@ -333,7 +345,7 @@ fn cursor_pages_events_oldest_first() {
     );
     let inc = feed(&d, cur, 200);
     assert_eq!(inc["events"].as_array().unwrap().len(), 1);
-    assert_eq!(inc["events"][0]["text"], "new");
+    assert_eq!(inc["events"][0]["text"], "new\\nr");
     // since>0 pages forward from the cursor, oldest first.
     let first = feed(&d, 1, 2);
     let l: Vec<u64> = first["events"]
@@ -360,7 +372,10 @@ fn limit_is_capped_at_200() {
             },
         );
     }
-    assert_eq!(feed(&d, 0, 100_000)["events"].as_array().unwrap().len(), 200);
+    assert_eq!(
+        feed(&d, 0, 100_000)["events"].as_array().unwrap().len(),
+        200
+    );
     assert_eq!(feed(&d, 0, 0)["events"].as_array().unwrap().len(), 1);
 }
 
@@ -434,7 +449,12 @@ fn long_text_is_cut_in_the_feed_but_complete_in_feed_event() {
             question: "short one".into(),
         },
     );
-    let before = d.store_for_test(room).lock().unwrap().event_count().unwrap();
+    let before = d
+        .store_for_test(room)
+        .lock()
+        .unwrap()
+        .event_count()
+        .unwrap();
     let v = feed(&d, 0, 50);
     let asks: Vec<&Value> = v["events"]
         .as_array()
@@ -461,7 +481,11 @@ fn long_text_is_cut_in_the_feed_but_complete_in_feed_event() {
     assert!(matches!(event_req(&d, &id[..8]), Response::Ok(_)));
     assert_eq!(
         before,
-        d.store_for_test(room).lock().unwrap().event_count().unwrap()
+        d.store_for_test(room)
+            .lock()
+            .unwrap()
+            .event_count()
+            .unwrap()
     );
 }
 
@@ -507,5 +531,65 @@ fn feed_event_caps_at_8_kib_and_redacts_peer_text() {
     let t = e["text"].as_str().unwrap();
     assert!(t.len() <= 8 * 1024, "{}", t.len());
     assert!(!t.contains(TOKEN));
-    assert!(t.contains("\nline two"), "keeps line breaks");
+    assert!(t.contains("\\nline two"), "visible line breaks");
+    assert!(!t.chars().any(char::is_control));
+}
+
+#[test]
+fn feed_escapes_bidi_and_controls_before_applying_full_flag() {
+    let (d, room, _) = setup();
+    ok(&d, "alice", Call::RoomCard);
+    let store = d.store_for_test(room);
+    let key = SigningKey::from_bytes(&[9; 32]);
+    let mut s = store.lock().unwrap();
+    let node = hm_proto::NodeId::from_verifying_key(&key.verifying_key());
+    let ev = Event::sign(
+        &key,
+        room,
+        "peer",
+        s.next_seq(&node).unwrap(),
+        s.next_lamport().unwrap(),
+        T0,
+        EventBody::Note {
+            scope: "s".into(),
+            text: "\u{202e}\x1b".repeat(40),
+        },
+    )
+    .unwrap();
+    s.append(&ev).unwrap();
+    drop(s);
+    let v = feed(&d, 0, 200);
+    let e = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "note")
+        .unwrap();
+    let t = e["text"].as_str().unwrap();
+    assert!(!t.contains('\u{202e}'));
+    assert!(t.contains("\\x1b"));
+    assert!(t.chars().count() <= 200);
+    assert_eq!(e["full"], false);
+}
+
+#[test]
+fn room_log_keeps_complete_text_and_neutralizes_controls() {
+    let key = SigningKey::from_bytes(&[9; 32]);
+    let room = RoomId::from_bytes([1; 32]);
+    let raw = format!("<script>\n\x1b[31m{}end", "x".repeat(9000));
+    let e = Event::sign(
+        &key,
+        room,
+        "alice",
+        1,
+        Lamport(1),
+        3_723_004,
+        EventBody::Ask { to: None, q: raw },
+    )
+    .unwrap();
+    let line = hm_daemon::feed::log_line(&e).unwrap();
+    assert!(line.starts_with("01:02:03.004Z "));
+    assert!(line.contains("/alice -> * [ask] <script>\\n\\x1b[31m"));
+    assert!(line.ends_with(&format!("{}end", "x".repeat(9000))));
+    assert!(!line.chars().any(char::is_control));
 }

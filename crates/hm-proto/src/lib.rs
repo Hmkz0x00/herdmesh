@@ -6,6 +6,7 @@
 pub mod budget;
 mod error;
 mod event;
+pub mod feed;
 mod ids;
 pub mod limits;
 pub mod redact;
