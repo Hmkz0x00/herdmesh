@@ -150,18 +150,33 @@ fn room_main(data: Option<DataDir>, cmd: RoomCmd) -> ExitCode {
                 room,
                 follow,
                 limit,
-            } => room::log(
-                &data,
-                &room,
-                follow,
-                limit,
-                async {
-                    let _ = tokio::signal::ctrl_c().await;
-                },
-                |line| println!("{line}"),
-            )
-            .await
-            .map(|()| String::new()),
+            } => {
+                // Like `view`: bring the daemon up so --follow sees synced
+                // events. The log itself reads the local store, so a daemon
+                // that cannot start is a warning, not a failure.
+                if let Err(e) = daemon::ensure_for_cli(
+                    &data,
+                    &daemon::default_socket(),
+                    || daemon::spawn_detached(&data),
+                    |m| eprintln!("herdmesh room log: {m}"),
+                )
+                .await
+                {
+                    eprintln!("herdmesh room log: daemon not available ({e}); showing local state");
+                }
+                room::log(
+                    &data,
+                    &room,
+                    follow,
+                    limit,
+                    async {
+                        let _ = tokio::signal::ctrl_c().await;
+                    },
+                    |line| println!("{line}"),
+                )
+                .await
+                .map(|()| String::new())
+            }
             RoomCmd::Run { room } => {
                 let ctrl_c = async {
                     // If the handler cannot be installed, run until killed.

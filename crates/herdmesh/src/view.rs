@@ -13,13 +13,12 @@
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hm_daemon::ipc::{Call, Client, Request, Response, Token, current_user, socket_name};
+use hm_daemon::ipc::{Call, Client, Request, Response, current_user, socket_name};
 use hm_proto::RoomId;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,7 +26,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
-use crate::board::TOKEN_FILE;
 use crate::data::DataDir;
 
 use crate::room::DEFAULT_AGENT;
@@ -358,22 +356,21 @@ fn open_browser(url: &str) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-fn read_token(path: &PathBuf) -> Result<Token, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("no daemon token ({e})"))?;
-    let arr: [u8; hm_daemon::ipc::TOKEN_LEN] = bytes
-        .try_into()
-        .map_err(|_| "daemon token has the wrong size".to_owned())?;
-    Ok(Token::from_bytes(arr))
-}
-
 async fn run_async(data: &DataDir, room: Option<&str>, open: bool) -> Result<(), String> {
     let room = room
         .map(|r| data.resolve_room(r).map(|(id, _)| id))
         .transpose()
         .map_err(|e| e.to_string())?;
-    let token = read_token(&data.root().join(TOKEN_FILE))
-        .map_err(|e| format!("{e}; is the daemon running?"))?;
-    let client = Client::new(socket_name(&current_user()), token);
+    let socket = socket_name(&current_user());
+    let token = crate::daemon::ensure_for_cli(
+        data,
+        &socket,
+        || crate::daemon::spawn_detached(data),
+        |m| eprintln!("herdmesh view: {m}"),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let client = Client::new(socket, token);
     let (listener, port) = bind().await.map_err(|e| format!("bind: {e}"))?;
     let url_token = random_token().map_err(|e| format!("random token: {e}"))?;
     let url = format!("http://127.0.0.1:{port}/{url_token}/");
