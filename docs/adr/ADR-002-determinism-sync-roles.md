@@ -8,7 +8,7 @@ Status: Accepted (2026-11-12). Trigger: GATE M1+M2 codex review (verdict FAIL). 
 - Lease effective expiry = `claim.ts + min(ttl, MAX_LEASE_TTL)`; `MAX_LEASE_TTL = 8h`.
 - **Ingestion skew guard (node-local, convergent):** an event with `ts > local_now + MAX_FUTURE_SKEW (5 min)` is not stored yet (kept in a bounded pending queue / re-fetched by later sync). Honest nodes with sane clocks converge on the same stored set.
 - **Settle safety is local, not a view:** the `claim` tool returns Granted only when the claim is the deterministic winner AND no conflicting claim was *first seen locally* in the last `SETTLE_MS`. First-seen times live in a local table, never in views.
-- **One lease model:** `settle.rs` is the single source of truth (overlap globs, atomic path sets, renewal = same author re-claims a superset, release targets a claim id). `views.rs` calls it.
+- **One lease model:** `settle.rs` is the single source of truth (overlap globs, atomic path sets, renewal = same holder re-claims the same paths or a subset (Addendum 2), release targets a claim id). `views.rs` calls it.
 
 ## 2. Clocks
 - Lamport: `checked_add`; events with `lamport > local_max + MAX_LAMPORT_JUMP (1_000_000)` are rejected (not stored). Exhaustion → error, never wrap/saturate.
@@ -32,3 +32,19 @@ Status: Accepted (2026-11-12). Trigger: GATE M1+M2 codex review (verdict FAIL). 
 ## Addendum (2026-11-12, after G3)
 - **Equivocation convergence:** a sync response for an author also carries every stored twin (same author+seq, different id) for that author, capped at 64; receivers keep the lowest id deterministically and mark the author. Without this, a node holding only the higher twin never fetches the lower one.
 - **Pre-Genesis rooms:** not migrated (pre-release). They fail with `NoGenesis` and must be recreated.
+
+## Addendum 2 (2026-11-14, after GATE-3 N3/N9): lease admission and narrow renewal
+**Why signed data alone can't fix N3.** Members can mint fresh node keys for free, and both `lamport` and `ts` are chosen by the signer (only future skew is bounded). A fresh seq-1 claim with a low Lamport and a backdated `ts` looks exactly like an honest claim from a node that was cut off. So every deterministic rule over signed fields, including a signed "seen frontier", can be met by lying about what was seen. The only signal an attacker cannot forge is *when a claim reached this node*. We use that at **admission** (which events get stored), never inside views.
+
+1. **Views stay a pure function of the stored signed set** (§1 unchanged): same stored set + `now` → same leases.
+2. **Lease admission (ingest, node-local).** A `LeaseClaim` C offered at local time `now` is **refused** (not stored: `StoreError::LeaseTakeover`, counted as rejected in batches) when adding it would make some claim V of another holder stop winning, and V's root was first seen here at least `SETTLE_MS` before `now`, i.e. V is *locally settled*. The "before" book only holds claims and releases first seen strictly before `now`, so events that arrive in the same instant (one batch) never refuse each other. Arrival order inside one instant therefore cannot change the stored set (the GATE-1/2 order-independence proptests still apply). This applies to fresh inserts and to lower-id equivocation twins alike.
+   - Honest races are unaffected: a conflicting claim that arrives inside V's local settle window still competes by the deterministic rule.
+   - Consequence: `claim_safe` ⇒ final *at this node*. A lease this node reported as safe can no longer be taken retroactively by a claim that arrives later (N3), whatever its Lamport, `ts`, seq or renewal root.
+   - Missing `first_seen` (legacy rows) counts as settled (the safe direction).
+3. **Renewal cannot grow (N9).** A renewal is a later claim by the same holder (node + agent), signed before the parent expired and not after a release of the parent, whose paths are a **subset** (literal strings) of the parent's. It keeps the parent's place in line, and dropped paths are freed. Any wider claim is a **new claim** with its own root, signed time and Lamport, and it competes normally. Narrowing is still checked by (2), so a "shrink" renewal can't take a locally settled lease either.
+4. **Not adopted: monotonic per-author Lamport.** It does not stop N3 as written (a fresh node has no history). Rejecting at ingest depends on which twin arrives first, so it diverges, and a claims-only view rule needs a new `ClaimRec` field that other crates construct. Revisit together with a signed causal-frontier field if signed proof is ever needed.
+
+**Residual risks (documented, accepted for now):**
+- *Partitions / delivery slower than `SETTLE_MS`*: if two honest conflicting claims race and one reaches a node only after the other has settled there, that node refuses it and others don't. The stored sets differ until the surviving lease chain ends (expiry or release; re-offered by sync, then admitted). This is the price of (b): a settled lease is never revoked by a later arrival.
+- *Returning or new nodes* that receive the victim's claim and a backdated attacker claim in the same instant can't tell them apart, and fall back to the deterministic rule. Nodes that witnessed the lease settle refuse the attacker claim, so it is not propagated by them.
+- *Loser revival*: a claim that was losing because of a third claim can win again when that blocker is released or expires, and can then take a settled lease (a pre-existing atomic-set property; it needs no later-arriving claim). Tracked as a follow-up.

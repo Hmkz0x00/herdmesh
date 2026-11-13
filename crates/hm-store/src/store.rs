@@ -17,18 +17,20 @@
 //!    in-memory pending queue that every later append retries;
 //! 3. `lamport > local max + MAX_LAMPORT_JUMP` → rejected;
 //! 4. same (author, seq) with a different id → equivocation: the lowest id
-//!    is kept, a mark is recorded.
+//!    is kept, a mark is recorded;
+//! 5. a `LeaseClaim` that would take a lease already settled here is
+//!    refused (ADR-002 Addendum 2, [`takes_settled_lease`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hm_proto::limits::{MAX_EVENT_BYTES, MAX_FUTURE_SKEW_MS, MAX_LAMPORT_JUMP};
-use hm_proto::{AgentRef, Event, EventBody, EventId, EventSig, Lamport, NodeId, RoomId};
+use hm_proto::{AgentRef, Event, EventBody, EventId, EventKind, EventSig, Lamport, NodeId, RoomId};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::StoreError;
-use crate::settle::{ClaimState, SETTLE_MS};
+use crate::settle::{ClaimRec, ClaimState, LeaseBook, SETTLE_MS};
 use crate::views::{OrderKey, Views, order_key};
 
 const SCHEMA: &str = "
@@ -201,6 +203,8 @@ enum Disp {
     Replaced,
     /// Equivocation; the stored twin has the lower id, this one was dropped.
     Dropped,
+    /// Lease claim that would take a lease already settled here.
+    Takeover,
 }
 
 fn be(n: u64) -> Vec<u8> {
@@ -331,6 +335,59 @@ fn load_snapshot(conn: &Connection) -> Result<Option<(Views, Option<OrderKey>)>,
         None => None,
     };
     Ok(Some((views, last)))
+}
+
+fn first_seen_at(conn: &Connection, id: &EventId) -> Result<Option<u64>, StoreError> {
+    let v: Option<Vec<u8>> = conn
+        .prepare_cached("SELECT at FROM first_seen WHERE id = ?1")?
+        .query_row(params![id.as_bytes().to_vec()], |r| r.get(0))
+        .optional()?;
+    v.map(|v| u64_of(v, "first_seen")).transpose()
+}
+
+/// Lease admission (ADR-002 Addendum 2): whether storing claim `e` at `now`
+/// would make a claim of another holder stop winning whose root this node
+/// first saw at least [`SETTLE_MS`] ago. Judged against `before`: the lease
+/// book without anything first seen at or after `now`, so events arriving
+/// in the same instant never refuse each other and their order can't change
+/// what is stored. Missing first-seen rows count as settled.
+fn takes_settled_lease(
+    conn: &Connection,
+    views: &Views,
+    before: &mut Option<LeaseBook>,
+    e: &Event,
+    now: u64,
+) -> Result<bool, StoreError> {
+    let Some(c) = ClaimRec::from_event(e) else {
+        return Ok(false);
+    };
+    // Views ignore it anyway.
+    if !views.role_of(&e.author.node).may(EventKind::LeaseClaim) {
+        return Ok(false);
+    }
+    let book = match before {
+        Some(b) => b,
+        None => {
+            let mut recent = BTreeSet::new();
+            for id in views.leases.event_ids() {
+                if first_seen_at(conn, &id)?.is_some_and(|at| at >= now) {
+                    recent.insert(id);
+                }
+            }
+            let mut b = views.leases.clone();
+            b.retain(|id| !recent.contains(id));
+            before.insert(b)
+        }
+    };
+    for v in book.displaced_by(&c, now) {
+        let root = book.root_of(&v).unwrap_or(v);
+        let settled =
+            first_seen_at(conn, &root)?.is_none_or(|at| at.saturating_add(SETTLE_MS) <= now);
+        if settled {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Stores from before per-author seqs (wire v1) can't be migrated: their
@@ -645,6 +702,7 @@ impl Store {
             Some(Disp::Duplicate | Disp::Dropped) => Ok(AppendOutcome::Duplicate),
             Some(Disp::Deferred) => Ok(AppendOutcome::Deferred),
             Some(Disp::LamportJump) => Err(StoreError::LamportJump),
+            Some(Disp::Takeover) => Err(StoreError::LeaseTakeover),
             Some(Disp::Rejected) | None => Err(StoreError::Corrupt("ingest disposition")),
         }
     }
@@ -670,7 +728,7 @@ impl Store {
                 Disp::Inserted => r.inserted += 1,
                 Disp::Duplicate => r.duplicates += 1,
                 Disp::Deferred => r.deferred += 1,
-                Disp::Rejected | Disp::LamportJump => r.rejected += 1,
+                Disp::Rejected | Disp::LamportJump | Disp::Takeover => r.rejected += 1,
                 Disp::Replaced => {
                     r.inserted += 1;
                     r.equivocations += 1;
@@ -751,6 +809,8 @@ impl Store {
         let mut added: Vec<usize> = Vec::new();
         let mut replaced = false;
         let mut touched = BTreeSet::new();
+        // Lease book as of strictly before `now`, built on first use.
+        let mut before: Option<LeaseBook> = None;
         for i in todo {
             let e = &all[i];
             if e.lamport.0 > max.saturating_add(MAX_LAMPORT_JUMP) {
@@ -778,6 +838,10 @@ impl Store {
                         disp[i] = Disp::Dropped;
                         continue;
                     }
+                    if takes_settled_lease(&tx, &self.views, &mut before, e, now)? {
+                        disp[i] = Disp::Takeover;
+                        continue;
+                    }
                     delete_event(&tx, &old)?;
                     insert_event(&tx, e)?;
                     truncate_prefix(&tx, &e.author.node, e.seq)?;
@@ -785,6 +849,10 @@ impl Store {
                     disp[i] = Disp::Replaced;
                 }
                 None => {
+                    if takes_settled_lease(&tx, &self.views, &mut before, e, now)? {
+                        disp[i] = Disp::Takeover;
+                        continue;
+                    }
                     insert_event(&tx, e)?;
                     disp[i] = Disp::Inserted;
                     added.push(i);
@@ -836,12 +904,7 @@ impl Store {
 
     /// When this node first stored event `id` (local clock, unix millis).
     pub fn first_seen(&self, id: &EventId) -> Result<Option<u64>, StoreError> {
-        let v: Option<Vec<u8>> = self
-            .conn
-            .prepare_cached("SELECT at FROM first_seen WHERE id = ?1")?
-            .query_row(params![id.as_bytes().to_vec()], |r| r.get(0))
-            .optional()?;
-        v.map(|v| u64_of(v, "first_seen")).transpose()
+        first_seen_at(&self.conn, id)
     }
 
     /// Local settle safety (ADR-002 §1): true only if the claim is the

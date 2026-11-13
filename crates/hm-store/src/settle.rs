@@ -12,9 +12,13 @@
 //! 1. **Released**: a `LeaseRelease { claim }` naming it exists from the
 //!    claim's *author node*. Releases from other nodes are ignored.
 //! 2. **Renewed { by }**: a later claim by the same holder (node + agent)
-//!    covers a superset of its paths, was signed (`ts`) before it expired,
-//!    and no release of it sorts before that renewal. The renewal takes over
-//!    the original's place in line (its *root*). `by` is the latest renewal.
+//!    names the same paths or a subset of them (literal strings), was signed
+//!    (`ts`) before it expired, and no release of it sorts before that
+//!    renewal. The renewal takes over the original's place in line (its
+//!    *root*); dropped paths are freed. `by` is the latest renewal. A claim
+//!    naming any path the parent did not is a new claim with its own root
+//!    (ADR-002 Addendum 2, GATE-3 N9), so renewal can't inherit priority for
+//!    paths it never held.
 //! 3. **Expired**: `now >= ts + min(ttl, MAX_LEASE_TTL)`.
 //! 4. Otherwise it is *live*. Live claims are sorted by (root's order key,
 //!    own order key) and walked lowest-first; a claim **wins** unless one of
@@ -194,11 +198,12 @@ impl<'a> Resolved<'a> {
         for list in by_holder.values_mut() {
             list.sort_by_key(|c| c.key());
             for (i, child) in list.iter().enumerate() {
-                let have: BTreeSet<&String> = child.paths.iter().collect();
-                // Most recent earlier claim this one can renew.
+                // Most recent earlier claim this one can renew. A renewal
+                // never grows the path set (GATE-3 N9): wider is a new claim.
                 let found = list[..i].iter().rev().find(|p| {
+                    let held: BTreeSet<&String> = p.paths.iter().collect();
                     child.ts < p.expires_at_ms()
-                        && p.paths.iter().all(|x| have.contains(x))
+                        && child.paths.iter().all(|x| held.contains(x))
                         && !book.released_before(p, Some(child.key()))
                 });
                 if let Some(p) = found {
@@ -290,6 +295,55 @@ impl LeaseBook {
         if key < *e {
             *e = key;
         }
+    }
+
+    /// Keep only the claims, and the releases, whose own event id passes
+    /// `keep`. A dropped release removes that node's release of the claim.
+    pub fn retain(&mut self, keep: impl Fn(&EventId) -> bool) {
+        self.claims.retain(|id, _| keep(id));
+        for by_node in self.releases.values_mut() {
+            by_node.retain(|_, (_, _, id)| keep(id));
+        }
+        self.releases.retain(|_, by_node| !by_node.is_empty());
+    }
+
+    /// Event ids of every claim and every recorded release.
+    pub fn event_ids(&self) -> impl Iterator<Item = EventId> + '_ {
+        let releases = self.releases.values().flat_map(|m| m.values().map(|k| k.2));
+        self.claims.keys().copied().chain(releases)
+    }
+
+    /// Ids of the claims that win at `now` (pending or granted).
+    pub fn winners(&self, now: u64) -> BTreeSet<EventId> {
+        Resolved::new(self)
+            .walk(now)
+            .into_iter()
+            .filter(|(_, beaten)| beaten.is_none())
+            .map(|(c, _)| c.id)
+            .collect()
+    }
+
+    /// The claim at the start of `id`'s renewal chain (`id` itself if it
+    /// renews nothing). `None` if `id` is not a known claim.
+    pub fn root_of(&self, id: &EventId) -> Option<EventId> {
+        Resolved::new(self).root(id).map(|c| c.id)
+    }
+
+    /// Claims of other holders that win at `now` but would stop winning if
+    /// `c` were added: the leases `c` would take (ADR-002 Addendum 2).
+    pub fn displaced_by(&self, c: &ClaimRec, now: u64) -> Vec<EventId> {
+        let before = self.winners(now);
+        if before.is_empty() {
+            return Vec::new();
+        }
+        let mut with = self.clone();
+        with.add_claim(c.clone());
+        let after = with.winners(now);
+        before
+            .into_iter()
+            .filter(|id| !after.contains(id))
+            .filter(|id| self.claims.get(id).is_some_and(|v| v.holder != c.holder))
+            .collect()
     }
 
     pub fn claim(&self, id: &EventId) -> Option<&ClaimRec> {

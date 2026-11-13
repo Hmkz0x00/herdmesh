@@ -289,7 +289,8 @@ fn scenario() -> Vec<Event> {
         claim(3, 2, T0 + 500, &["docs/x.md"], 600),
         claim(4, 3, T0 + 900, &["Cargo.toml"], 1),
         claim(1, 4, T0 + 1_500, &["crates/**"], 600),
-        claim(1, 5, T0 + 1_600, &["src/net/**", "crates/**"], 600), // renewal
+        claim(1, 5, T0 + 1_600, &["src/net/**", "crates/**"], 600), // widening: new claim
+        claim(1, 6, T0 + 1_700, &["crates/**"], 600),               // subset renewal
         release(2, 5, T0 + 1_800, &b),
         release(3, 6, T0 + 1_900, &a), // foreign
         a,
@@ -338,8 +339,8 @@ fn claim_sets_are_atomic() {
 fn renewal_keeps_place_in_line_and_extends_ttl() {
     let a1 = claim(1, 1, T0, &["src/**"], 60);
     let b = claim(2, 2, T0 + 10, &["src/a.rs"], 600);
-    // a re-claims a superset before a1 expires, after b's claim.
-    let a2 = claim(1, 3, T0 + 50_000, &["src/**", "docs/**"], 60);
+    // a re-claims the same paths before a1 expires, after b's claim.
+    let a2 = claim(1, 3, T0 + 50_000, &["src/**"], 60);
     let evs = vec![a1.clone(), b.clone(), a2.clone()];
     assert_eq!(
         claim_state(&a1.id, &evs, T0 + 55_000),
@@ -379,21 +380,30 @@ fn reclaim_after_expiry_is_a_new_claim() {
 }
 
 #[test]
-fn subset_reclaim_or_other_agent_is_not_a_renewal() {
+fn subset_reclaim_is_a_renewal_that_frees_dropped_paths() {
     let a1 = claim_as(1, "x", 1, T0, &["src/**", "docs/**"], 600);
     let a2 = claim_as(1, "x", 2, T0 + 10, &["src/**"], 600);
-    let other = claim_as(1, "y", 3, T0 + 20, &["src/**", "docs/**"], 600);
-    let evs = vec![a1.clone(), a2.clone(), other.clone()];
-    // Same holder never blocks itself; a2 is a separate claim.
+    let b = claim(2, 3, T0 + 20, &["docs/a.md"], 600);
+    let evs = vec![a1.clone(), a2.clone(), b.clone()];
+    let now = SETTLED + 100;
+    assert_eq!(
+        claim_state(&a1.id, &evs, now),
+        Some(ClaimState::Renewed { by: a2.id })
+    );
+    assert_eq!(claim_state(&a2.id, &evs, now), Some(ClaimState::Granted));
+    // docs/** was dropped by the renewal, so b gets it.
+    assert_eq!(claim_state(&b.id, &evs, now), Some(ClaimState::Granted));
+}
+
+#[test]
+fn other_agent_on_the_same_node_is_not_a_renewal() {
+    let a1 = claim_as(1, "x", 1, T0, &["src/**", "docs/**"], 600);
+    let other = claim_as(1, "y", 3, T0 + 20, &["src/**"], 600);
+    let evs = vec![a1.clone(), other.clone()];
     assert_eq!(
         claim_state(&a1.id, &evs, SETTLED),
         Some(ClaimState::Granted)
     );
-    assert_eq!(
-        claim_state(&a2.id, &evs, SETTLED + 10),
-        Some(ClaimState::Granted)
-    );
-    // Another agent on the same node cannot renew x's claim.
     assert_eq!(
         claim_state(&other.id, &evs, SETTLED + 20),
         Some(ClaimState::Lost { winner: a1.id })
@@ -419,7 +429,7 @@ fn released_claim_cannot_be_renewed() {
 proptest! {
     #[test]
     fn state_is_independent_of_event_order(
-        perm in Just((0..8usize).collect::<Vec<_>>()).prop_shuffle(),
+        perm in Just((0..9usize).collect::<Vec<_>>()).prop_shuffle(),
         now in T0..T0 + 5_000,
     ) {
         let base = scenario();
@@ -469,4 +479,38 @@ fn concurrent_low_lamport_claim_still_wins_inside_the_window() {
         claim_state(&a.id, &evs, now),
         Some(ClaimState::Lost { winner: b.id })
     );
+}
+
+// ---- GATE-3 N9: renewal scope expansion can't steal settled paths ----
+
+#[test]
+fn widening_reclaim_is_a_new_claim_and_cannot_steal_settled_paths() {
+    // Exactly GATE-3 N9: A claims [a] at T/L1; B claims [b] at T+60s/L10 and
+    // settles; A claims [a,b] at T+120s/L20 while its first lease lives.
+    let a1 = claim(1, 1, T0, &["a"], 3600);
+    let b = claim(2, 10, T0 + 60_000, &["b"], 3600);
+    let a2 = claim(1, 20, T0 + 120_000, &["a", "b"], 3600);
+    let evs = vec![a1.clone(), b.clone(), a2.clone()];
+    let now = T0 + 130_000;
+    assert_eq!(claim_state(&b.id, &evs, now), Some(ClaimState::Granted));
+    assert_eq!(
+        claim_state(&a2.id, &evs, now),
+        Some(ClaimState::Lost { winner: b.id })
+    );
+    // A keeps what it already held.
+    assert_eq!(claim_state(&a1.id, &evs, now), Some(ClaimState::Granted));
+    let active = book_from_events(&evs).active(now);
+    assert_eq!(active["a"].claim, a1.id);
+    assert_eq!(active["b"].claim, b.id);
+}
+
+#[test]
+fn widening_reclaim_without_conflict_wins_on_its_own() {
+    let a1 = claim(1, 1, T0, &["a"], 3600);
+    let a2 = claim(1, 2, T0 + 10_000, &["a", "c"], 3600);
+    let evs = vec![a1.clone(), a2.clone()];
+    let now = T0 + 20_000;
+    // Not a renewal: a1 is still its own live claim.
+    assert_eq!(claim_state(&a1.id, &evs, now), Some(ClaimState::Granted));
+    assert_eq!(claim_state(&a2.id, &evs, now), Some(ClaimState::Granted));
 }
