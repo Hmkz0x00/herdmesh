@@ -24,7 +24,13 @@ People in a room want to see what the other person's agents are doing, and to wa
   "events":  [{ "id": "ab12cd", "lamport": 12, "ts_ms": 0, "kind": "join|leave|presence|ask|answer|handoff|claim|release|task_add|task_update|decide|note",
                 "from": "3d053a/alice", "to": "1e048f/bob", "text": "short text", "ref": "t-3" }] }
 ```
-`events` holds only events after `since` (max 200, oldest first); `to`, `ref`, `owner` may be null. `id` values are short prefixes for display.
+`events` holds only events after `since` (max 200, oldest first); `to`, `ref`, `owner` may be null. Event `id` is the full hex id (the page shortens it for display) and each event carries `"full": true|false` (false when `text` was cut at 200 chars).
+
+## Message detail and conversation log (added 2026-11-13)
+The owner's main question is "what are the agents passing to each other", so messages must be readable in full.
+- `GET /<token>/api/event?id=<id>` returns `{ "id", "kind", "from", "to", "ts_ms", "text", "refs": [] }` with the complete text (sanitized + redacted, capped at 8 KiB). The page opens it when a message is selected.
+- `herdmesh room log <room> [--follow] [--limit N]` prints the same conversation in the terminal, one entry per message: time, from → to, kind, full text (through `sanitize_display`). No browser needed.
+- Scope stays the same: only what agents send through herdmesh (asks, answers, handoffs, claims, tasks, decisions). Never screens, transcripts or an agent's private reasoning.
 
 ## Consequences
 - One more local surface to review at the next security gate (token, Host check, CSP, text handling).
