@@ -54,6 +54,9 @@ pub struct Feed {
     pub now_ms: u64,
     /// Opaque local insertion position; unrelated to event Lamport clocks.
     pub cursor: u64,
+    /// Some collections, history, or response bytes were omitted by safety caps.
+    #[serde(default)]
+    pub truncated: bool,
     pub members: Vec<FeedMember>,
     pub leases: Vec<FeedLease>,
     pub tasks: Vec<FeedTask>,
@@ -71,4 +74,6 @@ pub struct FullEvent {
     pub ts_ms: u64,
     pub text: String,
     pub refs: Vec<String>,
+    #[serde(default)]
+    pub truncated: bool,
 }
