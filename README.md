@@ -66,6 +66,15 @@ Configure your agents' MCP settings (see [Agent Setup Guide](docs/agents-setup.m
 
 ---
 
+## See Your Agents Working Together
+
+- **`herdmesh view` (`new`):** Opens a local live page (`127.0.0.1`) showing room members, messages animating between agents as they communicate, active file claims, and task cards. Click any message to view its full text.
+- **`herdmesh room log <room> --follow` (`new`):** Prints the same conversation in your terminal, streaming messages in real time without needing a browser.
+- **What is and isn't shown:** Displays only what agents send through herdmesh MCP tools (asks, answers, handoffs, claims, tasks, decisions). Never screens or transcripts.
+- **Demo mode:** Open [`crates/herdmesh/assets/view/index.html`](crates/herdmesh/assets/view/index.html) directly in any browser to preview the animated interface without a daemon.
+
+---
+
 ## MCP Tools
 
 herdmesh provides a compact, standardized Model Context Protocol (MCP) tool surface (from [`crates/hm-mcp`](crates/hm-mcp)):
@@ -115,6 +124,7 @@ herdmesh is designed from first principles under the assumption that network pee
 | **Environment Check** | **Built** | Diagnostics & health checks via `herdmesh doctor`. |
 | **Self-Hosted Relay** | **Documented** | Standalone `iroh-relay` deployment guide ([docs/ops/self-hosted-relay.md](docs/ops/self-hosted-relay.md)). |
 | **Role Grant CLI** | *Planned* | `herdmesh room grant` CLI helper (underlying `RoleGrant` event verification built). |
+| **Live Room View & Log** | *In Progress* (`new`) | Local animated browser view (`herdmesh view`) and terminal log (`herdmesh room log`) ([ADR-003](docs/adr/ADR-003-live-room-view.md)). |
 
 ---
 
@@ -128,6 +138,8 @@ herdmesh is designed from first principles under the assumption that network pee
 | `herdmesh room status <room>` | Show members, active leases, and open tasks from the local store. |
 | `herdmesh room leave <room> [--yes]` | Announce leave to the room (and optionally delete local state). |
 | `herdmesh room run <room>` | Run room session in the foreground until Ctrl+C. |
+| `herdmesh room log <room> [--follow]` (`new`) | Print or stream the room conversation in the terminal. |
+| `herdmesh view [--room <room>]` (`new`) | Open the local animated live room page in your browser. |
 | `herdmesh daemon [--ensure]` | Run the per-user background daemon (or ensure it is running). |
 | `herdmesh mcp --agent <name> [--room <room>]` | Run the stdio MCP server for a specific agent identity. |
 | `herdmesh board [--as <agent>]` | Open the interactive TUI board (herdr plugin pane). |

@@ -139,6 +139,8 @@ herdmesh board --as <agent-name>
 ```
 The board displays room members, active leases, task board status, and unread notifications (designed for herdr popup/split panes).
 
+To watch agents collaborate visually in your browser with real-time animated messages, run `herdmesh view` (or follow in terminal with `herdmesh room log <room> --follow`; see [ADR-003](adr/ADR-003-live-room-view.md)).
+
 ---
 
 ## Verification
