@@ -185,9 +185,9 @@ fn cli_agent(data: &DataDir, given: Option<String>) -> Result<String, String> {
 }
 
 /// Explicit room, else the room `herdmesh setup` made for this folder.
-fn project_room(given: Option<String>) -> Result<String, String> {
+fn project_room(data: &DataDir, given: Option<String>) -> Result<String, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    project::room_arg(given.as_deref(), &cwd)
+    project::room_arg(data.root(), given.as_deref(), &cwd)
 }
 
 async fn room_cmd(data: &DataDir, cmd: RoomCmd) -> Result<String, String> {
@@ -198,7 +198,7 @@ async fn room_cmd(data: &DataDir, cmd: RoomCmd) -> Result<String, String> {
             room::create(data, &name, &agent).await.map_err(e)
         }
         RoomCmd::Invite { room, copy } => {
-            let room = project_room(room)?;
+            let room = project_room(data, room)?;
             room::invite(data, &room, copy).await.map_err(e)
         }
         RoomCmd::Join {
@@ -213,13 +213,13 @@ async fn room_cmd(data: &DataDir, cmd: RoomCmd) -> Result<String, String> {
         RoomCmd::Grant { room, node, role } => {
             room::grant(data, &room, &node, &role).await.map_err(e)
         }
-        RoomCmd::Status { room } => room::status(data, &project_room(room)?).map_err(e),
+        RoomCmd::Status { room } => room::status(data, &project_room(data, room)?).map_err(e),
         RoomCmd::Log {
             room,
             follow,
             limit,
         } => {
-            let room = project_room(room)?;
+            let room = project_room(data, room)?;
             // Like `view`: bring the daemon up so --follow sees synced
             // events. The log itself reads the local store, so a daemon
             // that cannot start is a warning, not a failure.
@@ -248,7 +248,7 @@ async fn room_cmd(data: &DataDir, cmd: RoomCmd) -> Result<String, String> {
             .map_err(e)
         }
         RoomCmd::Run { room } => {
-            let room = project_room(room)?;
+            let room = project_room(data, room)?;
             let ctrl_c = async {
                 // If the handler cannot be installed, run until killed.
                 if tokio::signal::ctrl_c().await.is_err() {
@@ -378,7 +378,7 @@ fn mcp_main(
     let project_room = if room.is_none() {
         std::env::current_dir()
             .ok()
-            .and_then(|d| project::find_room(&d))
+            .and_then(|d| project::find_room(data.root(), &d))
             .filter(|r| data.resolve_room(r).is_ok())
     } else {
         None
@@ -470,12 +470,14 @@ fn main() -> ExitCode {
             yes,
         ),
         Cmd::View { room, no_open } => {
+            let data = data_dir(cli.data_dir);
             let room = room.or_else(|| {
+                let data = data.as_ref()?;
                 std::env::current_dir()
                     .ok()
-                    .and_then(|d| project::find_room(&d))
+                    .and_then(|d| project::find_room(data.root(), &d))
             });
-            herdmesh::view::run(data_dir(cli.data_dir), room.as_deref(), no_open)
+            herdmesh::view::run(data, room.as_deref(), no_open)
         }
         Cmd::Board { agent } => herdmesh::board::run(data_dir(cli.data_dir), &agent),
         Cmd::Doctor => {

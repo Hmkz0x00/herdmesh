@@ -13,7 +13,7 @@
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use hm_net::RoomTicket;
 use serde_json::{Value, json};
@@ -305,6 +305,149 @@ fn read_opt(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+fn refuse(msg: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg.into())
+}
+
+/// Symlinks, and on Windows junctions and every other reparse point.
+fn is_link(md: &std::fs::Metadata) -> bool {
+    if md.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// `root/rel` for reading or writing, or an error. `root` must be canonical.
+/// Every existing component below the root must be a real folder (the last
+/// one a regular file): a link or reparse point anywhere on the way is
+/// refused, so nothing is ever read or written outside the project through
+/// one (GATE-4 N13). A missing tail is fine.
+fn checked_target(root: &Path, rel: &Path) -> std::io::Result<PathBuf> {
+    let comps: Vec<_> = rel.components().collect();
+    if comps.is_empty() || comps.iter().any(|c| !matches!(c, Component::Normal(_))) {
+        return Err(refuse(format!("unsafe path {}", rel.display())));
+    }
+    let mut cur = root.to_path_buf();
+    for (i, c) in comps.iter().enumerate() {
+        cur.push(c);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(md) => {
+                if is_link(&md) {
+                    return Err(refuse(format!(
+                        "{} is a link; refusing to follow links out of the project",
+                        rel.display()
+                    )));
+                }
+                let last = i + 1 == comps.len();
+                if last && !md.is_file() {
+                    return Err(refuse(format!("{} is not a regular file", rel.display())));
+                }
+                if !last && !md.is_dir() {
+                    return Err(refuse(format!("{} is not a folder", cur.display())));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e),
+        }
+    }
+    // Belt and braces: the deepest existing part must resolve inside the root.
+    let full = root.join(rel);
+    if let Some(existing) = full
+        .ancestors()
+        .find(|a| std::fs::symlink_metadata(a).is_ok())
+    {
+        let real = std::fs::canonicalize(existing)?;
+        if !real.starts_with(root) {
+            return Err(refuse(format!(
+                "{} resolves outside the project",
+                rel.display()
+            )));
+        }
+    }
+    Ok(full)
+}
+
+/// Create the folders above `rel` one by one, never through a link.
+fn create_parents(root: &Path, rel: &Path) -> std::io::Result<()> {
+    let Some(parent) = rel.parent() else {
+        return Ok(());
+    };
+    let mut cur = root.to_path_buf();
+    for c in parent.components() {
+        cur.push(c);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(md) if is_link(&md) || !md.is_dir() => {
+                return Err(refuse(format!("{} is not a plain folder", cur.display())));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&cur)?;
+                let md = std::fs::symlink_metadata(&cur)?;
+                if is_link(&md) || !md.is_dir() {
+                    return Err(refuse(format!("{} is not a plain folder", cur.display())));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn random_hex() -> std::io::Result<String> {
+    let mut b = [0u8; 8];
+    getrandom::fill(&mut b).map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+/// Write `text` to `root/rel` atomically: an exclusive, unpredictably named
+/// temp file in the same folder, then a rename. A pre-planted link with the
+/// temp name makes `create_new` fail instead of truncating its target, and
+/// the rename replaces a (refused) link rather than writing through it.
+fn write_checked(root: &Path, rel: &Path, text: &str) -> std::io::Result<()> {
+    checked_target(root, rel)?;
+    create_parents(root, rel)?;
+    let target = checked_target(root, rel)?;
+    let dir = target
+        .parent()
+        .ok_or_else(|| refuse("path has no parent"))?;
+    let name = target
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| refuse("path has no file name"))?;
+    let tmp = dir.join(format!(".{name}.{}.herdmesh-tmp", random_hex()?));
+    let result = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        // Last check right before the swap (narrows, cannot close, a race).
+        checked_target(root, rel)?;
+        std::fs::rename(&tmp, &target)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Like `read_opt`, but through `checked_target`: a link is an error, so a
+/// planted `CLAUDE.md -> ~/.ssh/...` is never read into a diff.
+fn read_checked(root: &Path, rel: &Path) -> Result<Option<String>, String> {
+    let path = checked_target(root, rel).map_err(|e| e.to_string())?;
+    read_opt(&path)
+}
+
 /// Which instruction file gets the snippet for `kinds`.
 fn instruction_targets(project: &Path, kinds: &[Kind]) -> Vec<&'static str> {
     let mut out = Vec::new();
@@ -312,7 +455,7 @@ fn instruction_targets(project: &Path, kinds: &[Kind]) -> Vec<&'static str> {
         let t = match k {
             Kind::Claude => {
                 // CLAUDE.md that imports AGENTS.md is satisfied by AGENTS.md.
-                let imports = read_opt(&project.join("CLAUDE.md"))
+                let imports = read_checked(project, Path::new("CLAUDE.md"))
                     .ok()
                     .flatten()
                     .is_some_and(|s| s.lines().any(|l| l.trim() == "@AGENTS.md"));
@@ -330,10 +473,18 @@ fn instruction_targets(project: &Path, kinds: &[Kind]) -> Vec<&'static str> {
 /// Work out the file changes for `kinds` in `project` without writing anything.
 pub fn plan_files(project: &Path, kinds: &[Kind], room: &str) -> Plan {
     let mut plan = Plan::default();
+    let project = match std::fs::canonicalize(project) {
+        Ok(p) => p,
+        Err(e) => {
+            plan.problems
+                .push((PathBuf::from("."), format!("project folder: {e}")));
+            return plan;
+        }
+    };
+    let project = project.as_path();
     for &kind in kinds {
         let rel = kind.config_path();
-        let abs = project.join(&rel);
-        let result = read_opt(&abs).and_then(|old| {
+        let result = read_checked(project, &rel).and_then(|old| {
             let new = if kind.is_toml() {
                 merge_toml(old.as_deref(), kind, room)
             } else {
@@ -354,7 +505,7 @@ pub fn plan_files(project: &Path, kinds: &[Kind], room: &str) -> Plan {
     let snip = snippet();
     for target in instruction_targets(project, kinds) {
         let rel = PathBuf::from(target);
-        match read_opt(&project.join(target)) {
+        match read_checked(project, &rel) {
             Ok(Some(old)) if old.contains(SNIPPET_MARKER) => {}
             Ok(old) => {
                 let mut new = old.clone().unwrap_or_default();
@@ -382,18 +533,13 @@ pub fn plan_files(project: &Path, kinds: &[Kind], room: &str) -> Plan {
 pub struct Applied {
     pub written: Vec<PathBuf>,
     pub declined: Vec<PathBuf>,
+    /// `(path, reason)` for files that were approved but could not be written
+    /// safely (for example a link appeared); nothing was written for them.
+    pub failed: Vec<(PathBuf, String)>,
 }
 
-fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("herdmesh-tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)
-}
-
-/// Show each change's diff via `show`, ask `confirm`, write the accepted ones.
+/// Show each change's diff via `show`, ask `confirm`, write the accepted
+/// ones. Writes never go through links and are re-checked at write time.
 pub fn apply(
     project: &Path,
     plan: &Plan,
@@ -401,13 +547,19 @@ pub fn apply(
     show: &mut dyn FnMut(&str),
 ) -> std::io::Result<Applied> {
     let mut done = Applied::default();
+    if plan.changes.is_empty() {
+        return Ok(done);
+    }
+    let root = std::fs::canonicalize(project)?;
     for ch in &plan.changes {
         show(&ch.diff());
-        if confirm(ch) {
-            write_file(&project.join(&ch.path), &ch.new)?;
-            done.written.push(ch.path.clone());
-        } else {
+        if !confirm(ch) {
             done.declined.push(ch.path.clone());
+            continue;
+        }
+        match write_checked(&root, &ch.path, &ch.new) {
+            Ok(()) => done.written.push(ch.path.clone()),
+            Err(e) => done.failed.push((ch.path.clone(), e.to_string())),
         }
     }
     Ok(done)
@@ -433,6 +585,32 @@ pub fn room_name_for(project: &Path) -> String {
         .unwrap_or_default();
     hm_proto::names::sanitize_name(folder, hm_proto::names::NAME_MAX)
         .unwrap_or_else(|| "project".to_owned())
+}
+
+/// A local room name for this folder that no existing room uses. The plain
+/// folder name when free; otherwise the name plus the folder's identity, so
+/// two folders called `app` never share a room (N14).
+fn unique_room_name(
+    base: &str,
+    rooms: &[(hm_proto::RoomId, crate::data::RoomConfig)],
+    key: &str,
+) -> Result<String, String> {
+    let taken = |n: &str| rooms.iter().any(|(_, c)| c.name == n);
+    if !taken(base) {
+        return Ok(base.to_owned());
+    }
+    let mut short = base.to_owned();
+    short.truncate(hm_proto::names::NAME_MAX - 9);
+    let alt = format!("{}-{}", short.trim_end_matches('-'), &key[..8]);
+    if taken(&alt) {
+        return Err(format!(
+            "a room named '{base}' exists and so does '{alt}'; pick another folder or remove one of the rooms"
+        ));
+    }
+    println!(
+        "A room named '{base}' already exists but is not bound to this folder; creating '{alt}' for it."
+    );
+    Ok(alt)
 }
 
 pub struct Opts<'a> {
@@ -462,30 +640,79 @@ pub async fn run(opts: Opts<'_>) -> Result<(), String> {
     let person = naming::person(&cfg).map_err(|e| e.to_string())?;
     println!("You are '{person}' (change with `herdmesh setup --name <you>`).");
 
-    // 2. the room.
-    let room_name = room_name_for(opts.project);
+    // 2. the room, chosen by the folder's identity, never by its name alone.
+    let root = project::canonical_root(opts.project)
+        .map_err(|e| format!("project folder {}: {e}", opts.project.display()))?;
+    let key = project::project_key(&root);
     let cli_agent = naming::candidate(&person, "cli", 1).map_err(|e| e.to_string())?;
     let rooms = data.list_rooms().map_err(|e| e.to_string())?;
+    let ticket: Option<RoomTicket> = match &opts.join {
+        None => None,
+        Some(arg) => {
+            let raw = if arg.trim().is_empty() {
+                clipboard::paste()
+                    .ok_or("no ticket given and the clipboard has none; pass --join <ticket>")?
+            } else {
+                arg.clone()
+            };
+            Some(
+                raw.trim()
+                    .parse::<RoomTicket>()
+                    .map_err(|e| format!("invalid ticket: {e}"))?,
+            )
+        }
+    };
+    let bound = project::bound_room(data.root(), &root)
+        .and_then(|id| rooms.iter().find(|(r, _)| r.to_string() == id).cloned());
     let mut ticket_to_share: Option<RoomTicket> = None;
-    if rooms.iter().any(|(_, c)| c.name == room_name) {
-        println!("Room '{room_name}' already exists on this machine; reusing it.");
-    } else if let Some(arg) = &opts.join {
-        let raw = if arg.trim().is_empty() {
-            clipboard::paste()
-                .ok_or("no ticket given and the clipboard has none; pass --join <ticket>")?
-        } else {
-            arg.clone()
-        };
-        let out =
-            room::join(data, &raw, &cli_agent, Some(&room_name)).map_err(|e| e.to_string())?;
-        print!("{out}");
-    } else {
-        let made = room::create_with_ticket(data, &room_name, &cli_agent)
-            .await
-            .map_err(|e| e.to_string())?;
-        println!("Created room '{room_name}' (id: {}).", made.id);
-        ticket_to_share = Some(made.ticket);
-    }
+    let (room_id, room_name, joined) = match (&bound, &ticket) {
+        (Some((id, cfg)), t) => {
+            if let Some(t) = t.as_ref().filter(|t| t.room_id != *id) {
+                return Err(format!(
+                    "this folder is already bound to room '{}' ({id}), but the ticket is for room {}; \
+                     run setup without --join, or use a different folder",
+                    cfg.name, t.room_id
+                ));
+            }
+            println!(
+                "This folder is already bound to room '{}'; reusing it.",
+                cfg.name
+            );
+            (*id, cfg.name.clone(), false)
+        }
+        (None, Some(t)) => {
+            if let Some((id, cfg)) = rooms.iter().find(|(r, _)| *r == t.room_id) {
+                println!(
+                    "You already have room '{}'; binding this folder to it.",
+                    cfg.name
+                );
+                (*id, cfg.name.clone(), true)
+            } else {
+                let name = unique_room_name(&room_name_for(&root), &rooms, &key)?;
+                let out = room::join(data, &t.to_string(), &cli_agent, Some(&name))
+                    .map_err(|e| e.to_string())?;
+                print!("{out}");
+                (t.room_id, name, true)
+            }
+        }
+        (None, None) => {
+            let name = unique_room_name(&room_name_for(&root), &rooms, &key)?;
+            let made = room::create_with_ticket(data, &name, &cli_agent)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("Created room '{name}' (id: {}).", made.id);
+            let id = made.id;
+            ticket_to_share = Some(made.ticket);
+            (id, name, false)
+        }
+    };
+    project::bind(data.root(), &root, &room_id.to_string())
+        .map_err(|e| format!("could not record the folder-to-room binding: {e}"))?;
+    println!(
+        "Folder {} is bound to room '{room_name}' (id {room_id}).",
+        root.display()
+    );
+    let room_name = room_name.as_str();
 
     // 3. daemon (warning only: the agents start it too).
     if let Err(e) = daemon::ensure_for_cli(
@@ -507,13 +734,13 @@ pub async fn run(opts: Opts<'_>) -> Result<(), String> {
         let names: Vec<&str> = kinds.iter().map(|k| k.name()).collect();
         println!("Found: {}.", names.join(", "));
     }
-    let plan = plan_files(opts.project, &kinds, &room_name);
+    let plan = plan_files(&root, &kinds, room_name);
     for (path, why) in &plan.problems {
         eprintln!("herdmesh setup: leaving {} alone: {why}", path.display());
     }
     let yes = opts.yes;
     let applied = apply(
-        opts.project,
+        &root,
         &plan,
         &mut |ch| {
             yes || ask_yes(&format!(
@@ -531,10 +758,12 @@ pub async fn run(opts: Opts<'_>) -> Result<(), String> {
     for p in &applied.declined {
         println!("skipped {}", p.display());
     }
+    for (p, why) in &applied.failed {
+        eprintln!("herdmesh setup: did not write {}: {why}", p.display());
+    }
     if plan.changes.is_empty() && plan.problems.is_empty() {
         println!("Project files are already set up.");
     }
-    project::write_room(opts.project, &room_name).map_err(|e| e.to_string())?;
 
     // 5. ticket and next steps.
     if let Some(t) = &ticket_to_share {
@@ -546,7 +775,7 @@ pub async fn run(opts: Opts<'_>) -> Result<(), String> {
         }
     }
     println!("\nNext:");
-    match (&ticket_to_share, opts.join.is_some()) {
+    match (&ticket_to_share, joined) {
         (Some(_), _) => println!(
             "  1. Send the ticket to your teammate; they run `herdmesh setup --join` in their copy of this project."
         ),
@@ -561,6 +790,9 @@ pub async fn run(opts: Opts<'_>) -> Result<(), String> {
         "  2. Start your agent here (claude / codex / agy); it picks up the herdmesh MCP server."
     );
     println!("  3. Watch it live with `herdmesh view`.");
+    if !applied.failed.is_empty() {
+        return Err("some project files were not written (see above)".to_owned());
+    }
     Ok(())
 }
 
@@ -669,17 +901,18 @@ mod tests {
     #[test]
     fn instruction_target_follows_agents_md_imports() {
         let t = tmp();
+        let root = std::fs::canonicalize(t.path()).unwrap();
         assert_eq!(
-            instruction_targets(t.path(), &[Kind::Claude]),
+            instruction_targets(&root, &[Kind::Claude]),
             vec!["CLAUDE.md"]
         );
         assert_eq!(
-            instruction_targets(t.path(), &[Kind::Claude, Kind::Codex, Kind::Agy]),
+            instruction_targets(&root, &[Kind::Claude, Kind::Codex, Kind::Agy]),
             vec!["CLAUDE.md", "AGENTS.md"]
         );
         std::fs::write(t.path().join("CLAUDE.md"), "# x\n@AGENTS.md\n").unwrap();
         assert_eq!(
-            instruction_targets(t.path(), &[Kind::Claude, Kind::Codex]),
+            instruction_targets(&root, &[Kind::Claude, Kind::Codex]),
             vec!["AGENTS.md"]
         );
     }
@@ -792,5 +1025,229 @@ mod tests {
     #[test]
     fn yes_answers() {
         assert!(is_yes("Y\n") && is_yes(" yes ") && !is_yes("") && !is_yes("no") && !is_yes("yep"));
+    }
+
+    // ---- GATE-4 N13: links ----
+
+    /// A folder link: symlink on unix, junction (no privilege needed) on Windows.
+    fn link_dir(link: &Path, target: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+    }
+
+    fn link_file(link: &Path, target: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+    }
+
+    macro_rules! skip_unless {
+        ($ok:expr, $name:expr) => {
+            if !$ok {
+                eprintln!(
+                    "SKIPPED {}: this OS or user may not create links in tests",
+                    $name
+                );
+                return;
+            }
+        };
+    }
+
+    fn files_under(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            out.push(e.path());
+            if e.file_type().unwrap().is_dir() {
+                out.extend(files_under(&e.path()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_linked_config_folder_is_never_written_through() {
+        let t = tmp();
+        let (p, outside) = (t.path().join("proj"), t.path().join("outside"));
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        skip_unless!(link_dir(&p.join(".codex"), &outside), "linked .codex");
+
+        // Planning reports the link and plans nothing for it.
+        let plan = plan_files(&p, &[Kind::Codex], "r");
+        assert!(
+            plan.problems
+                .iter()
+                .any(|(f, why)| f.ends_with("config.toml") && why.contains("link")),
+            "{:?}",
+            plan.problems
+        );
+        assert!(plan.changes.iter().all(|c| !c.path.starts_with(".codex")));
+
+        // Even a hand-made plan (a link appeared after planning) writes nothing outside.
+        let forced = Plan {
+            changes: vec![FileChange {
+                path: Kind::Codex.config_path(),
+                old: None,
+                new: "x = 1\n".into(),
+            }],
+            problems: vec![],
+        };
+        let done = apply(&p, &forced, &mut |_| true, &mut |_| {}).unwrap();
+        assert!(
+            done.written.is_empty() && done.failed.len() == 1,
+            "{done:?}"
+        );
+        assert!(
+            files_under(&outside).is_empty(),
+            "wrote outside: {:?}",
+            files_under(&outside)
+        );
+    }
+
+    #[test]
+    fn a_linked_instruction_file_is_neither_read_nor_replaced() {
+        let t = tmp();
+        let (p, outside) = (t.path().join("proj"), t.path().join("outside"));
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "TOP-SECRET-CONTENT\n").unwrap();
+        skip_unless!(link_file(&p.join("CLAUDE.md"), &secret), "linked CLAUDE.md");
+
+        let plan = plan_files(&p, &[Kind::Claude], "r");
+        let shown: String = plan.changes.iter().map(FileChange::diff).collect();
+        assert!(
+            !shown.contains("TOP-SECRET"),
+            "link target leaked into a diff"
+        );
+        assert!(
+            plan.problems
+                .iter()
+                .any(|(f, why)| f == Path::new("CLAUDE.md") && why.contains("link"))
+        );
+        let forced = Plan {
+            changes: vec![FileChange {
+                path: PathBuf::from("CLAUDE.md"),
+                old: None,
+                new: snippet(),
+            }],
+            problems: vec![],
+        };
+        let done = apply(&p, &forced, &mut |_| true, &mut |_| {}).unwrap();
+        assert!(done.written.is_empty(), "{done:?}");
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            "TOP-SECRET-CONTENT\n"
+        );
+    }
+
+    #[test]
+    fn a_planted_temp_name_link_cannot_truncate_its_target() {
+        // The old code wrote `<file>.herdmesh-tmp` with fs::write, which follows a link.
+        let t = tmp();
+        let (p, outside) = (t.path().join("proj"), t.path().join("outside"));
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        for name in ["CLAUDE.herdmesh-tmp", ".CLAUDE.md.herdmesh-tmp"] {
+            skip_unless!(link_file(&p.join(name), &victim), "planted temp link");
+        }
+        let plan = plan_files(&p, &[Kind::Claude], "r");
+        let done = apply(&p, &plan, &mut |_| true, &mut |_| {}).unwrap();
+        assert!(done.written.iter().any(|f| f == Path::new("CLAUDE.md")));
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn writes_leave_no_temp_files_and_are_still_idempotent() {
+        let t = tmp();
+        let p = t.path();
+        let plan = plan_files(p, &Kind::ALL, "r");
+        let done = all(&plan, p);
+        assert!(done.failed.is_empty(), "{done:?}");
+        assert!(
+            files_under(p)
+                .iter()
+                .all(|f| !f.to_string_lossy().contains("herdmesh-tmp"))
+        );
+        assert_eq!(plan_files(p, &Kind::ALL, "r"), Plan::default());
+    }
+
+    #[test]
+    fn root_given_through_a_link_is_resolved_and_contained() {
+        let t = tmp();
+        let (real, via) = (t.path().join("real"), t.path().join("via"));
+        std::fs::create_dir_all(&real).unwrap();
+        skip_unless!(link_dir(&via, &real), "linked project root");
+        let plan = plan_files(&via, &[Kind::Claude], "r");
+        assert!(plan.problems.is_empty(), "{:?}", plan.problems);
+        all(&plan, &via);
+        assert!(real.join(".mcp.json").is_file());
+    }
+
+    #[test]
+    fn unsafe_relative_paths_are_refused() {
+        let t = tmp();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        for bad in ["../x", "/abs", "a/../../x", ""] {
+            assert!(checked_target(&root, Path::new(bad)).is_err(), "{bad}");
+        }
+        assert!(checked_target(&root, Path::new("ok/new.txt")).is_ok());
+    }
+
+    // ---- GATE-4 N14: identity, not basename ----
+
+    #[test]
+    fn same_named_folders_get_distinct_room_names() {
+        let id = hm_proto::RoomId::from_bytes([1; 32]);
+        let existing = vec![(
+            id,
+            crate::data::RoomConfig::new("app", crate::data::RoleName::Owner, "a-cli"),
+        )];
+        let (k1, k2) = (
+            project::project_key(Path::new("/one/app")),
+            project::project_key(Path::new("/two/app")),
+        );
+        assert_eq!(unique_room_name("app", &[], &k1).unwrap(), "app");
+        let alt = unique_room_name("app", &existing, &k1).unwrap();
+        assert_eq!(alt, format!("app-{}", &k1[..8]));
+        assert_ne!(alt, unique_room_name("app", &existing, &k2).unwrap());
+        assert!(hm_proto::names::valid_name(&alt));
+        let long = "x".repeat(32);
+        let existing_long = vec![(
+            id,
+            crate::data::RoomConfig::new(&long, crate::data::RoleName::Owner, "a-cli"),
+        )];
+        assert!(hm_proto::names::valid_name(
+            &unique_room_name(&long, &existing_long, &k1).unwrap()
+        ));
+        // The derived name is also taken: refuse instead of guessing.
+        let both = vec![
+            existing[0].clone(),
+            (
+                hm_proto::RoomId::from_bytes([2; 32]),
+                crate::data::RoomConfig::new(&alt, crate::data::RoleName::Owner, "a-cli"),
+            ),
+        ];
+        assert!(unique_room_name("app", &both, &k1).is_err());
     }
 }
