@@ -109,7 +109,10 @@ impl Views {
     /// Whether `e` can change anyone's role. Such events require a full
     /// rebuild ([`Views::from_events`]): roles apply retroactively.
     pub fn changes_roles(e: &Event) -> bool {
-        matches!(e.body, EventBody::Genesis { .. } | EventBody::RoleGrant { .. })
+        matches!(
+            e.body,
+            EventBody::Genesis { .. } | EventBody::RoleGrant { .. }
+        )
     }
 
     /// Views of a whole stored set, in ascending [`OrderKey`] (ADR-005
