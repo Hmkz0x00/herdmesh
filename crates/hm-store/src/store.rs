@@ -278,13 +278,9 @@ fn rebuild(
     room: RoomId,
     genesis: Option<EventId>,
 ) -> Result<(Views, Option<OrderKey>), StoreError> {
-    let mut views = Views::new(genesis);
-    let mut last = None;
-    for e in query_events(conn, room, ALL_IN_ORDER, [])? {
-        views.apply(&e);
-        last = Some(order_key(&e));
-    }
-    Ok((views, last))
+    let events = query_events(conn, room, ALL_IN_ORDER, [])?;
+    let last = events.last().map(order_key);
+    Ok((Views::from_events(genesis, &events), last))
 }
 
 fn save_views(conn: &Connection, views: &Views, last: Option<&OrderKey>) -> Result<(), StoreError> {
@@ -815,7 +811,9 @@ impl Store {
             (Some(&first), Some(last)) => order_key(&all[first]) > last,
             _ => true,
         };
-        let (views, last_key) = if replaced || !in_order {
+        // Roles apply retroactively (ADR-005 Addendum 1): rebuild.
+        let roles = added.iter().any(|&i| Views::changes_roles(&all[i]));
+        let (views, last_key) = if replaced || !in_order || roles {
             rebuild(&tx, self.room, self.views.genesis)?
         } else {
             let mut views = self.views.clone();
