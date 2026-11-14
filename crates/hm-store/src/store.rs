@@ -17,9 +17,7 @@
 //!    in-memory pending queue that every later append retries;
 //! 3. `lamport > local max + MAX_LAMPORT_JUMP` → rejected;
 //! 4. same (author, seq) with a different id → equivocation: the lowest id
-//!    is kept, a mark is recorded;
-//! 5. a claim, release or twin swap that would take a lease already
-//!    settled here is refused (ADR-002 Addenda 2-3, [`admission_refusals`]).
+//!    is kept, a mark is recorded.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -30,7 +28,7 @@ use hm_proto::{AgentRef, Event, EventBody, EventId, EventSig, Lamport, NodeId, R
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::StoreError;
-use crate::settle::{ClaimRec, ClaimState, LeaseBook, SETTLE_MS};
+use crate::settle::{ClaimState, SETTLE_MS};
 use crate::views::{OrderKey, Views, order_key};
 
 const SCHEMA: &str = "
@@ -86,7 +84,7 @@ const SELECT_EVENT: &str = "SELECT e.id, e.author_node, e.seq, e.lamport, e.agen
      b.body, e.sig FROM events e JOIN blobs b ON b.hash = e.body_hash";
 
 /// Bumped when the view snapshot layout changes; a mismatch triggers a rebuild.
-const VIEW_SNAPSHOT_VERSION: u8 = 3;
+const VIEW_SNAPSHOT_VERSION: u8 = 4;
 
 /// Max events parked because their `ts` is too far in the future.
 pub const PENDING_CAP: usize = 1000;
@@ -179,9 +177,6 @@ pub struct Store {
     views: Views,
     last_key: Option<OrderKey>,
     pending: Vec<Event>,
-    /// Last local admission instant; each ingest call gets a later one
-    /// (ADR-002 Addendum 4).
-    last_admit: u64,
 }
 
 impl std::fmt::Debug for Store {
@@ -206,8 +201,6 @@ enum Disp {
     Replaced,
     /// Equivocation; the stored twin has the lower id, this one was dropped.
     Dropped,
-    /// Lease claim that would take a lease already settled here.
-    Takeover,
 }
 
 fn be(n: u64) -> Vec<u8> {
@@ -346,133 +339,6 @@ fn first_seen_at(conn: &Connection, id: &EventId) -> Result<Option<u64>, StoreEr
         .query_row(params![id.as_bytes().to_vec()], |r| r.get(0))
         .optional()?;
     v.map(|v| u64_of(v, "first_seen")).transpose()
-}
-
-/// One (author, seq) slot a batch would change: `new` replaces `old`.
-struct Change<'a> {
-    new: &'a Event,
-    old: Option<EventId>,
-}
-
-fn apply_changes(base: &LeaseBook, views: &Views, changes: &[&Change<'_>]) -> LeaseBook {
-    let mut book = base.clone();
-    let gone: BTreeSet<EventId> = changes.iter().filter_map(|c| c.old).collect();
-    if !gone.is_empty() {
-        book.retain(|id| !gone.contains(id));
-    }
-    for c in changes {
-        let e = c.new;
-        if !views.role_of(&e.author.node).may(e.kind()) {
-            continue;
-        }
-        match &e.body {
-            EventBody::LeaseClaim { .. } => {
-                if let Some(r) = ClaimRec::from_event(e) {
-                    book.add_claim(r);
-                }
-            }
-            EventBody::LeaseRelease { claim } => {
-                book.add_release(e.author.node, order_key(e), *claim);
-            }
-            _ => {}
-        }
-    }
-    book
-}
-
-/// Lease admission (ADR-002 Addenda 2-4): the ids among `todo` to refuse
-/// because, together, the batch's lease changes (claims, releases, twin
-/// swaps) would unseat a winner whose root this node first saw at least
-/// [`SETTLE_MS`] before `now`. The pre-call book holds exactly the earlier
-/// admission instants. Offenders are removed one at a time, in descending
-/// order key, until no settled winner is displaced; the result depends on
-/// the batch as a set, not its order. A winner that ends up `Released` by
-/// its own node or `Renewed` by its holder is not displaced.
-fn admission_refusals(
-    conn: &Connection,
-    views: &Views,
-    all: &[Event],
-    todo: &[usize],
-    now: u64,
-) -> Result<BTreeSet<EventId>, StoreError> {
-    let base = &views.leases;
-    let lease_ids: BTreeSet<EventId> = base.event_ids().collect();
-    // Final event per (author, seq): the lowest id among stored and offered.
-    let mut slots: BTreeMap<(NodeId, u64), &Event> = BTreeMap::new();
-    for &i in todo {
-        let e = &all[i];
-        let cur = slots.entry((e.author.node, e.seq)).or_insert(e);
-        if e.id < cur.id {
-            *cur = e;
-        }
-    }
-    let mut changes: Vec<Change<'_>> = Vec::new();
-    for ((node, seq), e) in slots {
-        let old = id_at(conn, &node, seq)?;
-        if old.is_some_and(|o| o <= e.id) {
-            continue;
-        }
-        let relevant = matches!(
-            e.body,
-            EventBody::LeaseClaim { .. } | EventBody::LeaseRelease { .. }
-        ) || old.is_some_and(|o| lease_ids.contains(&o));
-        if relevant {
-            changes.push(Change { new: e, old });
-        }
-    }
-    let mut refused = BTreeSet::new();
-    if changes.is_empty() {
-        return Ok(refused);
-    }
-    let mut settled = BTreeSet::new();
-    for v in base.winners(now) {
-        let root = base.root_of(&v, now).unwrap_or(v);
-        if first_seen_at(conn, &root)?.is_none_or(|at| at.saturating_add(SETTLE_MS) <= now) {
-            settled.insert(v);
-        }
-    }
-    if settled.is_empty() {
-        return Ok(refused);
-    }
-    // Canonical order: highest order key first.
-    changes.sort_by_key(|c| std::cmp::Reverse(order_key(c.new)));
-    let displaced = |acc: &[&Change<'_>]| -> BTreeSet<EventId> {
-        let after = apply_changes(base, views, acc);
-        settled
-            .iter()
-            .filter(|v| {
-                !matches!(
-                    after.state(v, now),
-                    Some(
-                        ClaimState::Granted
-                            | ClaimState::Pending
-                            | ClaimState::Released
-                            | ClaimState::Renewed { .. }
-                    )
-                )
-            })
-            .copied()
-            .collect()
-    };
-    let mut acc: Vec<&Change<'_>> = changes.iter().collect();
-    loop {
-        let d = displaced(&acc);
-        if d.is_empty() {
-            break;
-        }
-        let pick = (0..acc.len())
-            .find(|&i| {
-                let mut rest = acc.clone();
-                rest.remove(i);
-                displaced(&rest).len() < d.len()
-            })
-            .unwrap_or(0);
-        refused.insert(acc.remove(pick).new.id);
-        if acc.is_empty() {
-            break;
-        }
-    }
-    Ok(refused)
 }
 
 /// Stores from before per-author seqs (wire v1) can't be migrated: their
@@ -720,19 +586,12 @@ impl Store {
             Some((v, last)) if v.genesis == genesis => (v, last),
             _ => rebuild(&conn, room, genesis)?,
         };
-        let last: Option<Vec<u8>> =
-            conn.query_row("SELECT MAX(at) FROM first_seen", [], |r| r.get(0))?;
-        let last_admit = last
-            .map(|v| u64_of(v, "first_seen"))
-            .transpose()?
-            .unwrap_or(0);
         Ok(Self {
             conn,
             room,
             views,
             last_key,
             pending: Vec::new(),
-            last_admit,
         })
     }
 
@@ -794,7 +653,6 @@ impl Store {
             Some(Disp::Duplicate | Disp::Dropped) => Ok(AppendOutcome::Duplicate),
             Some(Disp::Deferred) => Ok(AppendOutcome::Deferred),
             Some(Disp::LamportJump) => Err(StoreError::LamportJump),
-            Some(Disp::Takeover) => Err(StoreError::LeaseTakeover),
             Some(Disp::Rejected) | None => Err(StoreError::Corrupt("ingest disposition")),
         }
     }
@@ -820,7 +678,7 @@ impl Store {
                 Disp::Inserted => r.inserted += 1,
                 Disp::Duplicate => r.duplicates += 1,
                 Disp::Deferred => r.deferred += 1,
-                Disp::Rejected | Disp::LamportJump | Disp::Takeover => r.rejected += 1,
+                Disp::Rejected | Disp::LamportJump => r.rejected += 1,
                 Disp::Replaced => {
                     r.inserted += 1;
                     r.equivocations += 1;
@@ -896,11 +754,7 @@ impl Store {
         }
         todo.sort_by_key(|&i| order_key(&all[i]));
 
-        // This call's admission instant: strictly after every earlier call.
-        let at = now.max(self.last_admit.saturating_add(1));
-        self.last_admit = at;
         let tx = self.conn.transaction()?;
-        let refused = admission_refusals(&tx, &self.views, &all, &todo, now)?;
         let mut max = max_lamport(&tx)?.unwrap_or(0);
         let mut added: Vec<usize> = Vec::new();
         let mut replaced = false;
@@ -932,10 +786,6 @@ impl Store {
                         disp[i] = Disp::Dropped;
                         continue;
                     }
-                    if refused.contains(&e.id) {
-                        disp[i] = Disp::Takeover;
-                        continue;
-                    }
                     delete_event(&tx, &old)?;
                     insert_event(&tx, e)?;
                     truncate_prefix(&tx, &e.author.node, e.seq)?;
@@ -943,17 +793,13 @@ impl Store {
                     disp[i] = Disp::Replaced;
                 }
                 None => {
-                    if refused.contains(&e.id) {
-                        disp[i] = Disp::Takeover;
-                        continue;
-                    }
                     insert_event(&tx, e)?;
                     disp[i] = Disp::Inserted;
                     added.push(i);
                 }
             }
             tx.prepare_cached("INSERT OR IGNORE INTO first_seen (id, at) VALUES (?1, ?2)")?
-                .execute(params![e.id.as_bytes().to_vec(), be(at)])?;
+                .execute(params![e.id.as_bytes().to_vec(), be(now)])?;
             max = max.max(e.lamport.0);
             touched.insert(e.author.node);
         }

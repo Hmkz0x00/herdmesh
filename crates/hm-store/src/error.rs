@@ -16,10 +16,6 @@ pub enum StoreError {
     Oversized(usize),
     #[error("lamport jumps too far past the local max")]
     LamportJump,
-    /// ADR-002 Addendum 2: this claim arrived after a conflicting lease had
-    /// settled here and would take it over; not stored.
-    #[error("lease claim would take over a lease already settled here")]
-    LeaseTakeover,
     #[error("lamport or seq clock exhausted")]
     ClockExhausted,
     #[error("store was written by an older, incompatible version; remove it and re-sync")]
