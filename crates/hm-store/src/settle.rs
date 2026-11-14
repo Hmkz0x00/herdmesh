@@ -47,7 +47,10 @@
 //! prefix-compatible. That can over-report overlap between two globs, which
 //! is the safe direction for a lease.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::sync::{Arc, OnceLock};
 
 use hm_proto::limits::MAX_LEASE_TTL_SECS;
 use hm_proto::{AgentRef, Event, EventBody, EventId, Lamport, NodeId};
@@ -104,7 +107,13 @@ fn literal_prefix(p: &str) -> &str {
 
 /// Whether two lease path patterns can name a common file. See module docs.
 pub fn paths_overlap(a: &str, b: &str) -> bool {
-    if a == b || glob_matches(a, b) || glob_matches(b, a) {
+    if a == b {
+        return true;
+    }
+    if !has_meta(a) && !has_meta(b) {
+        return false;
+    }
+    if glob_matches(a, b) || glob_matches(b, a) {
         return true;
     }
     if has_meta(a) && has_meta(b) {
@@ -170,27 +179,72 @@ pub struct Lease {
 }
 
 /// All claims and releases seen, as signed data. Answers are computed per
-/// call from `now`; nothing time-based is stored.
+/// call from `now`; nothing time-based is stored. The derived index
+/// (renewals, roots, deadness) is cached per book state, never serialized.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseBook {
     claims: BTreeMap<EventId, ClaimRec>,
     /// claim id → per releasing node, the lowest order key of its releases.
     releases: BTreeMap<EventId, BTreeMap<NodeId, OrderKey>>,
+    #[serde(skip)]
+    index: IndexCell,
 }
 
-/// Derived, per-call structure: renewal links and roots.
-struct Resolved<'a> {
-    book: &'a LeaseBook,
+/// Lazily built [`Index`]; reset on every change. Always compares equal,
+/// so it never affects view equality.
+#[derive(Default)]
+struct IndexCell(OnceLock<Arc<Index>>);
+
+impl Clone for IndexCell {
+    fn clone(&self) -> Self {
+        let cell = OnceLock::new();
+        if let Some(i) = self.0.get() {
+            let _ = cell.set(Arc::clone(i));
+        }
+        Self(cell)
+    }
+}
+
+impl PartialEq for IndexCell {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for IndexCell {}
+
+impl std::fmt::Debug for IndexCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IndexCell")
+    }
+}
+
+/// Everything about the book that does not depend on `now`.
+#[derive(Debug, Default)]
+struct Index {
     /// child → parent it renews.
     parent: BTreeMap<EventId, EventId>,
     /// parent → latest child renewing it.
     renewed_by: BTreeMap<EventId, EventId>,
+    /// parent → lowest order key among its renewals.
+    first_renewal: BTreeMap<EventId, OrderKey>,
+    /// claim → root of its renewal chain (absent: itself).
+    root: BTreeMap<EventId, EventId>,
+    /// dead claim → the claim that killed it (ADR-002 Addendum 3).
+    dead: BTreeMap<EventId, EventId>,
+    /// (expires_at, id), latest expiry first.
+    by_expiry: Vec<(u64, EventId)>,
 }
 
-impl<'a> Resolved<'a> {
-    fn new(book: &'a LeaseBook) -> Self {
-        let mut parent = BTreeMap::new();
-        let mut renewed_by: BTreeMap<EventId, (OrderKey, EventId)> = BTreeMap::new();
+const MAX_LEASE_TTL_MS: u64 = MAX_LEASE_TTL_SECS as u64 * 1000;
+
+impl Index {
+    fn build(book: &LeaseBook) -> Self {
+        // Candidate renewal links: most recent earlier claim of the same
+        // holder this one can renew. A renewal never grows the path set
+        // (GATE-3 N9): wider is a new claim.
+        let mut parent: BTreeMap<EventId, EventId> = BTreeMap::new();
+        let mut children: BTreeMap<EventId, BTreeSet<(OrderKey, EventId)>> = BTreeMap::new();
         let mut by_holder: BTreeMap<&AgentRef, Vec<&ClaimRec>> = BTreeMap::new();
         for c in book.claims.values() {
             by_holder.entry(&c.holder).or_default().push(c);
@@ -198,56 +252,227 @@ impl<'a> Resolved<'a> {
         for list in by_holder.values_mut() {
             list.sort_by_key(|c| c.key());
             for (i, child) in list.iter().enumerate() {
-                // Most recent earlier claim this one can renew. A renewal
-                // never grows the path set (GATE-3 N9): wider is a new claim.
                 let found = list[..i].iter().rev().find(|p| {
-                    let held: BTreeSet<&String> = p.paths.iter().collect();
                     child.ts < p.expires_at_ms()
-                        && child.paths.iter().all(|x| held.contains(x))
+                        && child.paths.iter().all(|x| p.paths.contains(x))
                         && !book.released_before(p, Some(child.key()))
                 });
                 if let Some(p) = found {
                     parent.insert(child.id, p.id);
-                    let e = renewed_by.entry(p.id).or_insert((child.key(), child.id));
-                    if child.key() > e.0 {
-                        *e = (child.key(), child.id);
-                    }
+                    children
+                        .entry(p.id)
+                        .or_default()
+                        .insert((child.key(), child.id));
                 }
             }
         }
-        Self {
-            book,
-            parent,
-            renewed_by: renewed_by.into_iter().map(|(k, (_, v))| (k, v)).collect(),
+        let mut root: BTreeMap<EventId, EventId> = BTreeMap::new();
+        for c in book.claims.values() {
+            let mut cur = c.id;
+            // Parent keys strictly decrease, so this terminates.
+            while let Some(p) = parent.get(&cur) {
+                cur = *p;
+            }
+            root.insert(c.id, cur);
+        }
+        let rec = |id: &EventId| book.claims.get(id);
+        let order = |root: &BTreeMap<EventId, EventId>, c: &ClaimRec| -> (OrderKey, OrderKey) {
+            let r = root.get(&c.id).and_then(rec).map_or(c.key(), ClaimRec::key);
+            (r, c.key())
+        };
+        let root_ts = |root: &BTreeMap<EventId, EventId>, c: &ClaimRec| -> u64 {
+            root.get(&c.id).and_then(rec).map_or(c.ts, |r| r.ts)
+        };
+
+        // Deadness (ADR-002 Addendum 3), in walk order so every claim that
+        // sorts earlier is decided first. A re-claim of a dead claim is cut
+        // loose to start its own chain, which moves it (and its renewals)
+        // later in the order.
+        let mut by_ts: Vec<&ClaimRec> = book.claims.values().collect();
+        by_ts.sort_by_key(|c| (c.ts, c.id));
+        let mut heap: BinaryHeap<Reverse<((OrderKey, OrderKey), EventId)>> = book
+            .claims
+            .values()
+            .map(|c| Reverse((order(&root, c), c.id)))
+            .collect();
+        let mut done: BTreeSet<EventId> = BTreeSet::new();
+        let mut dead: BTreeMap<EventId, EventId> = BTreeMap::new();
+        let globs = Globs::default();
+        while let Some(Reverse((ord, id))) = heap.pop() {
+            let Some(c) = rec(&id) else { continue };
+            if done.contains(&id) || ord != order(&root, c) {
+                continue;
+            }
+            if let Some(p) = parent.get(&id).copied().filter(|p| dead.contains_key(p)) {
+                parent.remove(&id);
+                if let Some(s) = children.get_mut(&p) {
+                    s.remove(&(c.key(), id));
+                }
+                let old_root = root.get(&id).copied().unwrap_or(id);
+                let mut stack = vec![id];
+                while let Some(n) = stack.pop() {
+                    if root.get(&n) == Some(&old_root) {
+                        root.insert(n, id);
+                        if let Some(d) = rec(&n) {
+                            heap.push(Reverse((order(&root, d), n)));
+                        }
+                        if let Some(s) = children.get(&n) {
+                            stack.extend(s.iter().map(|(_, k)| *k));
+                        }
+                    }
+                }
+                continue;
+            }
+            done.insert(id);
+            let (c_key, c_exp, c_root_ts) = (c.key(), c.expires_at_ms(), root_ts(&root, c));
+            // Coexisting claims were signed in (c.ts - MAX_TTL, c.expires).
+            let from = c.ts.saturating_sub(MAX_LEASE_TTL_MS);
+            let lo = by_ts.partition_point(|v| v.ts <= from);
+            let hi = by_ts.partition_point(|v| v.ts < c_exp);
+            let killer = by_ts[lo.min(hi)..hi]
+                .iter()
+                .filter(|v| {
+                    v.id != id
+                        && v.holder != c.holder
+                        && c.ts < v.expires_at_ms()
+                        && !book.released_before(v, Some(c_key))
+                        && children
+                            .get(&v.id)
+                            .and_then(|s| s.first())
+                            .is_none_or(|(k, _)| *k > c_key)
+                })
+                .filter(|v| {
+                    if order(&root, v) < ord {
+                        !dead.contains_key(&v.id)
+                    } else {
+                        root_ts(&root, v).saturating_add(SETTLE_MS) <= c_root_ts
+                    }
+                })
+                .filter(|v| globs.sets_overlap(&v.paths, &c.paths))
+                .min_by_key(|v| order(&root, v))
+                .map(|v| v.id);
+            if let Some(k) = killer {
+                dead.insert(id, k);
+            }
+        }
+
+        let mut ix = Self {
+            dead,
+            ..Self::default()
+        };
+        for (p, s) in &children {
+            if let (Some((first, _)), Some((_, last))) = (s.first(), s.last()) {
+                ix.first_renewal.insert(*p, *first);
+                ix.renewed_by.insert(*p, *last);
+            }
+        }
+        ix.parent = parent;
+        ix.root = root.into_iter().filter(|(c, r)| c != r).collect();
+        ix.by_expiry = book
+            .claims
+            .values()
+            .map(|c| (c.expires_at_ms(), c.id))
+            .collect();
+        ix.by_expiry.sort_by(|a, b| b.cmp(a));
+        ix
+    }
+}
+
+/// [`paths_overlap`] with each glob compiled once.
+#[derive(Default)]
+struct Globs(RefCell<HashMap<String, Option<globset::GlobMatcher>>>);
+
+impl Globs {
+    fn matches(&self, pattern: &str, path: &str) -> bool {
+        let mut cache = self.0.borrow_mut();
+        let m = cache.entry(pattern.to_owned()).or_insert_with(|| {
+            globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .ok()
+                .map(|g| g.compile_matcher())
+        });
+        match m {
+            Some(m) => m.is_match(path),
+            None => pattern == path,
         }
     }
 
-    fn root(&self, id: &EventId) -> Option<&'a ClaimRec> {
-        let mut cur = *id;
-        // Parent keys strictly decrease, so this terminates.
-        while let Some(p) = self.parent.get(&cur) {
-            cur = *p;
+    fn paths_overlap(&self, a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
         }
-        self.book.claims.get(&cur)
+        let (ma, mb) = (has_meta(a), has_meta(b));
+        if !ma && !mb {
+            return false;
+        }
+        if (ma && self.matches(a, b)) || (mb && self.matches(b, a)) {
+            return true;
+        }
+        if ma && mb {
+            let (pa, pb) = (literal_prefix(a), literal_prefix(b));
+            return pa.starts_with(pb) || pb.starts_with(pa);
+        }
+        false
+    }
+
+    fn sets_overlap(&self, a: &[String], b: &[String]) -> bool {
+        a.iter().any(|x| b.iter().any(|y| self.paths_overlap(x, y)))
+    }
+}
+
+impl LeaseBook {
+    fn index(&self) -> &Index {
+        self.index.0.get_or_init(|| Arc::new(Index::build(self)))
+    }
+
+    fn touched(&mut self) {
+        self.index = IndexCell::default();
+    }
+
+    fn root_rec<'a>(&'a self, c: &'a ClaimRec) -> &'a ClaimRec {
+        self.index()
+            .root
+            .get(&c.id)
+            .and_then(|r| self.claims.get(r))
+            .unwrap_or(c)
+    }
+
+    /// Unexpired at `now`, latest expiry first; O(unexpired), not history.
+    fn unexpired(&self, now: u64) -> impl Iterator<Item = &ClaimRec> {
+        self.index()
+            .by_expiry
+            .iter()
+            .take_while(move |(exp, _)| *exp > now)
+            .filter_map(|(_, id)| self.claims.get(id))
     }
 
     fn live(&self, c: &ClaimRec, now: u64) -> bool {
-        !self.book.released_before(c, None)
-            && !self.renewed_by.contains_key(&c.id)
+        !self.released_before(c, None)
+            && !self.index().renewed_by.contains_key(&c.id)
             && !c.expired(now)
     }
 
-    /// Winners at `now` in priority order, and the full sorted live list.
-    fn walk(&self, now: u64) -> Vec<(&'a ClaimRec, Option<EventId>)> {
-        let mut live: Vec<(OrderKey, &'a ClaimRec)> = self
-            .book
-            .claims
-            .values()
-            .filter(|c| self.live(c, now))
-            .map(|c| (self.root(&c.id).map_or(c.key(), ClaimRec::key), c))
+    /// Latest renewal in `id`'s chain from `id` on.
+    fn head(&self, id: EventId) -> EventId {
+        let mut cur = id;
+        while let Some(n) = self.index().renewed_by.get(&cur) {
+            cur = *n;
+        }
+        cur
+    }
+
+    /// Live, non-dead claims at `now` in priority order, each with the claim
+    /// that beats it (if any).
+    fn walk(&self, now: u64) -> Vec<(&ClaimRec, Option<EventId>)> {
+        let ix = self.index();
+        let mut live: Vec<(OrderKey, &ClaimRec)> = self
+            .unexpired(now)
+            .filter(|c| self.live(c, now) && !ix.dead.contains_key(&c.id))
+            .map(|c| (self.root_rec(c).key(), c))
             .collect();
         live.sort_by_key(|(root, c)| (*root, c.key()));
-        let root_ts = |c: &ClaimRec| self.root(&c.id).map_or(c.ts, |r| r.ts);
+        let root_ts = |c: &ClaimRec| self.root_rec(c).ts;
         let mut winners: Vec<&ClaimRec> = Vec::new();
         let mut out = Vec::with_capacity(live.len());
         for (i, &(_, c)) in live.iter().enumerate() {
@@ -257,8 +482,7 @@ impl<'a> Resolved<'a> {
                 .find(|w| w.holder != c.holder && sets_overlap(&w.paths, &c.paths))
                 .map(|w| w.id)
                 // Late claim (GATE-2 N3): a later-sorted live claim that had
-                // settled, by signed time, before this one was signed beats
-                // it, so a low Lamport can't retroactively take a lease.
+                // settled, by signed time, before this one was signed beats it.
                 .or_else(|| {
                     live[i + 1..]
                         .iter()
@@ -276,12 +500,11 @@ impl<'a> Resolved<'a> {
         }
         out
     }
-}
 
-impl LeaseBook {
     /// Record a claim. Idempotent.
     pub fn add_claim(&mut self, c: ClaimRec) {
         self.claims.insert(c.id, c);
+        self.touched();
     }
 
     /// Record that node `by` released `claim` with an event of order `key`.
@@ -295,6 +518,7 @@ impl LeaseBook {
         if key < *e {
             *e = key;
         }
+        self.touched();
     }
 
     /// Keep only the claims, and the releases, whose own event id passes
@@ -305,6 +529,7 @@ impl LeaseBook {
             by_node.retain(|_, (_, _, id)| keep(id));
         }
         self.releases.retain(|_, by_node| !by_node.is_empty());
+        self.touched();
     }
 
     /// Event ids of every claim and every recorded release.
@@ -315,8 +540,7 @@ impl LeaseBook {
 
     /// Ids of the claims that win at `now` (pending or granted).
     pub fn winners(&self, now: u64) -> BTreeSet<EventId> {
-        Resolved::new(self)
-            .walk(now)
+        self.walk(now)
             .into_iter()
             .filter(|(_, beaten)| beaten.is_none())
             .map(|(c, _)| c.id)
@@ -326,24 +550,8 @@ impl LeaseBook {
     /// The claim at the start of `id`'s renewal chain (`id` itself if it
     /// renews nothing). `None` if `id` is not a known claim.
     pub fn root_of(&self, id: &EventId) -> Option<EventId> {
-        Resolved::new(self).root(id).map(|c| c.id)
-    }
-
-    /// Claims of other holders that win at `now` but would stop winning if
-    /// `c` were added: the leases `c` would take (ADR-002 Addendum 2).
-    pub fn displaced_by(&self, c: &ClaimRec, now: u64) -> Vec<EventId> {
-        let before = self.winners(now);
-        if before.is_empty() {
-            return Vec::new();
-        }
-        let mut with = self.clone();
-        with.add_claim(c.clone());
-        let after = with.winners(now);
-        before
-            .into_iter()
-            .filter(|id| !after.contains(id))
-            .filter(|id| self.claims.get(id).is_some_and(|v| v.holder != c.holder))
-            .collect()
+        let c = self.claims.get(id)?;
+        Some(self.root_rec(c).id)
     }
 
     pub fn claim(&self, id: &EventId) -> Option<&ClaimRec> {
@@ -373,18 +581,23 @@ impl LeaseBook {
         if self.released_before(target, None) {
             return Some(ClaimState::Released);
         }
-        let r = Resolved::new(self);
-        if let Some(by) = r.renewed_by.get(id) {
+        let ix = self.index();
+        if let Some(by) = ix.renewed_by.get(id) {
             return Some(ClaimState::Renewed { by: *by });
         }
         if target.expired(now) {
             return Some(ClaimState::Expired);
         }
-        let (_, beaten) = r.walk(now).into_iter().find(|(c, _)| c.id == *id)?;
+        if let Some(killer) = ix.dead.get(id) {
+            return Some(ClaimState::Lost {
+                winner: self.head(*killer),
+            });
+        }
+        let (_, beaten) = self.walk(now).into_iter().find(|(c, _)| c.id == *id)?;
         if let Some(winner) = beaten {
             return Some(ClaimState::Lost { winner });
         }
-        let root_ts = r.root(id).map_or(target.ts, |c| c.ts);
+        let root_ts = self.root_rec(target).ts;
         Some(if now >= root_ts.saturating_add(settle_ms) {
             ClaimState::Granted
         } else {
@@ -395,7 +608,7 @@ impl LeaseBook {
     /// Path → lease for every winning claim at `now` (pending or granted).
     pub fn active(&self, now: u64) -> BTreeMap<String, Lease> {
         let mut out: BTreeMap<String, Lease> = BTreeMap::new();
-        for (c, beaten) in Resolved::new(self).walk(now) {
+        for (c, beaten) in self.walk(now) {
             if beaten.is_some() {
                 continue;
             }
@@ -418,18 +631,19 @@ impl LeaseBook {
     }
 
     /// Claims by other holders whose paths overlap claim `id`'s, and that
-    /// are not released, renewed or expired at `now`.
+    /// are not released, renewed or expired at `now` (dead ones included).
     pub fn conflicting(&self, id: &EventId, now: u64) -> Vec<EventId> {
         let Some(target) = self.claims.get(id) else {
             return Vec::new();
         };
-        let r = Resolved::new(self);
-        self.claims
-            .values()
+        let mut out: Vec<EventId> = self
+            .unexpired(now)
             .filter(|c| c.holder != target.holder && sets_overlap(&c.paths, &target.paths))
-            .filter(|c| r.live(c, now))
+            .filter(|c| self.live(c, now))
             .map(|c| c.id)
-            .collect()
+            .collect();
+        out.sort();
+        out
     }
 }
 
