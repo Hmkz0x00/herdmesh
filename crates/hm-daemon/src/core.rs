@@ -215,6 +215,8 @@ const RESOLVE_NAMES_MAX: usize = 20;
 struct TargetIndex<'a> {
     names: BTreeMap<&'a str, Vec<&'a AgentRef>>,
     people: HashMap<&'a str, Vec<&'a AgentRef>>,
+    /// Members that passed the shared name validator (the only ones indexed).
+    indexed: usize,
 }
 
 impl<'a> TargetIndex<'a> {
@@ -222,8 +224,15 @@ impl<'a> TargetIndex<'a> {
         let mut index = Self {
             names: BTreeMap::new(),
             people: HashMap::new(),
+            indexed: 0,
         };
         for a in agents {
+            // Peers are not bound by local name limits (N17): oversized or
+            // malformed names are never indexed, so no prefix work is done.
+            if !valid_agent(&a.agent_name) {
+                continue;
+            }
+            index.indexed += 1;
             index.names.entry(&a.agent_name).or_default().push(a);
             // Preserve aliases for people whose names themselves contain '-'.
             for (pos, _) in a.agent_name.match_indices('-') {
@@ -324,7 +333,7 @@ fn pick_target(agents: &[AgentRef], to: &str) -> Pick {
 #[cfg(test)]
 fn names_list(agents: &[AgentRef]) -> String {
     let index = TargetIndex::new(agents);
-    index.names_list(index.names.values().flatten().copied(), agents.len())
+    index.names_list(index.names.values().flatten().copied(), index.indexed)
 }
 
 fn valid_agent(name: &str) -> bool {
@@ -747,7 +756,7 @@ impl Daemon {
             Pick::None => Target::Unknown(format!(
                 "No agent matches '{}'. Agents in this room: {}. Nothing was sent.",
                 clean(to, 40),
-                index.names_list(index.names.values().flatten().copied(), agents.len())
+                index.names_list(index.names.values().flatten().copied(), index.indexed)
             )),
             Pick::Many { hits, total } => Target::Unknown(format!(
                 "'{}' matches several agents: {}. Use person/agent or node6/name. Nothing was sent.",
@@ -1353,6 +1362,22 @@ mod resolve_tests {
                 .ends_with("and 9980 more")
         );
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn oversized_peer_names_are_not_indexed_or_resolvable() {
+        let evil = format!("zed{}", "-".repeat(60_000));
+        let agents = vec![ag(1, "alice"), ag(2, &evil)];
+        let start = std::time::Instant::now();
+        let index = TargetIndex::new(&agents);
+        assert!(start.elapsed() < std::time::Duration::from_millis(200));
+        assert_eq!(index.indexed, 1);
+        assert!(index.people.len() <= 32);
+        assert_eq!(index.pick("z"), Pick::None);
+        assert_eq!(index.pick(&evil), Pick::None);
+        assert_eq!(index.pick("zed/-"), Pick::None);
+        assert!(matches!(index.pick("alice"), Pick::One(_)));
+        assert_eq!(names_list(&agents), "alice");
     }
 
     #[test]
