@@ -205,82 +205,126 @@ enum Target {
 enum Pick {
     One(AgentRef),
     None,
-    Many(Vec<AgentRef>),
+    Many { hits: Vec<AgentRef>, total: usize },
 }
 
-/// Match `to` against the room's agents (ADR-004 section 1). In order:
-/// `node6/name` (hex prefix of the machine key), `person/agent` (the agent is
-/// named `person-agent...`), an exact agent name, then a unique name prefix.
-/// Never falls back to an agent that is not in the room.
-fn pick_target(agents: &[AgentRef], to: &str) -> Pick {
-    let narrow = |hits: Vec<&AgentRef>| match hits.as_slice() {
-        [] => None,
-        [one] => Some(Pick::One((*one).clone())),
-        many => Some(Pick::Many(many.iter().map(|a| (*a).clone()).collect())),
-    };
-    if let Some((left, right)) = to.split_once('/') {
-        let by_node: Vec<&AgentRef> = agents
-            .iter()
-            .filter(|a| {
-                left.len() >= 4 && a.agent_name == right && a.node.to_string().starts_with(left)
-            })
-            .collect();
-        if let Some(p) = narrow(by_node) {
-            return p;
-        }
-        let by_person: Vec<&AgentRef> = agents
-            .iter()
-            .filter(|a| {
-                a.agent_name
-                    .strip_prefix(left)
-                    .and_then(|r| r.strip_prefix('-'))
-                    .is_some_and(|kind| kind.starts_with(right))
-            })
-            .collect();
-        return narrow(by_person).unwrap_or(Pick::None);
-    }
-    let exact: Vec<&AgentRef> = agents.iter().filter(|a| a.agent_name == to).collect();
-    if let Some(p) = narrow(exact) {
-        return p;
-    }
-    let prefixed: Vec<&AgentRef> = agents
-        .iter()
-        .filter(|a| a.agent_name.starts_with(to))
-        .collect();
-    narrow(prefixed).unwrap_or(Pick::None)
+/// Maximum candidates retained or names formatted for a resolver error.
+const RESOLVE_NAMES_MAX: usize = 20;
+
+/// Built once per recipient lookup, from an unlocked membership snapshot.
+struct TargetIndex<'a> {
+    names: BTreeMap<&'a str, Vec<&'a AgentRef>>,
+    people: HashMap<&'a str, Vec<&'a AgentRef>>,
 }
 
-/// `a, b, c` (distinct names; `name@node6` when a name repeats), capped.
-fn names_list(agents: &[AgentRef]) -> String {
-    const SHOWN: usize = 20;
-    let mut names: Vec<String> = agents
-        .iter()
-        .map(|a| {
-            let dup = agents
-                .iter()
-                .filter(|b| b.agent_name == a.agent_name)
-                .count()
-                > 1;
-            let name = clean(&a.agent_name, 40);
-            if dup {
-                format!("{name}@{}", &a.node.to_string()[..6])
-            } else {
-                name
+impl<'a> TargetIndex<'a> {
+    fn new(agents: &'a [AgentRef]) -> Self {
+        let mut index = Self {
+            names: BTreeMap::new(),
+            people: HashMap::new(),
+        };
+        for a in agents {
+            index.names.entry(&a.agent_name).or_default().push(a);
+            // Preserve aliases for people whose names themselves contain '-'.
+            for (pos, _) in a.agent_name.match_indices('-') {
+                index
+                    .people
+                    .entry(&a.agent_name[..pos])
+                    .or_default()
+                    .push(a);
             }
-        })
-        .collect();
-    names.sort();
-    names.dedup();
-    let more = names.len().saturating_sub(SHOWN);
-    names.truncate(SHOWN);
-    let mut out = names.join(", ");
-    if out.is_empty() {
-        out.push_str("(none yet)");
+        }
+        index
     }
-    if more > 0 {
-        out.push_str(&format!(", and {more} more"));
+
+    /// Hex prefixes of at least four digits are reserved for node identities.
+    /// A failed node lookup must never be reinterpreted as a person alias.
+    fn pick(&self, to: &str) -> Pick {
+        if let Some((left, right)) = to.split_once('/') {
+            if left.len() >= 4 && left.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Self::narrow(
+                    self.names
+                        .get(right)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .filter(|a| a.node.to_string().starts_with(left)),
+                );
+            }
+            return Self::narrow(
+                self.people
+                    .get(left)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|a| a.agent_name[left.len() + 1..].starts_with(right)),
+            );
+        }
+        if let Some(exact) = self.names.get(to) {
+            return Self::narrow(exact.iter().copied());
+        }
+        Self::narrow(
+            self.names
+                .range(to..)
+                .take_while(|(name, _)| name.starts_with(to))
+                .flat_map(|(_, agents)| agents.iter().copied()),
+        )
     }
-    out
+
+    fn narrow(agents: impl Iterator<Item = &'a AgentRef>) -> Pick {
+        let mut hits = Vec::new();
+        let mut total = 0;
+        for a in agents {
+            total += 1;
+            if hits.len() < RESOLVE_NAMES_MAX {
+                hits.push(a.clone());
+            }
+        }
+        match total {
+            0 => Pick::None,
+            1 => Pick::One(hits.remove(0)),
+            _ => Pick::Many { hits, total },
+        }
+    }
+
+    /// Format only the capped candidates; duplicate counts come from the index.
+    fn names_list<'b>(&self, agents: impl Iterator<Item = &'b AgentRef>, total: usize) -> String {
+        let names: Vec<_> = agents
+            .take(RESOLVE_NAMES_MAX)
+            .map(|a| {
+                let name = clean(&a.agent_name, 40);
+                if self
+                    .names
+                    .get(a.agent_name.as_str())
+                    .is_some_and(|v| v.len() > 1)
+                {
+                    format!("{name}@{}", &a.node.to_string()[..6])
+                } else {
+                    name
+                }
+            })
+            .collect();
+        let more = total.saturating_sub(names.len());
+        let mut out = names.join(", ");
+        if out.is_empty() {
+            out.push_str("(none yet)");
+        }
+        if more > 0 {
+            out.push_str(&format!(", and {more} more"));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+fn pick_target(agents: &[AgentRef], to: &str) -> Pick {
+    TargetIndex::new(agents).pick(to)
+}
+
+#[cfg(test)]
+fn names_list(agents: &[AgentRef]) -> String {
+    let index = TargetIndex::new(agents);
+    index.names_list(index.names.values().flatten().copied(), agents.len())
 }
 
 fn valid_agent(name: &str) -> bool {
@@ -680,10 +724,10 @@ impl Daemon {
             .map(|_| ())
     }
 
-    /// Resolve an ask/handoff target; see [`pick_target`]. No match is not an
+    /// Resolve an ask/handoff target; see [`TargetIndex`]. No match is not an
     /// error code (the MCP layer would flatten it to "unavailable"): it is a
     /// message listing the room's agents, and nothing is sent.
-    fn resolve(&self, st: &RoomState<'_>, to: &str) -> Res<Target> {
+    fn resolve(&self, room: Option<RoomId>, agent: &str, to: &str) -> Res<Target> {
         let to = to.trim();
         let (left, right) = to.split_once('/').unwrap_or((to, ""));
         let part_ok = |p: &str| {
@@ -696,23 +740,49 @@ impl Daemon {
         if !part_ok(left) || (to.contains('/') && !part_ok(right)) {
             return Err(ErrCode::BadRequest);
         }
-        let agents: Vec<AgentRef> = st.store.views().members.keys().cloned().collect();
-        Ok(match pick_target(&agents, to) {
+        let agents = self.recipient_snapshot(room, agent)?;
+        let index = TargetIndex::new(&agents);
+        Ok(match index.pick(to) {
             Pick::One(a) => Target::Found(a),
             Pick::None => Target::Unknown(format!(
                 "No agent matches '{}'. Agents in this room: {}. Nothing was sent.",
                 clean(to, 40),
-                names_list(&agents)
+                index.names_list(index.names.values().flatten().copied(), agents.len())
             )),
-            Pick::Many(hits) => Target::Unknown(format!(
+            Pick::Many { hits, total } => Target::Unknown(format!(
                 "'{}' matches several agents: {}. Use person/agent or node6/name. Nothing was sent.",
                 clean(to, 40),
-                names_list(&hits)
+                index.names_list(hits.iter(), total)
             )),
         })
     }
 
-    fn call(&self, st: &mut RoomState<'_>, agent: &str, call: Call) -> Res<Items> {
+    /// Clone membership while locked; all indexing and formatting happens later.
+    fn recipient_snapshot(&self, room: Option<RoomId>, agent: &str) -> Res<Vec<AgentRef>> {
+        let store = {
+            let rooms = lock(&self.rooms);
+            let id = room.or(rooms.default).ok_or(ErrCode::NoRoom)?;
+            Arc::clone(&rooms.by_id.get(&id).ok_or(ErrCode::NoRoom)?.store)
+        };
+        let me = AgentRef::new(self.node, agent);
+        let mut agents = {
+            let guard = lock(&store);
+            guard.views().members.keys().cloned().collect::<Vec<_>>()
+        };
+        // `call` announces the sender before consuming this resolution result.
+        if !agents.contains(&me) {
+            agents.push(me);
+        }
+        Ok(agents)
+    }
+
+    fn call(
+        &self,
+        st: &mut RoomState<'_>,
+        agent: &str,
+        call: Call,
+        resolved: Option<Res<Target>>,
+    ) -> Res<Items> {
         let me = AgentRef::new(self.node, agent);
         self.ensure_member(st, &me)?;
         let now = (self.clock)();
@@ -724,8 +794,8 @@ impl Daemon {
             ))),
             Call::Brief { max_tokens } => self.brief(st, &me, max_tokens as usize, now),
             Call::Inbox { ack } => Self::inbox(st, &me, ack),
-            Call::Ask { to, question } => {
-                let to = match self.resolve(st, &to)? {
+            Call::Ask { question, .. } => {
+                let to = match resolved.ok_or(ErrCode::Internal)?? {
                     Target::Found(a) => a,
                     Target::Unknown(msg) => return ok(msg),
                 };
@@ -766,7 +836,11 @@ impl Daemon {
                 refs,
                 next_steps,
             } => {
-                let to = match to.map(|t| self.resolve(st, &t)).transpose()? {
+                let to = match if to.is_some() {
+                    Some(resolved.ok_or(ErrCode::Internal)??)
+                } else {
+                    None
+                } {
                     None => None,
                     Some(Target::Found(a)) => Some(a),
                     Some(Target::Unknown(msg)) => return ok(msg),
@@ -1026,6 +1100,13 @@ impl Daemon {
         if !valid_agent(&req.agent) {
             return Response::Err(ErrCode::BadRequest);
         }
+        // Resolve from a snapshot before entering the request's locked section.
+        let resolved = match &req.call {
+            Call::Ask { to, .. } | Call::Handoff { to: Some(to), .. } => {
+                Some(self.resolve(req.room, &req.agent, to))
+            }
+            _ => None,
+        };
         let rooms = lock(&self.rooms);
         let Some(id) = req.room.or(rooms.default) else {
             return Response::Err(ErrCode::NoRoom);
@@ -1063,7 +1144,7 @@ impl Daemon {
             name: &entry.name,
             store: &mut guard,
         };
-        match self.call(&mut st, &req.agent, req.call) {
+        match self.call(&mut st, &req.agent, req.call, resolved) {
             Ok(items) => Response::Ok(items),
             Err(e) => Response::Err(e),
         }
@@ -1108,6 +1189,8 @@ fn fit_card(card: String) -> String {
 
 #[cfg(test)]
 mod resolve_tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     fn ag(node: u8, name: &str) -> AgentRef {
@@ -1146,6 +1229,10 @@ mod resolve_tests {
             Pick::One(ag(0xa1, "alice-codex"))
         );
         assert_eq!(pick_target(&room(), "bob/codex"), Pick::None);
+        assert_eq!(
+            pick_target(&[ag(1, "alice-smith-claude")], "alice-smith/cl"),
+            Pick::One(ag(1, "alice-smith-claude"))
+        );
     }
 
     #[test]
@@ -1159,7 +1246,9 @@ mod resolve_tests {
 
     #[test]
     fn ambiguity_and_no_match_never_fall_back() {
-        assert!(matches!(pick_target(&room(), "alice"), Pick::Many(v) if v.len() == 2));
+        assert!(
+            matches!(pick_target(&room(), "alice"), Pick::Many { hits, .. } if hits.len() == 2)
+        );
         assert_eq!(pick_target(&room(), "claude"), Pick::None);
         // The old behaviour addressed an unknown local name; now nothing matches.
         assert_eq!(pick_target(&room(), "ghost"), Pick::None);
@@ -1169,7 +1258,7 @@ mod resolve_tests {
     #[test]
     fn same_name_on_two_machines_is_ambiguous_and_listed_with_nodes() {
         let r = vec![ag(0xa1, "claude"), ag(0xb2, "claude")];
-        let Pick::Many(hits) = pick_target(&r, "claude") else {
+        let Pick::Many { hits, .. } = pick_target(&r, "claude") else {
             panic!("expected Many");
         };
         assert_eq!(names_list(&hits), "claude@a1a1a1, claude@b2b2b2");
@@ -1184,5 +1273,108 @@ mod resolve_tests {
         assert_eq!(names_list(&[]), "(none yet)");
         let many: Vec<AgentRef> = (0..25).map(|i| ag(1, &format!("a{i:02}"))).collect();
         assert!(names_list(&many).ends_with("and 5 more"));
+    }
+
+    #[test]
+    fn failed_node_qualification_never_selects_a_person_alias() {
+        let agents = vec![ag(1, "deadbe-alice"), ag(2, "b2b2-bob-claude")];
+        assert_eq!(pick_target(&agents, "deadbe/alice"), Pick::None);
+        assert_eq!(pick_target(&agents, "b2b2/bob-claude"), Pick::None);
+    }
+
+    #[test]
+    fn qualified_misses_do_not_emit_asks_or_handoffs() {
+        let daemon = Daemon::new(SigningKey::from_bytes(&[7; 32]), Arc::new(NullNet));
+        let room = daemon
+            .create_room(
+                "resolve",
+                Store::open_in_memory(RoomId::from_bytes([1; 32])).unwrap(),
+            )
+            .unwrap();
+        daemon.handle_request(Request {
+            room: Some(room),
+            agent: "deadbe-alice".into(),
+            call: Call::RoomCard,
+        });
+        for call in [
+            Call::Ask {
+                to: "deadbe/alice".into(),
+                question: "hello".into(),
+            },
+            Call::Handoff {
+                to: Some("deadbe/alice".into()),
+                summary: "hello".into(),
+                refs: vec![],
+                next_steps: vec![],
+            },
+        ] {
+            let response = daemon.handle_request(Request {
+                room: Some(room),
+                agent: "sender".into(),
+                call,
+            });
+            assert!(
+                matches!(response, Response::Ok(items) if items[0].1.contains("Nothing was sent"))
+            );
+        }
+        let store = daemon.store_for_test(room);
+        let snapshot = daemon.recipient_snapshot(Some(room), "sender").unwrap();
+        assert!(daemon.rooms.try_lock().is_ok());
+        assert!(store.try_lock().is_ok());
+        assert_eq!(TargetIndex::new(&snapshot).pick("deadbe/alice"), Pick::None);
+        assert!(
+            !lock(&store)
+                .events_since(Lamport(0))
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e.body, EventBody::Ask { .. } | EventBody::Handoff { .. }))
+        );
+    }
+
+    #[test]
+    fn ten_thousand_members_have_bounded_candidates_and_fast_errors() {
+        let agents: Vec<_> = (0..10_000)
+            .map(|i| ag(1, &format!("alice-worker-{i:05}")))
+            .collect();
+        let start = std::time::Instant::now();
+        assert_eq!(pick_target(&agents, "missing"), Pick::None);
+        let listing = names_list(&agents);
+        assert_eq!(listing.split(", ").count(), 21);
+        assert!(listing.ends_with("and 9980 more"));
+        let index = TargetIndex::new(&agents);
+        let Pick::Many { hits, total } = index.pick("alice/worker") else {
+            panic!("expected ambiguity");
+        };
+        assert_eq!(total, 10_000);
+        assert!(hits.len() <= 20, "candidate collection must be capped");
+        assert!(
+            index
+                .names_list(hits.iter(), total)
+                .ends_with("and 9980 more")
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn ten_thousand_duplicate_names_have_fast_bounded_errors() {
+        let agents: Vec<_> = (0u32..10_000)
+            .map(|i| {
+                let mut node = [0; 32];
+                node[..4].copy_from_slice(&i.to_be_bytes());
+                AgentRef::new(NodeId::from_bytes(node), "worker")
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        assert!(names_list(&agents).split(", ").count() <= 21);
+        let Pick::Many { hits, .. } = pick_target(&agents, "worker") else {
+            panic!("expected ambiguity");
+        };
+        assert!(hits.len() <= 20);
+        // Exact node lookup must still find a duplicate beyond the retained candidates.
+        assert_eq!(
+            pick_target(&agents, &format!("{}/worker", agents[9999].node)),
+            Pick::One(agents[9999].clone())
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 }
