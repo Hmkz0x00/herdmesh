@@ -324,3 +324,52 @@ fn renewal_loser_does_not_revive_after_release() {
         assert!(book_from_events(&evs).active(now).is_empty());
     }
 }
+
+// ---- GATE-8 N21 / N22 ----
+
+#[test]
+fn dense_expired_two_holder_history_is_cheap() {
+    // GATE-8 N21: 10k disjoint literal claims alternating between two
+    // holders, all ts=T, TTL 60s; rebuild and query a day later.
+    let evs: Vec<Event> = (0..10_000u64)
+        .map(|i| {
+            let k = (i % 2) as u8 + 1;
+            claim(k, i / 2 + 1, i + 1, T, &[format!("f{i}.rs").as_str()], 60)
+        })
+        .collect();
+    let start = Instant::now();
+    let book = book_from_events(&evs);
+    let day = T + 86_400_000;
+    for e in &evs {
+        assert_eq!(book.state(&e.id, day), Some(ClaimState::Expired));
+    }
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(3), "took {took:?}");
+}
+
+#[test]
+fn gate8_later_root_renewal_loses_for_good() {
+    // GATE-8 N22, all paths [a]: Bob W0=(L1, T+3s, 2s), W1=(L2, T+4s, 10s)
+    // renews W0; Alice P=(L3, T, 2s), R=(L4, T+1s, 10s) renews P. At T+6s R
+    // has lost to W1; Bob releases W1 at L5/T+6s; R must stay lost.
+    let w0 = claim(2, 1, 1, T + 3_000, &["a"], 2);
+    let w1 = claim(2, 2, 2, T + 4_000, &["a"], 10);
+    let p = claim(1, 1, 3, T, &["a"], 2);
+    let r = claim(1, 2, 4, T + 1_000, &["a"], 10);
+    let rel = release(2, 3, 5, T + 6_000, &w1);
+    let now = T + 6_000;
+    let before = vec![w0.clone(), w1.clone(), p.clone(), r.clone()];
+    assert_eq!(
+        claim_state(&r.id, &before, now),
+        Some(ClaimState::Lost { winner: w1.id })
+    );
+    let mut after = before.clone();
+    after.push(rel);
+    for evs in [after.clone(), after.iter().rev().cloned().collect()] {
+        assert_eq!(
+            claim_state(&r.id, &evs, now),
+            Some(ClaimState::Lost { winner: w1.id })
+        );
+        assert!(book_from_events(&evs).active(now).is_empty());
+    }
+}

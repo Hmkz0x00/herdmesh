@@ -195,6 +195,10 @@ pub struct LeaseBook {
     open_by_holder: BTreeMap<AgentRef, BTreeSet<(u64, EventId)>>,
     /// The same open claims per (holder, path), for renewal lookup.
     open_by_path: BTreeMap<(AgentRef, String), BTreeSet<(u64, EventId)>>,
+    /// Open claims per literal path, for overlap lookup (GATE-8 N21).
+    open_lit: BTreeMap<String, BTreeSet<(u64, EventId)>>,
+    /// Open claims naming at least one glob path.
+    open_glob: BTreeSet<(u64, EventId)>,
     /// Latest signed `ts` of any applied claim.
     max_ts: u64,
 }
@@ -217,6 +221,11 @@ impl LeaseBook {
                 .entry((c.holder.clone(), p.clone()))
                 .or_default()
                 .insert(k);
+            if has_meta(p) {
+                self.open_glob.insert(k);
+            } else {
+                self.open_lit.entry(p.clone()).or_default().insert(k);
+            }
         }
     }
 
@@ -240,7 +249,40 @@ impl LeaseBook {
                     self.open_by_path.remove(&pk);
                 }
             }
+            if let Some(s) = self.open_lit.get_mut(p) {
+                s.remove(&k);
+                if s.is_empty() {
+                    self.open_lit.remove(p);
+                }
+            }
         }
+        self.open_glob.remove(&k);
+    }
+
+    /// Open claims expiring after `ts` that could overlap `paths`: same
+    /// literal path, a literal under one of its globs' literal prefixes, or
+    /// any open glob claim. Never scans unrelated literal paths.
+    fn overlap_candidates(&self, paths: &[String], ts: u64) -> BTreeSet<EventId> {
+        let mut out = BTreeSet::new();
+        let mut add = |s: &BTreeSet<(u64, EventId)>| {
+            out.extend(s.range(after(ts)..).map(|(_, id)| *id));
+        };
+        for q in paths {
+            if has_meta(q) {
+                let pre = literal_prefix(q);
+                for (_, s) in self
+                    .open_lit
+                    .range(pre.to_owned()..)
+                    .take_while(|(k, _)| k.starts_with(pre))
+                {
+                    add(s);
+                }
+            } else if let Some(s) = self.open_lit.get(q) {
+                add(s);
+            }
+        }
+        add(&self.open_glob);
+        out
     }
 
     /// Apply a claim. Idempotent. Call in [`OrderKey`] order.
@@ -276,12 +318,10 @@ impl LeaseBook {
         .map(|p| p.id);
         // Open, coexisting, overlapping claims of other holders.
         let rivals: Vec<EventId> = self
-            .open_by_holder
+            .overlap_candidates(&c.paths, c.ts)
             .iter()
-            .filter(|(h, _)| **h != c.holder)
-            .flat_map(|(_, s)| s.range(after(c.ts)..))
-            .filter_map(|(_, v)| self.claims.get(v))
-            .filter(|v| coexists(v) && sets_overlap(&v.paths, &c.paths))
+            .filter_map(|v| self.claims.get(v))
+            .filter(|v| v.holder != c.holder && coexists(v) && sets_overlap(&v.paths, &c.paths))
             .map(|v| v.id)
             .collect();
         self.claims.insert(id, c);
@@ -291,20 +331,30 @@ impl LeaseBook {
             self.root.insert(id, root);
             self.chain_head.insert(root, id);
             self.open_remove(&p);
-            // GATE-7 N22: the renewal keeps the root's place in line, so a
-            // rival that sorts after the root loses to it for good.
+            // The renewal keeps its root's place in line. A rival whose root
+            // sorts earlier beats it for good (GATE-8 N22); otherwise every
+            // rival sorting after the root loses to it for good (GATE-7 N22).
             let root_key = self.claims.get(&root).map(ClaimRec::key);
-            for v in rivals {
-                let vk = self.claims.get(&v).map(|r| (self.root_key(r), r.key()));
-                if let (Some(rk), Some(vk)) = (root_key, vk)
-                    && vk.0 > rk
-                {
+            let keyed: Vec<((OrderKey, OrderKey), EventId)> = rivals
+                .iter()
+                .filter_map(|v| self.claims.get(v))
+                .map(|r| ((self.root_key(r), r.key()), r.id))
+                .collect();
+            let earlier = keyed
+                .iter()
+                .filter(|(k, _)| root_key.is_some_and(|rk| k.0 < rk))
+                .min()
+                .map(|(_, v)| *v);
+            if let Some(k) = earlier {
+                self.dead.insert(id, k);
+            } else {
+                for (_, v) in keyed {
                     self.dead.insert(v, id);
                     self.open_remove(&v);
                 }
-            }
-            if !released && let Some(rec) = self.claims.get(&id).cloned() {
-                self.open_insert(&rec);
+                if !released && let Some(rec) = self.claims.get(&id).cloned() {
+                    self.open_insert(&rec);
+                }
             }
         } else if let Some(k) = rivals
             .iter()
