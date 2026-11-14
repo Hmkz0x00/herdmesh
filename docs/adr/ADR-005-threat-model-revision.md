@@ -17,3 +17,8 @@ Four review rounds (GATE-3..6) tried to make file leases hold against a *malicio
 - GATE-3..6 findings N3, N9, N12, N19 are closed by redesign (simpler code, deterministic, convergent); N13's remaining race is documented as out of scope.
 - A malicious member *can* briefly hold or contest a lease until the owner demotes them; honest agents still see who holds what.
 - Review gates now judge leases against the cooperative model and owner removal.
+
+## Addendum 1 (2026-11-14, after GATE-7 N20-N22)
+- **Removal is retroactive.** Views first resolve roles over the whole stored set: the pinned Genesis owner, then every `RoleGrant` in order-key order, each grantor judged by its role at that point. Only then are all other events applied, each judged by its author's **final** role. A removed (observer) member's claims, tasks, task updates and decisions are ignored, both the ones made before the grant and any backdated around it. Any newly stored role event triggers a full view rebuild. Raw signed history stays in the log.
+- **Losers stay losers, including after renewals.** A renewal keeps its root's place in line. On applying it, open coexisting overlapping claims of other holders that sort after the root are marked dead. They do not win again when the renewal is released.
+- **Expired history is cheap.** Expiry is checked before any renewal lookup, and the latest claim of each chain is indexed. Open claims are indexed per holder and per (holder, path), so replaying many coexisting claims from one holder does no pairwise scan. Per-query work is bounded by the claims live at `now`.

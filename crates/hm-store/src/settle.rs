@@ -179,24 +179,70 @@ pub struct Lease {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseBook {
     claims: BTreeMap<EventId, ClaimRec>,
-    /// claim id → lowest order key of a release from the claim's own node
-    /// (or, until the claim is known, from any node).
+    /// claim id → lowest order key of a release, per releasing node.
     releases: BTreeMap<EventId, BTreeMap<NodeId, OrderKey>>,
-    /// child → the claim it renews.
-    parent: BTreeMap<EventId, EventId>,
-    /// claim → latest renewal of it.
+    /// claim → its direct renewal.
     renewed_by: BTreeMap<EventId, EventId>,
     /// renewal → root of its chain.
     root: BTreeMap<EventId, EventId>,
+    /// root → latest claim of its chain.
+    chain_head: BTreeMap<EventId, EventId>,
     /// dead claim → the claim that beat it.
     dead: BTreeMap<EventId, EventId>,
     /// `(expires_at, id)` of open claims: not dead, released or renewed.
     open: BTreeSet<(u64, EventId)>,
+    /// The same open claims per holder.
+    open_by_holder: BTreeMap<AgentRef, BTreeSet<(u64, EventId)>>,
+    /// The same open claims per (holder, path), for renewal lookup.
+    open_by_path: BTreeMap<(AgentRef, String), BTreeSet<(u64, EventId)>>,
     /// Latest signed `ts` of any applied claim.
     max_ts: u64,
 }
 
+/// Range start for "expires after `t`" in a `(expires_at, id)` set.
+fn after(t: u64) -> (u64, EventId) {
+    (t.saturating_add(1), EventId::from_bytes([0; 32]))
+}
+
 impl LeaseBook {
+    fn open_insert(&mut self, c: &ClaimRec) {
+        let k = (c.expires_at_ms(), c.id);
+        self.open.insert(k);
+        self.open_by_holder
+            .entry(c.holder.clone())
+            .or_default()
+            .insert(k);
+        for p in &c.paths {
+            self.open_by_path
+                .entry((c.holder.clone(), p.clone()))
+                .or_default()
+                .insert(k);
+        }
+    }
+
+    fn open_remove(&mut self, id: &EventId) {
+        let Some(c) = self.claims.get(id) else { return };
+        let k = (c.expires_at_ms(), c.id);
+        if !self.open.remove(&k) {
+            return;
+        }
+        if let Some(s) = self.open_by_holder.get_mut(&c.holder) {
+            s.remove(&k);
+            if s.is_empty() {
+                self.open_by_holder.remove(&c.holder);
+            }
+        }
+        for p in &c.paths {
+            let pk = (c.holder.clone(), p.clone());
+            if let Some(s) = self.open_by_path.get_mut(&pk) {
+                s.remove(&k);
+                if s.is_empty() {
+                    self.open_by_path.remove(&pk);
+                }
+            }
+        }
+    }
+
     /// Apply a claim. Idempotent. Call in [`OrderKey`] order.
     pub fn add_claim(&mut self, c: ClaimRec) {
         if self.claims.contains_key(&c.id) {
@@ -209,43 +255,67 @@ impl LeaseBook {
             if exp > stale {
                 break;
             }
+            self.open_remove(&id);
+            // In case the record is gone; guarantees progress.
             self.open.remove(&(exp, id));
         }
         let (id, exp) = (c.id, c.expires_at_ms());
         let released = self.released(&c);
-        let coexisting: Vec<&ClaimRec> = self
-            .open
-            .range((c.ts.saturating_add(1), EventId::from_bytes([0; 32]))..)
-            .filter_map(|(_, v)| self.claims.get(v))
-            .filter(|v| v.ts < exp)
-            .collect();
-        let parent = coexisting
-            .iter()
-            .filter(|p| p.holder == c.holder && c.paths.iter().all(|x| p.paths.contains(x)))
-            .max_by_key(|p| p.key())
-            .map(|p| p.id);
-        let killer = coexisting
-            .iter()
-            .filter(|v| v.holder != c.holder && sets_overlap(&v.paths, &c.paths))
-            .min_by_key(|v| (self.root_key(v), v.key()))
-            .map(|v| v.id);
-        if let Some(p) = parent {
-            self.parent.insert(id, p);
-            self.renewed_by.insert(p, id);
-            let root = self.root.get(&p).copied().unwrap_or(p);
-            self.root.insert(id, root);
-            if let Some(pc) = self.claims.get(&p) {
-                self.open.remove(&(pc.expires_at_ms(), p));
-            }
-            if !released {
-                self.open.insert((exp, id));
-            }
-        } else if let Some(k) = killer {
-            self.dead.insert(id, k);
-        } else if !released {
-            self.open.insert((exp, id));
+        let coexists = |v: &ClaimRec| v.ts < exp && c.ts < v.expires_at_ms();
+        // Renewal: the most recent open, coexisting claim of the same
+        // holder naming every path of this one.
+        let parent = match c.paths.first() {
+            Some(p0) => self.open_by_path.get(&(c.holder.clone(), p0.clone())),
+            None => self.open_by_holder.get(&c.holder),
         }
+        .into_iter()
+        .flat_map(|s| s.range(after(c.ts)..))
+        .filter_map(|(_, v)| self.claims.get(v))
+        .filter(|p| coexists(p) && c.paths.iter().all(|x| p.paths.contains(x)))
+        .max_by_key(|p| p.key())
+        .map(|p| p.id);
+        // Open, coexisting, overlapping claims of other holders.
+        let rivals: Vec<EventId> = self
+            .open_by_holder
+            .iter()
+            .filter(|(h, _)| **h != c.holder)
+            .flat_map(|(_, s)| s.range(after(c.ts)..))
+            .filter_map(|(_, v)| self.claims.get(v))
+            .filter(|v| coexists(v) && sets_overlap(&v.paths, &c.paths))
+            .map(|v| v.id)
+            .collect();
         self.claims.insert(id, c);
+        if let Some(p) = parent {
+            let root = self.root.get(&p).copied().unwrap_or(p);
+            self.renewed_by.insert(p, id);
+            self.root.insert(id, root);
+            self.chain_head.insert(root, id);
+            self.open_remove(&p);
+            // GATE-7 N22: the renewal keeps the root's place in line, so a
+            // rival that sorts after the root loses to it for good.
+            let root_key = self.claims.get(&root).map(ClaimRec::key);
+            for v in rivals {
+                let vk = self.claims.get(&v).map(|r| (self.root_key(r), r.key()));
+                if let (Some(rk), Some(vk)) = (root_key, vk)
+                    && vk.0 > rk
+                {
+                    self.dead.insert(v, id);
+                    self.open_remove(&v);
+                }
+            }
+            if !released && let Some(rec) = self.claims.get(&id).cloned() {
+                self.open_insert(&rec);
+            }
+        } else if let Some(k) = rivals
+            .iter()
+            .filter_map(|v| self.claims.get(v))
+            .min_by_key(|v| (self.root_key(v), v.key()))
+            .map(|v| v.id)
+        {
+            self.dead.insert(id, k);
+        } else if !released && let Some(rec) = self.claims.get(&id).cloned() {
+            self.open_insert(&rec);
+        }
     }
 
     /// Record that node `by` released `claim` with an event of order `key`.
@@ -259,25 +329,23 @@ impl LeaseBook {
         if key < *e {
             *e = key;
         }
-        if let Some(c) = self.claims.get(&claim)
-            && c.holder.node == by
-        {
-            self.open.remove(&(c.expires_at_ms(), claim));
+        if self.claims.get(&claim).is_some_and(|c| c.holder.node == by) {
+            self.open_remove(&claim);
         }
     }
 
     /// ADR-005 §2: a node demoted to observer no longer holds anything. Its
     /// open claims are dropped (claims they beat stay beaten).
     pub fn retire_node(&mut self, node: &NodeId) {
-        let gone: Vec<(u64, EventId)> = self
-            .open
+        let gone: Vec<EventId> = self
+            .open_by_holder
             .iter()
-            .filter(|(_, id)| self.claims.get(id).is_some_and(|c| c.holder.node == *node))
-            .copied()
+            .filter(|(h, _)| h.node == *node)
+            .flat_map(|(_, s)| s.iter().map(|(_, id)| *id))
             .collect();
-        for k in gone {
-            self.open.remove(&k);
-            self.claims.remove(&k.1);
+        for id in gone {
+            self.open_remove(&id);
+            self.claims.remove(&id);
         }
     }
 
@@ -307,21 +375,18 @@ impl LeaseBook {
         self.root_rec(c).key()
     }
 
-    /// Latest renewal in `id`'s chain from `id` on.
+    /// Latest claim of `id`'s renewal chain (O(log n), no chain walk).
     fn head(&self, id: EventId) -> EventId {
-        let mut cur = id;
-        while let Some(n) = self.renewed_by.get(&cur) {
-            cur = *n;
-        }
-        cur
+        let root = self.root.get(&id).copied().unwrap_or(id);
+        self.chain_head.get(&root).copied().unwrap_or(id)
     }
 
     /// Open claims unexpired at `now`, in priority order, each with the
-    /// claim that beats it (if any).
+    /// claim that beats it (if any). Visits only claims unexpired at `now`.
     fn walk(&self, now: u64) -> Vec<(&ClaimRec, Option<EventId>)> {
         let mut live: Vec<&ClaimRec> = self
             .open
-            .range((now.saturating_add(1), EventId::from_bytes([0; 32]))..)
+            .range(after(now)..)
             .filter_map(|(_, id)| self.claims.get(id))
             .collect();
         live.sort_by_key(|c| (self.root_key(c), c.key()));
@@ -346,16 +411,18 @@ impl LeaseBook {
     }
 
     /// State of claim `id` at `now`. `None` if `id` is not a known claim.
+    /// Order: released, expired (checked before any chain lookup), renewed,
+    /// dead, then the walk over live claims.
     pub fn state_with(&self, id: &EventId, now: u64, settle_ms: u64) -> Option<ClaimState> {
         let target = self.claims.get(id)?;
         if self.released(target) {
             return Some(ClaimState::Released);
         }
-        if let Some(by) = self.renewed_by.get(id) {
-            return Some(ClaimState::Renewed { by: self.head(*by) });
-        }
         if target.expired(now) {
             return Some(ClaimState::Expired);
+        }
+        if self.renewed_by.contains_key(id) {
+            return Some(ClaimState::Renewed { by: self.head(*id) });
         }
         if let Some(k) = self.dead.get(id) {
             return Some(ClaimState::Lost {

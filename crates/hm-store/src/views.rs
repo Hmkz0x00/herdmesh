@@ -106,14 +106,68 @@ impl Views {
         self.leases.state(id, now_ms)
     }
 
-    /// Apply one event. Callers must apply events in ascending [`OrderKey`].
-    pub fn apply(&mut self, e: &Event) {
-        if let EventBody::Genesis { owner } = &e.body {
-            if self.genesis == Some(e.id) && self.owner.is_none() {
-                self.owner = Some(*owner);
-            } else {
-                self.ignored += 1;
+    /// Whether `e` can change anyone's role. Such events require a full
+    /// rebuild ([`Views::from_events`]): roles apply retroactively.
+    pub fn changes_roles(e: &Event) -> bool {
+        matches!(
+            e.body,
+            EventBody::Genesis { .. } | EventBody::RoleGrant { .. }
+        )
+    }
+
+    /// Views of a whole stored set, in ascending [`OrderKey`] (ADR-005
+    /// Addendum 1): first the pinned Genesis and every `RoleGrant` (in key
+    /// order, each grantor judged by its role at that point), then every
+    /// other event judged by its author's **final** role. A removed member's
+    /// claims, tasks, task updates and decisions are ignored whatever their
+    /// Lamport.
+    pub fn from_events(genesis: Option<EventId>, events: &[Event]) -> Self {
+        let mut v = Self::new(genesis);
+        for e in events.iter().filter(|e| Self::changes_roles(e)) {
+            v.apply_role(e);
+        }
+        for e in events.iter().filter(|e| !Self::changes_roles(e)) {
+            v.apply(e);
+        }
+        v
+    }
+
+    fn apply_role(&mut self, e: &Event) {
+        match &e.body {
+            EventBody::Genesis { owner } => {
+                if self.genesis == Some(e.id) && self.owner.is_none() {
+                    self.owner = Some(*owner);
+                } else {
+                    self.ignored += 1;
+                }
             }
+            EventBody::RoleGrant { node, role } => {
+                if !self.role_of(&e.author.node).may(e.kind()) {
+                    self.ignored += 1;
+                } else if self.owner.as_ref() != Some(node) {
+                    // The genesis owner can't be demoted.
+                    self.roles.insert(*node, *role);
+                    // ADR-005 §2: removal by demotion drops its leases.
+                    if *role == Role::Observer {
+                        self.leases.retire_node(node);
+                    }
+                    for (who, m) in &mut self.members {
+                        if who.node == *node && m.role.is_some() {
+                            m.role = Some(*role);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply one event in ascending [`OrderKey`] after every role event of
+    /// the set (see [`Views::from_events`]). A role event applied here only
+    /// updates roles going forward; callers rebuild instead.
+    pub fn apply(&mut self, e: &Event) {
+        if Self::changes_roles(e) {
+            self.apply_role(e);
             return;
         }
         let role = self.role_of(&e.author.node);
@@ -180,23 +234,8 @@ impl Views {
                 rationale: rationale.clone(),
                 refs: refs.clone(),
             }),
-            EventBody::RoleGrant { node, role } => {
-                // The genesis owner can't be demoted.
-                if self.owner.as_ref() != Some(node) {
-                    self.roles.insert(*node, *role);
-                    // ADR-005 §2: removal by demotion drops its leases.
-                    if *role == Role::Observer {
-                        self.leases.retire_node(node);
-                    }
-                    for (who, m) in &mut self.members {
-                        if who.node == *node && m.role.is_some() {
-                            m.role = Some(*role);
-                        }
-                    }
-                }
-            }
-            // Handled above.
-            EventBody::Genesis { .. } => {}
+            // Handled by `apply_role`.
+            EventBody::Genesis { .. } | EventBody::RoleGrant { .. } => {}
             // Read from the log directly; no materialized view yet.
             EventBody::Handoff { .. }
             | EventBody::Ask { .. }
