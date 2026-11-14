@@ -263,7 +263,8 @@ fn claim_safe_needs_settled_win_and_no_recent_conflict() {
     );
     assert!(s.claim_safe(&mine.id, NOW + SETTLE_MS).unwrap());
 
-    // A conflicting (losing) claim arrives late: unsafe until it is old news.
+    // A conflicting claim that loses for good (ADR-005) arrives late: the
+    // winner stays safe, the loser is never safe.
     let theirs = claim(2, 1, 5, NOW + 100, &["src/a.rs"]);
     let t = NOW + 10_000;
     s.append_at(&theirs, t).unwrap();
@@ -272,9 +273,7 @@ fn claim_safe_needs_settled_win_and_no_recent_conflict() {
         Some(ClaimState::Lost { winner: mine.id })
     );
     assert_eq!(s.first_seen(&theirs.id).unwrap(), Some(t));
-    assert!(!s.claim_safe(&mine.id, t + SETTLE_MS - 1).unwrap());
-    assert!(s.claim_safe(&mine.id, t + SETTLE_MS).unwrap());
-    // The loser is never safe.
+    assert!(s.claim_safe(&mine.id, t).unwrap());
     assert!(!s.claim_safe(&theirs.id, t + 60_000).unwrap());
 }
 

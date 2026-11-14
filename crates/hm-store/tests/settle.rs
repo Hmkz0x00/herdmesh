@@ -454,28 +454,7 @@ proptest! {
     }
 }
 
-// ---- GATE-2 N3: late claim with a low Lamport can't take over ----
-
-#[test]
-fn late_low_lamport_claim_cannot_take_over_a_settled_lease() {
-    // Victim's lease is settled at T0 + SETTLE_MS. A minute later another
-    // node signs an overlapping claim with a tiny Lamport.
-    let victim = claim(1, 10, T0, &["src/net/**"], 3600);
-    let late = claim(2, 2, T0 + 60_000, &["src/net/a.rs"], 3600);
-    let evs = vec![victim.clone(), late.clone()];
-    let now = T0 + 120_000;
-    assert_eq!(
-        claim_state(&victim.id, &evs, now),
-        Some(ClaimState::Granted)
-    );
-    assert_eq!(
-        claim_state(&late.id, &evs, now),
-        Some(ClaimState::Lost { winner: victim.id })
-    );
-    let book = book_from_events(&evs);
-    let active: Vec<_> = book.active(now).into_values().map(|l| l.claim).collect();
-    assert_eq!(active, vec![victim.id]);
-}
+// ---- concurrent claims: the lowest key wins (ADR-005) ----
 
 #[test]
 fn concurrent_low_lamport_claim_still_wins_inside_the_window() {

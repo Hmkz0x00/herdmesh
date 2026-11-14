@@ -184,6 +184,10 @@ impl Views {
                 // The genesis owner can't be demoted.
                 if self.owner.as_ref() != Some(node) {
                     self.roles.insert(*node, *role);
+                    // ADR-005 §2: removal by demotion drops its leases.
+                    if *role == Role::Observer {
+                        self.leases.retire_node(node);
+                    }
                     for (who, m) in &mut self.members {
                         if who.node == *node && m.role.is_some() {
                             m.role = Some(*role);
