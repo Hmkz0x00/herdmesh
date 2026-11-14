@@ -156,13 +156,15 @@ fn shrinking_renewal_cannot_take_a_settled_lease() {
     let x = claim(2, 1, 5, T + 10_000, &["a"], 3600);
     s.append_batch_at(&[w, a1, x.clone()], T + 10_000).unwrap();
     assert_eq!(holder(&s, "a", T + 20_000), Some(x.id));
-    // a1's holder drops b: the renewal would inherit a1's place in line.
+    // a1's holder drops b: the renewal would inherit a1's place in line,
+    // but a1 is dead (Addendum 3), so its renewal is dead too.
     let a2 = claim(1, 2, 6, T + 20_000, &["a"], 3600);
-    assert!(matches!(
-        s.append_at(&a2, T + 20_000),
-        Err(StoreError::LeaseTakeover)
+    let _ = s.append_at(&a2, T + 20_000);
+    assert!(!matches!(
+        s.claim_state(&a2.id, T + 30_000).unwrap(),
+        Some(ClaimState::Granted | ClaimState::Pending)
     ));
-    assert_eq!(holder(&s, "a", T + 20_000), Some(x.id));
+    assert_eq!(holder(&s, "a", T + 30_000), Some(x.id));
 }
 
 #[test]

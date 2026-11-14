@@ -18,15 +18,15 @@
 //! 3. `lamport > local max + MAX_LAMPORT_JUMP` → rejected;
 //! 4. same (author, seq) with a different id → equivocation: the lowest id
 //!    is kept, a mark is recorded;
-//! 5. a `LeaseClaim` that would take a lease already settled here is
-//!    refused (ADR-002 Addendum 2, [`takes_settled_lease`]).
+//! 5. a claim, release or twin swap that would take a lease already
+//!    settled here is refused (ADR-002 Addenda 2-3, [`takes_settled_lease`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hm_proto::limits::{MAX_EVENT_BYTES, MAX_FUTURE_SKEW_MS, MAX_LAMPORT_JUMP};
-use hm_proto::{AgentRef, Event, EventBody, EventId, EventKind, EventSig, Lamport, NodeId, RoomId};
+use hm_proto::{AgentRef, Event, EventBody, EventId, EventSig, Lamport, NodeId, RoomId};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::StoreError;
@@ -345,24 +345,31 @@ fn first_seen_at(conn: &Connection, id: &EventId) -> Result<Option<u64>, StoreEr
     v.map(|v| u64_of(v, "first_seen")).transpose()
 }
 
-/// Lease admission (ADR-002 Addendum 2): whether storing claim `e` at `now`
-/// would make a claim of another holder stop winning whose root this node
-/// first saw at least [`SETTLE_MS`] ago. Judged against `before`: the lease
-/// book without anything first seen at or after `now`, so events arriving
-/// in the same instant never refuse each other and their order can't change
-/// what is stored. Missing first-seen rows count as settled.
+/// Lease admission (ADR-002 Addenda 2-3): whether storing `e` at `now`
+/// (and, for a lower-id twin, deleting the stored event `replaces`) would
+/// make a winning claim stop winning whose root this node first saw at least
+/// [`SETTLE_MS`] ago. Applies to claims, releases and twin swaps; the claim's
+/// own holder and the claim a release targets are exempt. Judged against
+/// `before`: the lease book without anything first seen at or after `now`,
+/// so events arriving in the same instant never refuse each other and their
+/// order can't change what is stored. Missing first-seen rows count as
+/// settled.
 fn takes_settled_lease(
     conn: &Connection,
     views: &Views,
     before: &mut Option<LeaseBook>,
     e: &Event,
+    replaces: Option<EventId>,
     now: u64,
 ) -> Result<bool, StoreError> {
-    let Some(c) = ClaimRec::from_event(e) else {
-        return Ok(false);
+    // Views ignore it if its author may not send it.
+    let counts = views.role_of(&e.author.node).may(e.kind());
+    let claim = ClaimRec::from_event(e).filter(|_| counts);
+    let released = match &e.body {
+        EventBody::LeaseRelease { claim } if counts => Some(*claim),
+        _ => None,
     };
-    // Views ignore it anyway.
-    if !views.role_of(&e.author.node).may(EventKind::LeaseClaim) {
+    if claim.is_none() && released.is_none() && replaces.is_none() {
         return Ok(false);
     }
     let book = match before {
@@ -379,8 +386,34 @@ fn takes_settled_lease(
             before.insert(b)
         }
     };
-    for v in book.displaced_by(&c, now) {
-        let root = book.root_of(&v).unwrap_or(v);
+    let removes = replaces.filter(|old| book.event_ids().any(|id| id == *old));
+    if claim.is_none() && released.is_none() && removes.is_none() {
+        return Ok(false);
+    }
+    let was = book.winners(now);
+    if was.is_empty() {
+        return Ok(false);
+    }
+    let mut after = book.clone();
+    if let Some(old) = removes {
+        after.retain(|id| *id != old);
+    }
+    if let Some(c) = &claim {
+        after.add_claim(c.clone());
+    }
+    if let Some(target) = released {
+        after.add_release(e.author.node, order_key(e), target);
+    }
+    let now_winning = after.winners(now);
+    for v in was.difference(&now_winning) {
+        let exempt = released == Some(*v)
+            || claim
+                .as_ref()
+                .is_some_and(|c| book.claim(v).is_some_and(|w| w.holder == c.holder));
+        if exempt {
+            continue;
+        }
+        let root = book.root_of(v).unwrap_or(*v);
         let settled =
             first_seen_at(conn, &root)?.is_none_or(|at| at.saturating_add(SETTLE_MS) <= now);
         if settled {
@@ -838,7 +871,7 @@ impl Store {
                         disp[i] = Disp::Dropped;
                         continue;
                     }
-                    if takes_settled_lease(&tx, &self.views, &mut before, e, now)? {
+                    if takes_settled_lease(&tx, &self.views, &mut before, e, Some(old), now)? {
                         disp[i] = Disp::Takeover;
                         continue;
                     }
@@ -849,7 +882,7 @@ impl Store {
                     disp[i] = Disp::Replaced;
                 }
                 None => {
-                    if takes_settled_lease(&tx, &self.views, &mut before, e, now)? {
+                    if takes_settled_lease(&tx, &self.views, &mut before, e, None, now)? {
                         disp[i] = Disp::Takeover;
                         continue;
                     }

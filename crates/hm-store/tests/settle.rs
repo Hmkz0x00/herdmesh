@@ -211,16 +211,22 @@ fn claim_expires_after_ttl() {
 }
 
 #[test]
-fn expired_winner_no_longer_blocks() {
+fn expired_winner_frees_the_path_only_for_later_claims() {
+    // ADR-002 Addendum 3: b lost while a was live and stays dead.
     let a = claim(1, 1, T0, &["src/**"], 10);
     let b = claim(2, 2, T0 + 5_000, &["src/a.rs"], 600);
-    let evs = vec![a.clone(), b.clone()];
+    let c = claim(3, 3, T0 + 10_000, &["src/a.rs"], 600);
+    let evs = vec![a.clone(), b.clone(), c.clone()];
     assert_eq!(
         claim_state(&b.id, &evs, T0 + 9_000),
         Some(ClaimState::Lost { winner: a.id })
     );
     assert_eq!(
-        claim_state(&b.id, &evs, T0 + 10_000),
+        claim_state(&b.id, &evs, T0 + 20_000),
+        Some(ClaimState::Lost { winner: a.id })
+    );
+    assert_eq!(
+        claim_state(&c.id, &evs, T0 + 20_000),
         Some(ClaimState::Granted)
     );
 }
@@ -263,12 +269,17 @@ fn release_targets_only_the_named_claim() {
 }
 
 #[test]
-fn released_winner_unblocks_loser() {
+fn released_winner_does_not_promote_its_loser() {
+    // ADR-002 Addendum 3: the loser must claim again after the release.
     let a = claim(1, 1, T0, &["src/**"], 600);
     let b = claim(2, 2, T0, &["src/a.rs"], 600);
     let r = release(1, 3, T0 + 100, &a);
-    let evs = vec![a, b.clone(), r];
-    assert_eq!(claim_state(&b.id, &evs, SETTLED), Some(ClaimState::Granted));
+    let evs = vec![a.clone(), b.clone(), r];
+    assert_eq!(
+        claim_state(&b.id, &evs, SETTLED),
+        Some(ClaimState::Lost { winner: a.id })
+    );
+    assert!(book_from_events(&evs).active(SETTLED).is_empty());
 }
 
 #[test]
