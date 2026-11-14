@@ -426,7 +426,7 @@ fn admission_refusals(
     }
     let mut settled = BTreeSet::new();
     for v in base.winners(now) {
-        let root = base.root_of(&v).unwrap_or(v);
+        let root = base.root_of(&v, now).unwrap_or(v);
         if first_seen_at(conn, &root)?.is_none_or(|at| at.saturating_add(SETTLE_MS) <= now) {
             settled.insert(v);
         }
@@ -435,7 +435,7 @@ fn admission_refusals(
         return Ok(refused);
     }
     // Canonical order: highest order key first.
-    changes.sort_by(|a, b| order_key(b.new).cmp(&order_key(a.new)));
+    changes.sort_by_key(|c| std::cmp::Reverse(order_key(c.new)));
     let displaced = |acc: &[&Change<'_>]| -> BTreeSet<EventId> {
         let after = apply_changes(base, views, acc);
         settled
