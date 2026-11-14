@@ -68,6 +68,9 @@ enum Cmd {
         /// Don't ask before writing files.
         #[arg(long)]
         yes: bool,
+        /// Show which agent CLIs are detected and which file each would get, then exit.
+        #[arg(long)]
+        list_clients: bool,
     },
     /// Live board of members, leases, tasks and inbox (herdr plugin pane).
     Board {
@@ -463,7 +466,15 @@ fn main() -> ExitCode {
             kind.as_deref(),
             room.as_deref(),
         ),
-        Cmd::Setup { join, name, yes } => setup_main(
+        Cmd::Setup {
+            list_clients: true, ..
+        } => {
+            print!("{}", setup::list_clients());
+            ExitCode::SUCCESS
+        }
+        Cmd::Setup {
+            join, name, yes, ..
+        } => setup_main(
             data_dir(cli.data_dir).map(|d| d.allow_insecure_key(cli.allow_insecure_key)),
             join,
             name,
@@ -585,7 +596,8 @@ mod tests {
             Cmd::Setup {
                 join: None,
                 name: None,
-                yes: false
+                yes: false,
+                list_clients: false
             }
         ));
         let c = Cli::try_parse_from(["herdmesh", "setup", "--join", "--yes"]).unwrap();
