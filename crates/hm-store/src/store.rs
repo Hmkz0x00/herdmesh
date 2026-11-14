@@ -19,7 +19,7 @@
 //! 4. same (author, seq) with a different id → equivocation: the lowest id
 //!    is kept, a mark is recorded;
 //! 5. a claim, release or twin swap that would take a lease already
-//!    settled here is refused (ADR-002 Addenda 2-3, [`takes_settled_lease`]).
+//!    settled here is refused (ADR-002 Addenda 2-3, [`admission_refusals`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -179,6 +179,9 @@ pub struct Store {
     views: Views,
     last_key: Option<OrderKey>,
     pending: Vec<Event>,
+    /// Last local admission instant; each ingest call gets a later one
+    /// (ADR-002 Addendum 4).
+    last_admit: u64,
 }
 
 impl std::fmt::Debug for Store {
@@ -345,82 +348,131 @@ fn first_seen_at(conn: &Connection, id: &EventId) -> Result<Option<u64>, StoreEr
     v.map(|v| u64_of(v, "first_seen")).transpose()
 }
 
-/// Lease admission (ADR-002 Addenda 2-3): whether storing `e` at `now`
-/// (and, for a lower-id twin, deleting the stored event `replaces`) would
-/// make a winning claim stop winning whose root this node first saw at least
-/// [`SETTLE_MS`] ago. Applies to claims, releases and twin swaps; the claim's
-/// own holder and the claim a release targets are exempt. Judged against
-/// `before`: the lease book without anything first seen at or after `now`,
-/// so events arriving in the same instant never refuse each other and their
-/// order can't change what is stored. Missing first-seen rows count as
-/// settled.
-fn takes_settled_lease(
-    conn: &Connection,
-    views: &Views,
-    before: &mut Option<LeaseBook>,
-    e: &Event,
-    replaces: Option<EventId>,
-    now: u64,
-) -> Result<bool, StoreError> {
-    // Views ignore it if its author may not send it.
-    let counts = views.role_of(&e.author.node).may(e.kind());
-    let claim = ClaimRec::from_event(e).filter(|_| counts);
-    let released = match &e.body {
-        EventBody::LeaseRelease { claim } if counts => Some(*claim),
-        _ => None,
-    };
-    if claim.is_none() && released.is_none() && replaces.is_none() {
-        return Ok(false);
+/// One (author, seq) slot a batch would change: `new` replaces `old`.
+struct Change<'a> {
+    new: &'a Event,
+    old: Option<EventId>,
+}
+
+fn apply_changes(base: &LeaseBook, views: &Views, changes: &[&Change<'_>]) -> LeaseBook {
+    let mut book = base.clone();
+    let gone: BTreeSet<EventId> = changes.iter().filter_map(|c| c.old).collect();
+    if !gone.is_empty() {
+        book.retain(|id| !gone.contains(id));
     }
-    let book = match before {
-        Some(b) => b,
-        None => {
-            let mut recent = BTreeSet::new();
-            for id in views.leases.event_ids() {
-                if first_seen_at(conn, &id)?.is_some_and(|at| at >= now) {
-                    recent.insert(id);
-                }
-            }
-            let mut b = views.leases.clone();
-            b.retain(|id| !recent.contains(id));
-            before.insert(b)
-        }
-    };
-    let removes = replaces.filter(|old| book.event_ids().any(|id| id == *old));
-    if claim.is_none() && released.is_none() && removes.is_none() {
-        return Ok(false);
-    }
-    let was = book.winners(now);
-    if was.is_empty() {
-        return Ok(false);
-    }
-    let mut after = book.clone();
-    if let Some(old) = removes {
-        after.retain(|id| *id != old);
-    }
-    if let Some(c) = &claim {
-        after.add_claim(c.clone());
-    }
-    if let Some(target) = released {
-        after.add_release(e.author.node, order_key(e), target);
-    }
-    let now_winning = after.winners(now);
-    for v in was.difference(&now_winning) {
-        let exempt = released == Some(*v)
-            || claim
-                .as_ref()
-                .is_some_and(|c| book.claim(v).is_some_and(|w| w.holder == c.holder));
-        if exempt {
+    for c in changes {
+        let e = c.new;
+        if !views.role_of(&e.author.node).may(e.kind()) {
             continue;
         }
-        let root = book.root_of(v).unwrap_or(*v);
-        let settled =
-            first_seen_at(conn, &root)?.is_none_or(|at| at.saturating_add(SETTLE_MS) <= now);
-        if settled {
-            return Ok(true);
+        match &e.body {
+            EventBody::LeaseClaim { .. } => {
+                if let Some(r) = ClaimRec::from_event(e) {
+                    book.add_claim(r);
+                }
+            }
+            EventBody::LeaseRelease { claim } => {
+                book.add_release(e.author.node, order_key(e), *claim);
+            }
+            _ => {}
         }
     }
-    Ok(false)
+    book
+}
+
+/// Lease admission (ADR-002 Addenda 2-4): the ids among `todo` to refuse
+/// because, together, the batch's lease changes (claims, releases, twin
+/// swaps) would unseat a winner whose root this node first saw at least
+/// [`SETTLE_MS`] before `now`. The pre-call book holds exactly the earlier
+/// admission instants. Offenders are removed one at a time, in descending
+/// order key, until no settled winner is displaced; the result depends on
+/// the batch as a set, not its order. A winner that ends up `Released` by
+/// its own node or `Renewed` by its holder is not displaced.
+fn admission_refusals(
+    conn: &Connection,
+    views: &Views,
+    all: &[Event],
+    todo: &[usize],
+    now: u64,
+) -> Result<BTreeSet<EventId>, StoreError> {
+    let base = &views.leases;
+    let lease_ids: BTreeSet<EventId> = base.event_ids().collect();
+    // Final event per (author, seq): the lowest id among stored and offered.
+    let mut slots: BTreeMap<(NodeId, u64), &Event> = BTreeMap::new();
+    for &i in todo {
+        let e = &all[i];
+        let cur = slots.entry((e.author.node, e.seq)).or_insert(e);
+        if e.id < cur.id {
+            *cur = e;
+        }
+    }
+    let mut changes: Vec<Change<'_>> = Vec::new();
+    for ((node, seq), e) in slots {
+        let old = id_at(conn, &node, seq)?;
+        if old.is_some_and(|o| o <= e.id) {
+            continue;
+        }
+        let relevant = matches!(
+            e.body,
+            EventBody::LeaseClaim { .. } | EventBody::LeaseRelease { .. }
+        ) || old.is_some_and(|o| lease_ids.contains(&o));
+        if relevant {
+            changes.push(Change { new: e, old });
+        }
+    }
+    let mut refused = BTreeSet::new();
+    if changes.is_empty() {
+        return Ok(refused);
+    }
+    let mut settled = BTreeSet::new();
+    for v in base.winners(now) {
+        let root = base.root_of(&v, now).unwrap_or(v);
+        if first_seen_at(conn, &root)?.is_none_or(|at| at.saturating_add(SETTLE_MS) <= now) {
+            settled.insert(v);
+        }
+    }
+    if settled.is_empty() {
+        return Ok(refused);
+    }
+    // Canonical order: highest order key first.
+    changes.sort_by_key(|c| std::cmp::Reverse(order_key(c.new)));
+    let displaced = |acc: &[&Change<'_>]| -> BTreeSet<EventId> {
+        let after = apply_changes(base, views, acc);
+        settled
+            .iter()
+            .filter(|v| {
+                !matches!(
+                    after.state(v, now),
+                    Some(
+                        ClaimState::Granted
+                            | ClaimState::Pending
+                            | ClaimState::Released
+                            | ClaimState::Renewed { .. }
+                    )
+                )
+            })
+            .copied()
+            .collect()
+    };
+    let mut acc: Vec<&Change<'_>> = changes.iter().collect();
+    loop {
+        let d = displaced(&acc);
+        if d.is_empty() {
+            break;
+        }
+        let pick = (0..acc.len())
+            .find(|&i| {
+                let mut rest = acc.clone();
+                rest.remove(i);
+                displaced(&rest).len() < d.len()
+            })
+            .unwrap_or(0);
+        refused.insert(acc.remove(pick).new.id);
+        if acc.is_empty() {
+            break;
+        }
+    }
+    Ok(refused)
 }
 
 /// Stores from before per-author seqs (wire v1) can't be migrated: their
@@ -668,12 +720,19 @@ impl Store {
             Some((v, last)) if v.genesis == genesis => (v, last),
             _ => rebuild(&conn, room, genesis)?,
         };
+        let last: Option<Vec<u8>> =
+            conn.query_row("SELECT MAX(at) FROM first_seen", [], |r| r.get(0))?;
+        let last_admit = last
+            .map(|v| u64_of(v, "first_seen"))
+            .transpose()?
+            .unwrap_or(0);
         Ok(Self {
             conn,
             room,
             views,
             last_key,
             pending: Vec::new(),
+            last_admit,
         })
     }
 
@@ -837,13 +896,15 @@ impl Store {
         }
         todo.sort_by_key(|&i| order_key(&all[i]));
 
+        // This call's admission instant: strictly after every earlier call.
+        let at = now.max(self.last_admit.saturating_add(1));
+        self.last_admit = at;
         let tx = self.conn.transaction()?;
+        let refused = admission_refusals(&tx, &self.views, &all, &todo, now)?;
         let mut max = max_lamport(&tx)?.unwrap_or(0);
         let mut added: Vec<usize> = Vec::new();
         let mut replaced = false;
         let mut touched = BTreeSet::new();
-        // Lease book as of strictly before `now`, built on first use.
-        let mut before: Option<LeaseBook> = None;
         for i in todo {
             let e = &all[i];
             if e.lamport.0 > max.saturating_add(MAX_LAMPORT_JUMP) {
@@ -871,7 +932,7 @@ impl Store {
                         disp[i] = Disp::Dropped;
                         continue;
                     }
-                    if takes_settled_lease(&tx, &self.views, &mut before, e, Some(old), now)? {
+                    if refused.contains(&e.id) {
                         disp[i] = Disp::Takeover;
                         continue;
                     }
@@ -882,7 +943,7 @@ impl Store {
                     disp[i] = Disp::Replaced;
                 }
                 None => {
-                    if takes_settled_lease(&tx, &self.views, &mut before, e, None, now)? {
+                    if refused.contains(&e.id) {
                         disp[i] = Disp::Takeover;
                         continue;
                     }
@@ -892,7 +953,7 @@ impl Store {
                 }
             }
             tx.prepare_cached("INSERT OR IGNORE INTO first_seen (id, at) VALUES (?1, ?2)")?
-                .execute(params![e.id.as_bytes().to_vec(), be(now)])?;
+                .execute(params![e.id.as_bytes().to_vec(), be(at)])?;
             max = max.max(e.lamport.0);
             touched.insert(e.author.node);
         }

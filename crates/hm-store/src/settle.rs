@@ -50,7 +50,7 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use hm_proto::limits::MAX_LEASE_TTL_SECS;
 use hm_proto::{AgentRef, Event, EventBody, EventId, Lamport, NodeId};
@@ -179,31 +179,61 @@ pub struct Lease {
 }
 
 /// All claims and releases seen, as signed data. Answers are computed per
-/// call from `now`; nothing time-based is stored. The derived index
-/// (renewals, roots, deadness) is cached per book state, never serialized.
+/// call from `now`; nothing time-based is stored. Derived data (an expiry
+/// index, and renewals/roots/deadness per horizon bucket) is cached, never
+/// serialized (ADR-002 Addendum 4).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseBook {
     claims: BTreeMap<EventId, ClaimRec>,
     /// claim id → per releasing node, the lowest order key of its releases.
     releases: BTreeMap<EventId, BTreeMap<NodeId, OrderKey>>,
     #[serde(skip)]
+    expiry: ExpiryCell,
+    #[serde(skip)]
     index: IndexCell,
 }
 
-/// Lazily built [`Index`]; reset on every change. Always compares equal,
-/// so it never affects view equality.
+/// `(expires_at, id)` of every claim: built once, then kept up to date.
 #[derive(Default)]
-struct IndexCell(OnceLock<Arc<Index>>);
+struct ExpiryCell(OnceLock<BTreeSet<(u64, EventId)>>);
 
-impl Clone for IndexCell {
+/// The [`Index`] for one horizon bucket. Reset only by changes that can
+/// matter inside that horizon.
+#[derive(Default)]
+struct IndexCell(Mutex<Option<(u64, Arc<Index>)>>);
+
+impl IndexCell {
+    fn get(&self) -> std::sync::MutexGuard<'_, Option<(u64, Arc<Index>)>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Clone for ExpiryCell {
     fn clone(&self) -> Self {
         let cell = OnceLock::new();
         if let Some(i) = self.0.get() {
-            let _ = cell.set(Arc::clone(i));
+            let _ = cell.set(i.clone());
         }
         Self(cell)
     }
 }
+
+impl Clone for IndexCell {
+    fn clone(&self) -> Self {
+        Self(Mutex::new(self.get().clone()))
+    }
+}
+
+/// Caches always compare equal, so they never affect view equality.
+impl PartialEq for ExpiryCell {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ExpiryCell {}
 
 impl PartialEq for IndexCell {
     fn eq(&self, _: &Self) -> bool {
@@ -213,13 +243,30 @@ impl PartialEq for IndexCell {
 
 impl Eq for IndexCell {}
 
+impl std::fmt::Debug for ExpiryCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExpiryCell")
+    }
+}
+
 impl std::fmt::Debug for IndexCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("IndexCell")
     }
 }
 
-/// Everything about the book that does not depend on `now`.
+/// Bucket size of the lease horizon.
+const HORIZON_BUCKET_MS: u64 = 3_600_000;
+
+/// Claims whose lifetime ended at or before this are ignored at `now`:
+/// `floor((now - 2 * MAX_LEASE_TTL) / 1h) * 1h` (ADR-002 Addendum 4).
+pub fn horizon(now: u64) -> u64 {
+    let h = now.saturating_sub(2 * MAX_LEASE_TTL_MS);
+    h - h % HORIZON_BUCKET_MS
+}
+
+/// Everything about the claims inside one horizon that does not depend on
+/// the exact `now`.
 #[derive(Debug, Default)]
 struct Index {
     /// child → parent it renews.
@@ -239,14 +286,20 @@ struct Index {
 const MAX_LEASE_TTL_MS: u64 = MAX_LEASE_TTL_SECS as u64 * 1000;
 
 impl Index {
-    fn build(book: &LeaseBook) -> Self {
+    fn build(book: &LeaseBook, horizon: u64) -> Self {
+        // Only claims whose lifetime ends after the horizon.
+        let relevant: Vec<&ClaimRec> = book
+            .expiry()
+            .range((horizon.saturating_add(1), EventId::from_bytes([0; 32]))..)
+            .filter_map(|(_, id)| book.claims.get(id))
+            .collect();
         // Candidate renewal links: most recent earlier claim of the same
         // holder this one can renew. A renewal never grows the path set
         // (GATE-3 N9): wider is a new claim.
         let mut parent: BTreeMap<EventId, EventId> = BTreeMap::new();
         let mut children: BTreeMap<EventId, BTreeSet<(OrderKey, EventId)>> = BTreeMap::new();
         let mut by_holder: BTreeMap<&AgentRef, Vec<&ClaimRec>> = BTreeMap::new();
-        for c in book.claims.values() {
+        for c in &relevant {
             by_holder.entry(&c.holder).or_default().push(c);
         }
         for list in by_holder.values_mut() {
@@ -267,7 +320,7 @@ impl Index {
             }
         }
         let mut root: BTreeMap<EventId, EventId> = BTreeMap::new();
-        for c in book.claims.values() {
+        for c in &relevant {
             let mut cur = c.id;
             // Parent keys strictly decrease, so this terminates.
             while let Some(p) = parent.get(&cur) {
@@ -288,11 +341,10 @@ impl Index {
         // sorts earlier is decided first. A re-claim of a dead claim is cut
         // loose to start its own chain, which moves it (and its renewals)
         // later in the order.
-        let mut by_ts: Vec<&ClaimRec> = book.claims.values().collect();
+        let mut by_ts: Vec<&ClaimRec> = relevant.clone();
         by_ts.sort_by_key(|c| (c.ts, c.id));
-        let mut heap: BinaryHeap<Reverse<((OrderKey, OrderKey), EventId)>> = book
-            .claims
-            .values()
+        let mut heap: BinaryHeap<Reverse<((OrderKey, OrderKey), EventId)>> = relevant
+            .iter()
             .map(|c| Reverse((order(&root, c), c.id)))
             .collect();
         let mut done: BTreeSet<EventId> = BTreeSet::new();
@@ -368,11 +420,7 @@ impl Index {
         }
         ix.parent = parent;
         ix.root = root.into_iter().filter(|(c, r)| c != r).collect();
-        ix.by_expiry = book
-            .claims
-            .values()
-            .map(|c| (c.expires_at_ms(), c.id))
-            .collect();
+        ix.by_expiry = relevant.iter().map(|c| (c.expires_at_ms(), c.id)).collect();
         ix.by_expiry.sort_by(|a, b| b.cmp(a));
         ix
     }
@@ -422,41 +470,67 @@ impl Globs {
 }
 
 impl LeaseBook {
-    fn index(&self) -> &Index {
-        self.index.0.get_or_init(|| Arc::new(Index::build(self)))
+    fn expiry(&self) -> &BTreeSet<(u64, EventId)> {
+        self.expiry.0.get_or_init(|| {
+            self.claims
+                .values()
+                .map(|c| (c.expires_at_ms(), c.id))
+                .collect()
+        })
     }
 
-    fn touched(&mut self) {
-        self.index = IndexCell::default();
+    /// The index for `now`'s horizon bucket, built over that horizon only.
+    fn index(&self, now: u64) -> Arc<Index> {
+        let h = horizon(now);
+        let mut cell = self.index.get();
+        if let Some((ch, ix)) = cell.as_ref()
+            && *ch == h
+        {
+            return Arc::clone(ix);
+        }
+        let ix = Arc::new(Index::build(self, h));
+        *cell = Some((h, Arc::clone(&ix)));
+        ix
     }
 
-    fn root_rec<'a>(&'a self, c: &'a ClaimRec) -> &'a ClaimRec {
-        self.index()
-            .root
+    /// Drop the cached index unless the change only touches a claim whose
+    /// lifetime ended at or before the cached horizon.
+    fn touched(&mut self, ends: Option<u64>) {
+        let cell = self
+            .index
+            .0
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inert = matches!((ends, cell.as_ref()), (Some(e), Some((h, _))) if e <= *h);
+        if !inert {
+            *cell = None;
+        }
+    }
+
+    fn root_rec<'a>(&'a self, ix: &Index, c: &'a ClaimRec) -> &'a ClaimRec {
+        ix.root
             .get(&c.id)
             .and_then(|r| self.claims.get(r))
             .unwrap_or(c)
     }
 
-    /// Unexpired at `now`, latest expiry first; O(unexpired), not history.
-    fn unexpired(&self, now: u64) -> impl Iterator<Item = &ClaimRec> {
-        self.index()
-            .by_expiry
+    /// Unexpired at `now`, latest expiry first; O(inside horizon).
+    fn unexpired(&self, ix: &Index, now: u64) -> Vec<&ClaimRec> {
+        ix.by_expiry
             .iter()
-            .take_while(move |(exp, _)| *exp > now)
+            .take_while(|(exp, _)| *exp > now)
             .filter_map(|(_, id)| self.claims.get(id))
+            .collect()
     }
 
-    fn live(&self, c: &ClaimRec, now: u64) -> bool {
-        !self.released_before(c, None)
-            && !self.index().renewed_by.contains_key(&c.id)
-            && !c.expired(now)
+    fn live(&self, ix: &Index, c: &ClaimRec, now: u64) -> bool {
+        !self.released_before(c, None) && !ix.renewed_by.contains_key(&c.id) && !c.expired(now)
     }
 
     /// Latest renewal in `id`'s chain from `id` on.
-    fn head(&self, id: EventId) -> EventId {
+    fn head(ix: &Index, id: EventId) -> EventId {
         let mut cur = id;
-        while let Some(n) = self.index().renewed_by.get(&cur) {
+        while let Some(n) = ix.renewed_by.get(&cur) {
             cur = *n;
         }
         cur
@@ -465,14 +539,16 @@ impl LeaseBook {
     /// Live, non-dead claims at `now` in priority order, each with the claim
     /// that beats it (if any).
     fn walk(&self, now: u64) -> Vec<(&ClaimRec, Option<EventId>)> {
-        let ix = self.index();
+        let ix = self.index(now);
+        let ix = ix.as_ref();
         let mut live: Vec<(OrderKey, &ClaimRec)> = self
-            .unexpired(now)
-            .filter(|c| self.live(c, now) && !ix.dead.contains_key(&c.id))
-            .map(|c| (self.root_rec(c).key(), c))
+            .unexpired(ix, now)
+            .into_iter()
+            .filter(|c| self.live(ix, c, now) && !ix.dead.contains_key(&c.id))
+            .map(|c| (self.root_rec(ix, c).key(), c))
             .collect();
         live.sort_by_key(|(root, c)| (*root, c.key()));
-        let root_ts = |c: &ClaimRec| self.root_rec(c).ts;
+        let root_ts = |c: &ClaimRec| self.root_rec(ix, c).ts;
         let mut winners: Vec<&ClaimRec> = Vec::new();
         let mut out = Vec::with_capacity(live.len());
         for (i, &(_, c)) in live.iter().enumerate() {
@@ -503,11 +579,17 @@ impl LeaseBook {
 
     /// Record a claim. Idempotent.
     pub fn add_claim(&mut self, c: ClaimRec) {
+        let ends = c.expires_at_ms();
+        if let Some(set) = self.expiry.0.get_mut() {
+            set.insert((ends, c.id));
+        }
         self.claims.insert(c.id, c);
-        self.touched();
+        self.touched(Some(ends));
     }
 
     /// Record that node `by` released `claim` with an event of order `key`.
+    /// A release of an unknown claim, or from a node other than the
+    /// claim's, can't change any answer and keeps the cache.
     pub fn add_release(&mut self, by: NodeId, key: OrderKey, claim: EventId) {
         let e = self
             .releases
@@ -515,21 +597,31 @@ impl LeaseBook {
             .or_default()
             .entry(by)
             .or_insert(key);
-        if key < *e {
+        let lowered = key < *e;
+        if lowered {
             *e = key;
         }
-        self.touched();
+        match self.claims.get(&claim) {
+            Some(c) if c.holder.node == by => {
+                let ends = c.expires_at_ms();
+                self.touched(Some(ends));
+            }
+            _ => {}
+        }
     }
 
     /// Keep only the claims, and the releases, whose own event id passes
     /// `keep`. A dropped release removes that node's release of the claim.
     pub fn retain(&mut self, keep: impl Fn(&EventId) -> bool) {
         self.claims.retain(|id, _| keep(id));
+        if let Some(set) = self.expiry.0.get_mut() {
+            set.retain(|(_, id)| keep(id));
+        }
         for by_node in self.releases.values_mut() {
             by_node.retain(|_, (_, _, id)| keep(id));
         }
         self.releases.retain(|_, by_node| !by_node.is_empty());
-        self.touched();
+        self.touched(None);
     }
 
     /// Event ids of every claim and every recorded release.
@@ -549,9 +641,11 @@ impl LeaseBook {
 
     /// The claim at the start of `id`'s renewal chain (`id` itself if it
     /// renews nothing). `None` if `id` is not a known claim.
-    pub fn root_of(&self, id: &EventId) -> Option<EventId> {
+    /// Uses the index for `now`'s horizon.
+    pub fn root_of(&self, id: &EventId, now: u64) -> Option<EventId> {
         let c = self.claims.get(id)?;
-        Some(self.root_rec(c).id)
+        let ix = self.index(now);
+        Some(self.root_rec(&ix, c).id)
     }
 
     pub fn claim(&self, id: &EventId) -> Option<&ClaimRec> {
@@ -581,7 +675,11 @@ impl LeaseBook {
         if self.released_before(target, None) {
             return Some(ClaimState::Released);
         }
-        let ix = self.index();
+        // Ended before the horizon: no index needed (never `Renewed`).
+        if target.expires_at_ms() <= horizon(now) {
+            return Some(ClaimState::Expired);
+        }
+        let ix = self.index(now);
         if let Some(by) = ix.renewed_by.get(id) {
             return Some(ClaimState::Renewed { by: *by });
         }
@@ -590,14 +688,14 @@ impl LeaseBook {
         }
         if let Some(killer) = ix.dead.get(id) {
             return Some(ClaimState::Lost {
-                winner: self.head(*killer),
+                winner: Self::head(&ix, *killer),
             });
         }
         let (_, beaten) = self.walk(now).into_iter().find(|(c, _)| c.id == *id)?;
         if let Some(winner) = beaten {
             return Some(ClaimState::Lost { winner });
         }
-        let root_ts = self.root_rec(target).ts;
+        let root_ts = self.root_rec(&ix, target).ts;
         Some(if now >= root_ts.saturating_add(settle_ms) {
             ClaimState::Granted
         } else {
@@ -636,10 +734,12 @@ impl LeaseBook {
         let Some(target) = self.claims.get(id) else {
             return Vec::new();
         };
+        let ix = self.index(now);
         let mut out: Vec<EventId> = self
-            .unexpired(now)
+            .unexpired(&ix, now)
+            .into_iter()
             .filter(|c| c.holder != target.holder && sets_overlap(&c.paths, &target.paths))
-            .filter(|c| self.live(c, now))
+            .filter(|c| self.live(&ix, c, now))
             .map(|c| c.id)
             .collect();
         out.sort();
