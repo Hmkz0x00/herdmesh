@@ -126,6 +126,14 @@ enum RoomCmd {
         node: String,
         role: String,
     },
+    /// Owner only: remove a member (ADR-005 §2). Same as `grant <room>
+    /// <node> observer`: every node then ignores its claims, decisions and
+    /// tasks.
+    Remove {
+        room: String,
+        /// Node id prefix (4+ hex chars, see `room status`).
+        node: String,
+    },
     /// Show members, leases and open tasks from the local store.
     Status {
         /// Room (default: this folder's room).
@@ -213,6 +221,10 @@ async fn room_cmd(data: &DataDir, cmd: RoomCmd) -> Result<String, String> {
         RoomCmd::Grant { room, node, role } => {
             room::grant(data, &room, &node, &role).await.map_err(e)
         }
+        RoomCmd::Remove { .. } => match remove_as_grant(&cmd) {
+            Some((room, node, role)) => room::grant(data, &room, &node, role).await.map_err(e),
+            None => Err("internal: remove".to_owned()),
+        },
         RoomCmd::Status { room } => room::status(data, &project_room(data, room)?).map_err(e),
         RoomCmd::Log {
             room,
@@ -496,6 +508,14 @@ fn main() -> ExitCode {
     }
 }
 
+/// `room remove <room> <node>` is `room grant <room> <node> observer`.
+fn remove_as_grant(cmd: &RoomCmd) -> Option<(String, String, &'static str)> {
+    match cmd {
+        RoomCmd::Remove { room, node } => Some((room.clone(), node.clone(), "observer")),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +595,27 @@ mod tests {
             let c = Cli::try_parse_from(v).unwrap();
             assert!(check_names(&c.command).is_ok(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn room_remove_is_an_owner_grant_of_observer() {
+        let c = Cli::try_parse_from(["herdmesh", "room", "remove", "alpha", "ab12"]).unwrap();
+        let Cmd::Room { cmd } = c.command else {
+            panic!("not a room command");
+        };
+        let Some((room_name, node, role)) = remove_as_grant(&cmd) else {
+            panic!("remove must map to a grant");
+        };
+        assert_eq!((room_name.as_str(), node.as_str()), ("alpha", "ab12"));
+        assert_eq!(room::parse_role(role).unwrap(), hm_proto::Role::Observer);
+        // Same owner-only check as `grant`: a non-owner is refused.
+        let mut v = hm_store::Views::new(None);
+        v.owner = Some(hm_proto::NodeId::from_bytes([1; 32]));
+        let me = hm_proto::NodeId::from_bytes([2; 32]);
+        assert!(matches!(
+            room::plan_grant(&v, &me, "0101"),
+            Err(room::RoomError::NotOwner(_))
+        ));
     }
 
     #[test]
