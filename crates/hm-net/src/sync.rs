@@ -1210,13 +1210,14 @@ pub async fn sync_page(
             return Err(SyncError::RoomMismatch);
         }
         // One page plus one author, so `request_page` knows if more follow.
-        let summary = s.seq_summary_page(from, MAX_AUTHORS_PER_REQUEST + 1, 0)?;
+        let now = hm_store::now_ms();
+        let summary = s.sync_seq_summary_page(&peer, from, MAX_AUTHORS_PER_REQUEST + 1, now)?;
         let mut page = request_page(&summary, from, window);
         let mut asked = Vec::new();
         for w in &mut page.want {
             if !checks.sparse_done.contains(&w.author) {
                 let after = s.sparse_cursor(&peer, &w.author)?;
-                let ids = s.seq_ids_after(&w.author, after, SPARSE_IDS)?;
+                let ids = s.sync_seq_ids_after(&peer, &w.author, after, SPARSE_IDS, now)?;
                 let through = if ids.len() == SPARSE_IDS {
                     ids.last().map_or(u64::MAX, |(seq, _)| *seq)
                 } else {
@@ -1233,6 +1234,14 @@ pub async fn sync_page(
                 if let Some(c) = w.check {
                     asked.push((w.author, c));
                 }
+                // This author is complete for this sweep. Keep a sparse request
+                // so legacy tail/twin serving cannot reoffer suppressed IDs while
+                // another author on the page is still progressing.
+                w.sparse = Some(SparseCheck {
+                    after: u64::MAX - 1,
+                    through: u64::MAX,
+                    ids: s.sync_seq_ids_after(&peer, &w.author, u64::MAX - 1, SPARSE_IDS, now)?,
+                });
             }
         }
         let req = SyncSince {
@@ -1271,10 +1280,13 @@ pub async fn sync_page(
     let (report, state) = tokio::task::spawn_blocking(move || -> Result<_, SyncError> {
         let mut s = store.lock()?;
         let report = s.append_batch(&events)?;
+        // Persist the retry inventory before advancing scan positions. Rejected
+        // and deferred IDs can be revisited on a later sweep after their TTL.
+        s.remember_sync_retries(&peer, &events, hm_store::now_ms())?;
         // After ingest, so a twin that just arrived is already reflected.
         state.absorb(&s, &asked, &probes)?;
-        // Never skip a rejected/deferred event on the strength of an ack.
-        if decoded_cleanly && report.rejected == 0 && report.deferred == 0 {
+        // Undecodable frames have no usable ID: never acknowledge their ranges.
+        if decoded_cleanly {
             for ack in sparse {
                 let done = ack.through == u64::MAX;
                 s.set_sparse_cursor(&peer, &ack.author, if done { 0 } else { ack.through })?;
@@ -1302,20 +1314,19 @@ pub async fn sync_page(
         more,
         "sync round"
     );
-    let suspects = usize::from(
-        decoded_cleanly && sparse_progress && report.rejected == 0 && report.deferred == 0,
-    ) + req
-        .want
-        .iter()
-        .filter(|w| checks.suspect.contains_key(&w.author))
-        .count();
+    let suspects = usize::from(decoded_cleanly && sparse_progress)
+        + req
+            .want
+            .iter()
+            .filter(|w| checks.suspect.contains_key(&w.author))
+            .count();
     Ok(PageRound {
         more,
         inserted: report.inserted,
         to,
         windows,
         suspects,
-        complete: decoded_cleanly && page_complete && report.rejected == 0 && report.deferred == 0,
+        complete: decoded_cleanly && page_complete,
     })
 }
 
@@ -1414,4 +1425,372 @@ pub async fn sync_from_with(
         result
     })
     .await
+}
+
+#[cfg(test)]
+mod retry_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use hm_proto::{EventBody, Lamport};
+    use iroh::RelayMode;
+    use iroh::endpoint::presets;
+    use iroh::protocol::Router;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    fn note(seq: u64, ts: u64) -> Event {
+        Event::sign(
+            &SigningKey::from_bytes(&[42; 32]),
+            RoomSecret::from_bytes([11; 32]).room_id(),
+            "agent",
+            seq,
+            Lamport(seq),
+            ts,
+            EventBody::Note {
+                scope: "s".into(),
+                text: "hello".into(),
+            },
+        )
+        .unwrap()
+    }
+
+    async fn endpoint() -> Endpoint {
+        Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    fn loopback(ep: &Endpoint) -> EndpointAddr {
+        ep.bound_sockets()
+            .into_iter()
+            .map(|s| {
+                let ip = match s.ip() {
+                    IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                };
+                SocketAddr::new(ip, s.port())
+            })
+            .fold(EndpointAddr::new(ep.id()), |a, s| a.with_ip_addr(s))
+    }
+
+    /// Real inventory pagination, with one permanently invalid signature on wire.
+    #[derive(Debug)]
+    struct PoisonedPeer {
+        store: SharedStore,
+        poison: Option<EventId>,
+    }
+
+    impl ProtocolHandler for PoisonedPeer {
+        async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+            let io = |e: SyncError| AcceptError::from_err(std::io::Error::other(e.to_string()));
+            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                let req = read_frame::<SyncSince>(&mut recv, MAX_REQUEST_FRAME)
+                    .await
+                    .map_err(io)?;
+                let answer = answer_request(&self.store.lock().unwrap(), &req, SyncCaps::DEFAULT)
+                    .map_err(io)?;
+                for wire in answer.events {
+                    let mut e = Event::decode(&wire).unwrap();
+                    if self.poison == Some(e.id) {
+                        e.body = EventBody::Note {
+                            scope: "s".into(),
+                            text: "forged".into(),
+                        };
+                    }
+                    write_frame(&mut send, &SyncMsg::Event(e.encode().unwrap()))
+                        .await
+                        .map_err(io)?;
+                }
+                for ack in answer.sparse {
+                    write_frame(&mut send, &SyncMsg::Sparse(ack))
+                        .await
+                        .map_err(io)?;
+                }
+                write_frame(&mut send, &SyncMsg::End { more: answer.more })
+                    .await
+                    .map_err(io)?;
+                send.finish().unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refused_id_does_not_block_sparse_tail_or_repeat_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = RoomSecret::from_bytes([11; 32]);
+        let events: Vec<_> = (0..24).map(|i| note(129 + 2 * i, 1000)).collect();
+        let poison = events[3].id;
+        let server = Arc::new(Mutex::new(Store::open_in_memory(secret.room_id()).unwrap()));
+        server
+            .lock()
+            .unwrap()
+            .append_batch_at(&events, 1000)
+            .unwrap();
+        let router = Router::builder(endpoint().await)
+            .accept(
+                SYNC_ALPN,
+                PoisonedPeer {
+                    store: server.clone(),
+                    poison: Some(poison),
+                },
+            )
+            .spawn();
+        let client = endpoint().await;
+        let db = dir.path().join("client.db");
+        let local = Arc::new(Mutex::new(Store::open(&db, secret.room_id()).unwrap()));
+        local.lock().unwrap().append_at(&events[0], 1000).unwrap();
+        let first = sync_from(&client, loopback(router.endpoint()), &secret, &local)
+            .await
+            .unwrap();
+        let ids: BTreeSet<_> = local
+            .lock()
+            .unwrap()
+            .events_since(Lamport(0))
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(
+            ids,
+            events
+                .iter()
+                .filter(|e| e.id != poison)
+                .map(|e| e.id)
+                .collect(),
+            "{first:?}"
+        );
+        assert_eq!(first.rejected, 1, "refuse once, then advance");
+        *local.lock().unwrap() = Store::open(&db, secret.room_id()).unwrap();
+        let again = sync_from(&client, loopback(router.endpoint()), &secret, &local)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.received, 0,
+            "the refused ID must survive reopening: {again:?}"
+        );
+        // A bad response from one peer must never hide the valid event at another.
+        let honest = Router::builder(endpoint().await)
+            .accept(
+                SYNC_ALPN,
+                PoisonedPeer {
+                    store: server,
+                    poison: None,
+                },
+            )
+            .spawn();
+        let other = sync_from(&client, loopback(honest.endpoint()), &secret, &local)
+            .await
+            .unwrap();
+        assert_eq!(other.inserted, 1, "{other:?}");
+        honest.shutdown().await.unwrap();
+        router.shutdown().await.unwrap();
+        client.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn future_id_does_not_block_sparse_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = RoomSecret::from_bytes([11; 32]);
+        let now = hm_store::now_ms();
+        let future = now + hm_proto::limits::MAX_FUTURE_SKEW_MS + 60_000;
+        let mut events: Vec<_> = (0..24).map(|i| note(129 + 2 * i, now)).collect();
+        events[3] = note(events[3].seq, future);
+        let server = Arc::new(Mutex::new(Store::open_in_memory(secret.room_id()).unwrap()));
+        server
+            .lock()
+            .unwrap()
+            .append_batch_at(&events, future)
+            .unwrap();
+        let router = Router::builder(endpoint().await)
+            .accept(
+                SYNC_ALPN,
+                PoisonedPeer {
+                    store: server,
+                    poison: None,
+                },
+            )
+            .spawn();
+        let client = endpoint().await;
+        let db = dir.path().join("future.db");
+        let local = Arc::new(Mutex::new(Store::open(&db, secret.room_id()).unwrap()));
+        local.lock().unwrap().append_at(&events[0], now).unwrap();
+        let first = sync_from(&client, loopback(router.endpoint()), &secret, &local)
+            .await
+            .unwrap();
+        assert_eq!(
+            local.lock().unwrap().event_count().unwrap(),
+            23,
+            "{first:?}"
+        );
+        assert_eq!(first.deferred, 1);
+        let again = sync_from(&client, loopback(router.endpoint()), &secret, &local)
+            .await
+            .unwrap();
+        assert_eq!(again.received, 0, "{again:?}");
+        // Restart loses the in-memory pending queue, but the persisted retry ID
+        // still suppresses this peer until its TTL expires.
+        *local.lock().unwrap() = Store::open(&db, secret.room_id()).unwrap();
+        assert_eq!(local.lock().unwrap().pending_len(), 0);
+        let again = sync_from(&client, loopback(router.endpoint()), &secret, &local)
+            .await
+            .unwrap();
+        assert_eq!(again.received, 0, "{again:?}");
+        let peer = NodeId::from_bytes(*router.endpoint().id().as_bytes());
+        local
+            .lock()
+            .unwrap()
+            .remember_sync_retries(&peer, &[], future)
+            .unwrap();
+        let expired = sync_from(&client, loopback(router.endpoint()), &secret, &local)
+            .await
+            .unwrap();
+        assert_eq!(
+            expired.received, 1,
+            "expired IDs must be fetched again: {expired:?}"
+        );
+        assert_eq!(expired.deferred, 1);
+        // The refetched event can be admitted once its future skew expires.
+        let retried = local.lock().unwrap().retry_pending(future).unwrap();
+        assert_eq!(retried.inserted, 1);
+        assert_eq!(local.lock().unwrap().event_count().unwrap(), 24);
+        router.shutdown().await.unwrap();
+        client.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refused_only_author_is_not_reoffered() {
+        let secret = RoomSecret::from_bytes([11; 32]);
+        let e = note(129, 1000);
+        let server = Arc::new(Mutex::new(Store::open_in_memory(secret.room_id()).unwrap()));
+        server.lock().unwrap().append_at(&e, 1000).unwrap();
+        let router = Router::builder(endpoint().await)
+            .accept(
+                SYNC_ALPN,
+                PoisonedPeer {
+                    store: server,
+                    poison: Some(e.id),
+                },
+            )
+            .spawn();
+        let client = endpoint().await;
+        let local = Arc::new(Mutex::new(Store::open_in_memory(secret.room_id()).unwrap()));
+        let first = sync_from(&client, loopback(router.endpoint()), &secret, &local)
+            .await
+            .unwrap();
+        assert_eq!(first.rejected, 1);
+        let again = sync_from(&client, loopback(router.endpoint()), &secret, &local)
+            .await
+            .unwrap();
+        assert_eq!(again.received, 0, "{again:?}");
+        assert_eq!(local.lock().unwrap().event_count().unwrap(), 0);
+        router.shutdown().await.unwrap();
+        client.close().await;
+    }
+
+    #[test]
+    fn retry_inventory_expires_and_only_overrides_the_offering_peer() {
+        let e = note(129, 1000);
+        let peer = NodeId::from_bytes([1; 32]);
+        let other = NodeId::from_bytes([2; 32]);
+        let mut store = Store::open_in_memory(e.room).unwrap();
+        let mut refused = e.clone();
+        refused.id = EventId::from_bytes([0; 32]);
+        store.append_at(&e, 1000).unwrap();
+        store
+            .remember_sync_retries(&peer, std::slice::from_ref(&refused), 1000)
+            .unwrap();
+        let until = 1000 + Store::SYNC_RETRY_TTL_MS;
+        assert_eq!(
+            store
+                .sync_seq_ids_after(&peer, &e.author.node, 0, 8, until - 1)
+                .unwrap(),
+            vec![(e.seq, refused.id)]
+        );
+        assert_eq!(
+            store
+                .sync_seq_ids_after(&other, &e.author.node, 0, 8, 1000)
+                .unwrap(),
+            vec![(e.seq, e.id)]
+        );
+        assert_eq!(
+            store.seq_ids_after(&e.author.node, 0, 8).unwrap(),
+            vec![(e.seq, e.id)]
+        );
+        assert_eq!(
+            store
+                .sync_seq_ids_after(&peer, &e.author.node, 0, 8, until)
+                .unwrap(),
+            vec![(e.seq, e.id)]
+        );
+    }
+
+    #[test]
+    fn retry_inventory_is_bounded_per_peer_and_globally() {
+        let base = note(1, 1000);
+        let mut store = Store::open_in_memory(base.room).unwrap();
+        let refused: Vec<_> = (1..=Store::SYNC_RETRY_PER_PEER + 1)
+            .map(|seq| {
+                let mut e = base.clone();
+                e.seq = seq as u64;
+                e.id = EventId::from_bytes(*blake3::hash(&seq.to_le_bytes()).as_bytes());
+                e
+            })
+            .collect();
+        let peer_count = Store::SYNC_RETRY_TOTAL / Store::SYNC_RETRY_PER_PEER + 1;
+        for n in 0..peer_count {
+            let peer = NodeId::from_bytes([n as u8; 32]);
+            store.remember_sync_retries(&peer, &refused, 1000).unwrap();
+            let ids = store
+                .sync_seq_ids_after(&peer, &base.author.node, 0, usize::MAX, 1000)
+                .unwrap();
+            assert_eq!(ids.len(), Store::SYNC_RETRY_PER_PEER);
+            assert!(
+                store
+                    .seq_ids_after(&base.author.node, 0, 8)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                store
+                    .sync_seq_summary_page(&peer, None, 1, 1000)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let total: usize = (0..peer_count)
+            .map(|n| {
+                store
+                    .sync_seq_ids_after(
+                        &NodeId::from_bytes([n as u8; 32]),
+                        &base.author.node,
+                        0,
+                        usize::MAX,
+                        1000,
+                    )
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert_eq!(total, Store::SYNC_RETRY_TOTAL);
+        let peer = NodeId::from_bytes([(peer_count - 1) as u8; 32]);
+        let expiry = 1000 + Store::SYNC_RETRY_TTL_MS;
+        assert!(
+            store
+                .sync_seq_summary_page(&peer, None, 1, expiry)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .sync_seq_ids_after(&peer, &base.author.node, 0, 8, expiry)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.event_count().unwrap(), 0);
+    }
 }
