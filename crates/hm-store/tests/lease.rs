@@ -253,3 +253,74 @@ proptest! {
         prop_assert_eq!(run(&evs), run(&shuffled));
     }
 }
+
+// ---- GATE-7 N21: expired history stays cheap ----
+
+#[test]
+fn dense_expired_same_holder_claims_are_cheap() {
+    // N same-holder, disjoint claims, all ts=T, TTL 60s; queried a day later.
+    let n = 10_000u64;
+    let evs: Vec<Event> = (0..n)
+        .map(|i| claim(1, i + 1, i + 1, T, &[format!("f{i}.rs").as_str()], 60))
+        .collect();
+    let start = Instant::now();
+    let book = book_from_events(&evs);
+    let day = T + 86_400_000;
+    for e in &evs {
+        assert_eq!(book.state(&e.id, day), Some(ClaimState::Expired));
+    }
+    assert!(book.active(day).is_empty());
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(3), "took {took:?}");
+}
+
+#[test]
+fn long_expired_renewal_chain_is_cheap() {
+    // One holder renews the same path every 30s for 10k rounds.
+    let n = 10_000u64;
+    let evs: Vec<Event> = (0..n)
+        .map(|i| claim(1, i + 1, i + 1, T + i * 30_000, &["src/**"], 60))
+        .collect();
+    let start = Instant::now();
+    let book = book_from_events(&evs);
+    let later = T + n * 30_000 + 86_400_000;
+    for e in &evs {
+        assert_eq!(book.state(&e.id, later), Some(ClaimState::Expired));
+    }
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(3), "took {took:?}");
+    // While live, the first claim reports the chain's latest renewal.
+    let mid = T + 40_000;
+    let small = book_from_events(&evs[..20]);
+    assert_eq!(
+        small.state(&evs[0].id, mid),
+        Some(ClaimState::Renewed { by: evs[19].id })
+    );
+}
+
+// ---- GATE-7 N22: a renewal's loser stays lost after the renewal ends ----
+
+#[test]
+fn renewal_loser_does_not_revive_after_release() {
+    // Alice P=(L1, T, 2s); Bob B=(L2, T+3s, 10s); Alice R=(L3, T+1s, 10s)
+    // renews P. At T+6s B has lost to R; Alice releases R. B stays lost.
+    let p = claim(1, 1, 1, T, &["a"], 2);
+    let b = claim(2, 1, 2, T + 3_000, &["a"], 10);
+    let r = claim(1, 2, 3, T + 1_000, &["a"], 10);
+    let rel = release(1, 3, 4, T + 6_000, &r);
+    let now = T + 6_000;
+    let before = vec![p.clone(), b.clone(), r.clone()];
+    assert_eq!(
+        claim_state(&b.id, &before, now),
+        Some(ClaimState::Lost { winner: r.id })
+    );
+    let mut after = before.clone();
+    after.push(rel);
+    for evs in [after.clone(), after.iter().rev().cloned().collect()] {
+        assert!(matches!(
+            claim_state(&b.id, &evs, now),
+            Some(ClaimState::Lost { .. })
+        ));
+        assert!(book_from_events(&evs).active(now).is_empty());
+    }
+}

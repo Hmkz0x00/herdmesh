@@ -84,7 +84,7 @@ const SELECT_EVENT: &str = "SELECT e.id, e.author_node, e.seq, e.lamport, e.agen
      b.body, e.sig FROM events e JOIN blobs b ON b.hash = e.body_hash";
 
 /// Bumped when the view snapshot layout changes; a mismatch triggers a rebuild.
-const VIEW_SNAPSHOT_VERSION: u8 = 4;
+const VIEW_SNAPSHOT_VERSION: u8 = 5;
 
 /// Max events parked because their `ts` is too far in the future.
 pub const PENDING_CAP: usize = 1000;
