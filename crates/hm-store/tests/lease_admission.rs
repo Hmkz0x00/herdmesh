@@ -199,9 +199,9 @@ fn equivocating_twin_cannot_smuggle_a_takeover() {
 
 #[test]
 fn same_instant_arrivals_do_not_depend_on_order() {
-    // Only events first seen strictly before `now` can protect a lease, so
-    // a release and a claim arriving together give one result in any order,
-    // one by one or batched.
+    // ADR-002 Addendum 4: one batch is one admission instant, judged as a
+    // whole, so a release and a claim arriving together give one result
+    // whatever their order in the batch.
     let victim = claim(1, 1, 10, T, &["src/**"], 3600);
     let rel = release(1, 2, 11, T + 30_000, &victim);
     let attacker = claim(2, 1, 2, T, &["src/a.rs"], 3600);
@@ -219,13 +219,10 @@ fn same_instant_arrivals_do_not_depend_on_order() {
         }
         s.events_since(Lamport(0)).unwrap()
     };
-    let base = run(&[&rel, &attacker], false);
-    assert_eq!(run(&[&attacker, &rel], false), base);
-    assert_eq!(run(&[&rel, &attacker], true), base);
-    assert_eq!(run(&[&attacker, &rel], true), base);
+    assert_eq!(run(&[&rel, &attacker], true), run(&[&attacker, &rel], true));
 }
 
-// ---- property: admission never depends on arrival order within an instant ----
+// ---- property: admission never depends on order within a batch ----
 
 use proptest::prelude::*;
 
@@ -279,7 +276,6 @@ proptest! {
         old in arb_claims(1..6),
         new in arb_claims(1..8),
         seed in any::<u64>(),
-        batch in any::<bool>(),
     ) {
         let (old, fresh) = build(&old, &new);
         let now = T + 120_000;
@@ -304,6 +300,6 @@ proptest! {
             x ^= x << 13; x ^= x >> 7; x ^= x << 17;
             perm.swap(i, (x % (i as u64 + 1)) as usize);
         }
-        prop_assert_eq!(run(&fresh, false), run(&perm, batch));
+        prop_assert_eq!(run(&fresh, true), run(&perm, true));
     }
 }
