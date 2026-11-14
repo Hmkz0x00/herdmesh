@@ -2,6 +2,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod board;
+pub mod clients;
 pub mod clipboard;
 pub mod daemon;
 pub mod data;

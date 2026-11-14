@@ -1,8 +1,8 @@
 //! `herdmesh setup`: one command per person per project (ADR-004 section 2).
 //!
 //! Project-level files only, never user-level config:
-//! * `.mcp.json` (Claude Code), `.codex/config.toml` (Codex),
-//!   `.agents/mcp_config.json` (Antigravity), each running
+//! * one project config per detected agent CLI (see `clients::REGISTRY`; e.g.
+//!   `.mcp.json`, `.codex/config.toml`), each running
 //!   `herdmesh mcp --kind <kind> --room <room>`, merged into what is there;
 //! * the collaboration snippet appended to `CLAUDE.md` / `AGENTS.md`;
 //! * `.herdmesh/room`, so room commands know the project's room.
@@ -32,43 +32,8 @@ pub const SNIPPET_MARKER: &str = "## Herdmesh Collaboration";
 /// Name of the server entry written into every agent config.
 pub const SERVER_NAME: &str = "herdmesh";
 
-/// An agent CLI we can configure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Kind {
-    Claude,
-    Codex,
-    Agy,
-}
-
-impl Kind {
-    pub const ALL: [Kind; 3] = [Kind::Claude, Kind::Codex, Kind::Agy];
-
-    /// Used both as the executable name and as `--kind`.
-    pub fn name(self) -> &'static str {
-        match self {
-            Kind::Claude => "claude",
-            Kind::Codex => "codex",
-            Kind::Agy => "agy",
-        }
-    }
-
-    /// Project-relative config file, as path components.
-    fn config_parts(self) -> &'static [&'static str] {
-        match self {
-            Kind::Claude => &[".mcp.json"],
-            Kind::Codex => &[".codex", "config.toml"],
-            Kind::Agy => &[".agents", "mcp_config.json"],
-        }
-    }
-
-    pub fn config_path(self) -> PathBuf {
-        self.config_parts().iter().collect()
-    }
-
-    fn is_toml(self) -> bool {
-        self == Kind::Codex
-    }
-}
+pub use crate::clients::Kind;
+use crate::clients::{Format, MANUAL, Shape};
 
 /// The collaboration snippet: the fenced markdown block of the snippet doc.
 pub fn snippet() -> String {
@@ -81,29 +46,73 @@ pub fn snippet() -> String {
     doc[start..end].trim_end().to_owned() + "\n"
 }
 
-/// Which agent CLIs are installed: an executable named after each kind in a
-/// `PATH` directory (trying each of `exts`, e.g. `.exe` on Windows).
+fn has_exe(dirs: &[PathBuf], exts: &[&str], exe: &str) -> bool {
+    dirs.iter()
+        .any(|d| exts.iter().any(|e| d.join(format!("{exe}{e}")).is_file()))
+}
+
+/// Which agent CLIs are installed: any of a client's executables in a `PATH`
+/// directory (trying each of `exts`, e.g. `.exe` on Windows).
 pub fn detect(path_var: &OsStr, exts: &[&str]) -> Vec<Kind> {
     let dirs: Vec<PathBuf> = std::env::split_paths(path_var).collect();
     Kind::ALL
         .into_iter()
-        .filter(|k| {
-            dirs.iter().any(|d| {
-                exts.iter()
-                    .any(|e| d.join(format!("{}{e}", k.name())).is_file())
-            })
-        })
+        .filter(|k| k.client().exes.iter().any(|x| has_exe(&dirs, exts, x)))
         .collect()
+}
+
+/// One-line hints for installed CLIs that only have user-level MCP config.
+pub fn manual_hints(path_var: &OsStr, exts: &[&str]) -> Vec<String> {
+    let dirs: Vec<PathBuf> = std::env::split_paths(path_var).collect();
+    MANUAL
+        .iter()
+        .filter(|(exe, _)| has_exe(&dirs, exts, exe))
+        .map(|(exe, how)| format!("{exe} has no project-level MCP config; {how}"))
+        .collect()
+}
+
+fn path_exts() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &[".exe", ".cmd", ".bat", ".com"]
+    } else {
+        &[""]
+    }
 }
 
 /// Installed agent CLIs on this machine's `PATH`.
 pub fn detect_installed() -> Vec<Kind> {
-    let exts: &[&str] = if cfg!(windows) {
-        &[".exe", ".cmd", ".bat", ".com"]
-    } else {
-        &[""]
-    };
-    std::env::var_os("PATH").map_or_else(Vec::new, |p| detect(&p, exts))
+    std::env::var_os("PATH").map_or_else(Vec::new, |p| detect(&p, path_exts()))
+}
+
+/// `setup --list-clients` text for the given `PATH`: every known CLI, whether
+/// it was found, the project file it would get and its docs.
+pub fn list_clients_text(path_var: &OsStr, exts: &[&str]) -> String {
+    let found = detect(path_var, exts);
+    let mut out = String::new();
+    for k in Kind::ALL {
+        let c = k.client();
+        let _ = writeln!(
+            out,
+            "{:<9} {:<12} {}  {}",
+            c.name,
+            if found.contains(&k) {
+                "detected"
+            } else {
+                "not found"
+            },
+            k.config_path().display(),
+            c.docs
+        );
+    }
+    for line in manual_hints(path_var, exts) {
+        let _ = writeln!(out, "{line}");
+    }
+    out
+}
+
+/// `list_clients_text` for this machine's `PATH`.
+pub fn list_clients() -> String {
+    list_clients_text(&std::env::var_os("PATH").unwrap_or_default(), path_exts())
 }
 
 fn server_args(kind: Kind, room: &str) -> Vec<String> {
@@ -113,31 +122,60 @@ fn server_args(kind: Kind, room: &str) -> Vec<String> {
 }
 
 fn server_entry_json(kind: Kind, room: &str) -> Value {
-    json!({ "command": "herdmesh", "args": server_args(kind, room) })
+    let args = server_args(kind, room);
+    match kind.client().shape {
+        Shape::CommandArgs => json!({ "command": "herdmesh", "args": args }),
+        Shape::LocalCommandArgs => {
+            json!({ "type": "local", "command": "herdmesh", "args": args })
+        }
+        Shape::LocalCommandArray => {
+            let mut cmd = vec!["herdmesh".to_owned()];
+            cmd.extend(args);
+            json!({ "type": "local", "command": cmd })
+        }
+    }
 }
 
 /// `existing` JSON config with our server entry set; everything else kept.
 pub fn merge_json(existing: Option<&str>, kind: Kind, room: &str) -> Result<String, String> {
+    let Format::Json(path) = kind.client().format else {
+        return Err("internal: not a JSON client".to_owned());
+    };
     let mut root: Value = match existing {
         Some(t) if !t.trim().is_empty() => {
             serde_json::from_str(t).map_err(|e| format!("not valid JSON ({e})"))?
         }
         _ => json!({}),
     };
-    let obj = root
-        .as_object_mut()
-        .ok_or("top level is not a JSON object")?;
-    let servers = obj.entry("mcpServers").or_insert_with(|| json!({}));
-    let servers = servers
-        .as_object_mut()
-        .ok_or("\"mcpServers\" is not an object")?;
-    servers.insert(SERVER_NAME.to_owned(), server_entry_json(kind, room));
+    let mut node = &mut root;
+    for (i, key) in path.iter().enumerate() {
+        let what = if i == 0 {
+            "top level".to_owned()
+        } else {
+            format!("\"{}\"", path[i - 1])
+        };
+        node = node
+            .as_object_mut()
+            .ok_or_else(|| format!("{what} is not a JSON object"))?
+            .entry(*key)
+            .or_insert_with(|| json!({}));
+    }
+    node.as_object_mut()
+        .ok_or_else(|| format!("\"{}\" is not an object", path.last().unwrap_or(&"")))?
+        .insert(SERVER_NAME.to_owned(), server_entry_json(kind, room));
     let mut text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     text.push('\n');
     Ok(text)
 }
 
-fn server_table_toml(kind: Kind, room: &str) -> toml::Table {
+fn toml_path(kind: Kind) -> Result<&'static [&'static str], String> {
+    match kind.client().format {
+        Format::Toml(path) => Ok(path),
+        Format::Json(_) => Err("internal: not a TOML client".to_owned()),
+    }
+}
+
+fn server_entry_toml(kind: Kind, room: &str) -> toml::Value {
     let mut entry = toml::Table::new();
     entry.insert("command".into(), "herdmesh".into());
     entry.insert(
@@ -149,28 +187,38 @@ fn server_table_toml(kind: Kind, room: &str) -> toml::Table {
                 .collect(),
         ),
     );
-    let mut servers = toml::Table::new();
-    servers.insert(SERVER_NAME.into(), toml::Value::Table(entry));
-    let mut root = toml::Table::new();
-    root.insert("mcp_servers".into(), toml::Value::Table(servers));
-    root
+    toml::Value::Table(entry)
 }
 
-/// `existing` Codex TOML config with our server entry set. A missing entry is
+/// `{path...: {herdmesh: entry}}` as a document.
+fn server_table_toml(kind: Kind, room: &str) -> Result<toml::Table, String> {
+    let mut node = toml::Table::new();
+    node.insert(SERVER_NAME.into(), server_entry_toml(kind, room));
+    for key in toml_path(kind)?.iter().rev() {
+        let mut up = toml::Table::new();
+        up.insert((*key).to_owned(), toml::Value::Table(node));
+        node = up;
+    }
+    Ok(node)
+}
+
+/// `existing` TOML config with our server entry set. A missing entry is
 /// appended as text so comments and layout survive; a differing entry is
 /// replaced by re-serialising the file.
 pub fn merge_toml(existing: Option<&str>, kind: Kind, room: &str) -> Result<String, String> {
-    let wanted = server_table_toml(kind, room);
+    let path = toml_path(kind)?;
+    let wanted = server_table_toml(kind, room)?;
     let text = existing.unwrap_or("");
     let mut parsed: toml::Table = if text.trim().is_empty() {
         toml::Table::new()
     } else {
         text.parse().map_err(|e| format!("not valid TOML ({e})"))?
     };
-    let has_entry = parsed
-        .get("mcp_servers")
-        .and_then(|v| v.as_table())
-        .is_some_and(|t| t.contains_key(SERVER_NAME));
+    let mut cur = Some(&parsed);
+    for key in path {
+        cur = cur.and_then(|t| t.get(*key)).and_then(|v| v.as_table());
+    }
+    let has_entry = cur.is_some_and(|t| t.contains_key(SERVER_NAME));
     if !has_entry {
         let mut out = text.to_owned();
         if !out.is_empty() && !out.ends_with('\n') {
@@ -185,18 +233,15 @@ pub fn merge_toml(existing: Option<&str>, kind: Kind, room: &str) -> Result<Stri
         }
     }
     // Replace (or the append produced invalid TOML, e.g. inline tables).
-    let servers = parsed
-        .entry("mcp_servers")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-        .as_table_mut()
-        .ok_or("\"mcp_servers\" is not a table")?;
-    let entry = wanted
-        .get("mcp_servers")
-        .and_then(|v| v.as_table())
-        .and_then(|t| t.get(SERVER_NAME))
-        .cloned()
-        .ok_or("internal: missing entry")?;
-    servers.insert(SERVER_NAME.to_owned(), entry);
+    let mut node = &mut parsed;
+    for key in path {
+        node = node
+            .entry(*key)
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| format!("\"{key}\" is not a table"))?;
+    }
+    node.insert(SERVER_NAME.to_owned(), server_entry_toml(kind, room));
     toml::to_string(&parsed).map_err(|e| e.to_string())
 }
 
@@ -319,7 +364,7 @@ fn instruction_targets(root: &Root, kinds: &[Kind]) -> Vec<&'static str> {
                     .is_some_and(|s| s.lines().any(|l| l.trim() == "@AGENTS.md"));
                 if imports { "AGENTS.md" } else { "CLAUDE.md" }
             }
-            Kind::Codex | Kind::Agy => "AGENTS.md",
+            _ => "AGENTS.md",
         };
         if !out.contains(&t) {
             out.push(t);
@@ -585,8 +630,13 @@ pub async fn run(opts: Opts<'_>) -> Result<(), String> {
 
     // 4. project files.
     let kinds = detect_installed();
+    for hint in std::env::var_os("PATH").map_or_else(Vec::new, |p| manual_hints(&p, path_exts())) {
+        println!("{hint}");
+    }
     if kinds.is_empty() {
-        println!("No agent CLI (claude, codex, agy) found on PATH; skipped MCP config.");
+        println!(
+            "No supported agent CLI found on PATH (see `herdmesh setup --list-clients`); skipped MCP config."
+        );
     } else {
         let names: Vec<&str> = kinds.iter().map(|k| k.name()).collect();
         println!("Found: {}.", names.join(", "));
@@ -644,7 +694,7 @@ pub async fn run(opts: Opts<'_>) -> Result<(), String> {
         }
     }
     println!(
-        "  2. Start your agent here (claude / codex / agy); it picks up the herdmesh MCP server."
+        "  2. Start your agent here; it picks up the herdmesh MCP server (`herdmesh setup --list-clients`)."
     );
     println!("  3. Watch it live with `herdmesh view`.");
     if !applied.failed.is_empty() {
@@ -1096,5 +1146,124 @@ mod tests {
             ),
         ];
         assert!(unique_room_name("app", &both, &k1).is_err());
+    }
+
+    fn fake_path(exes: &[&str]) -> (tempfile::TempDir, std::ffi::OsString) {
+        let t = tmp();
+        for e in exes {
+            std::fs::write(t.path().join(e), "").unwrap();
+        }
+        let path = std::env::join_paths([t.path()]).unwrap();
+        (t, path)
+    }
+
+    #[test]
+    fn detection_uses_each_clients_own_executable_names() {
+        // cursor's CLI is `agent`, kiro's is `kiro-cli`; the kind names alone do not match.
+        let (_t, path) = fake_path(&["agent", "kiro-cli", "gemini", "cursor", "kiro"]);
+        let found = detect(&path, &[""]);
+        assert_eq!(found, vec![Kind::Gemini, Kind::Cursor, Kind::Kiro]);
+        assert_eq!(Kind::Cursor.name(), "cursor");
+        assert!(detect(&path, &[".exe"]).is_empty());
+    }
+
+    #[test]
+    fn json_nested_key_paths_are_created_and_merged() {
+        // opencode: "mcp" holds servers directly, command is one array.
+        let v: Value =
+            serde_json::from_str(&merge_json(None, Kind::Opencode, "r").unwrap()).unwrap();
+        let e = &v["mcp"]["herdmesh"];
+        assert_eq!(e["type"], "local");
+        assert_eq!(
+            e["command"],
+            json!(["herdmesh", "mcp", "--kind", "opencode", "--room", "r"])
+        );
+        // amp: one key that contains a dot, not a nested path; other keys kept.
+        let old = r#"{"theme":"dark","amp.mcpServers":{"x":{"command":"y"}}}"#;
+        let v: Value =
+            serde_json::from_str(&merge_json(Some(old), Kind::Amp, "r").unwrap()).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["amp.mcpServers"]["x"]["command"], "y");
+        assert_eq!(
+            v["amp.mcpServers"]["herdmesh"]["args"][2], "amp",
+            "--kind value"
+        );
+        // copilot: typed local entry with command + args.
+        let v: Value =
+            serde_json::from_str(&merge_json(None, Kind::Copilot, "r").unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["herdmesh"]["type"], "local");
+        assert_eq!(v["mcpServers"]["herdmesh"]["command"], "herdmesh");
+        // A non-object on the path is refused, never overwritten.
+        assert!(merge_json(Some(r#"{"mcp":[]}"#), Kind::Opencode, "r").is_err());
+        assert!(merge_json(Some(r#"{"amp.mcpServers":1}"#), Kind::Amp, "r").is_err());
+    }
+
+    #[test]
+    fn grok_toml_is_merged_like_codex() {
+        let old = "# grok\nmodel = \"g\"\n";
+        let new = merge_toml(Some(old), Kind::Grok, "proj").unwrap();
+        assert!(new.starts_with(old), "{new}");
+        let t: toml::Table = new.parse().unwrap();
+        let args = t["mcp_servers"]["herdmesh"]["args"].as_array().unwrap();
+        assert_eq!(args[2].as_str(), Some("grok"));
+        assert!(merge_json(None, Kind::Grok, "r").is_err());
+        assert!(merge_toml(None, Kind::Gemini, "r").is_err());
+    }
+
+    #[test]
+    fn writes_only_for_detected_clients_with_fake_path_and_is_idempotent() {
+        let (_t, path) = fake_path(&["gemini", "grok", "agent", "cline"]);
+        let kinds = detect(&path, &[""]);
+        assert_eq!(kinds, vec![Kind::Gemini, Kind::Cursor, Kind::Grok]);
+        let proj = tmp();
+        let p = proj.path();
+        let plan = plan_files(p, &kinds, "r");
+        let paths: Vec<_> = plan.changes.iter().map(|c| c.path.clone()).collect();
+        assert!(paths.contains(&Kind::Gemini.config_path()));
+        assert!(paths.contains(&Kind::Cursor.config_path()));
+        assert!(paths.contains(&Kind::Grok.config_path()));
+        assert!(!paths.contains(&Kind::Pi.config_path()));
+        let done = all(&plan, p);
+        assert!(done.failed.is_empty() && done.declined.is_empty());
+        assert!(p.join(".gemini").join("settings.json").is_file());
+        assert!(p.join(".cursor").join("mcp.json").is_file());
+        assert!(p.join(".grok").join("config.toml").is_file());
+        assert!(!p.join(".pi").exists() && !p.join("opencode.json").exists());
+        assert_eq!(plan_files(p, &kinds, "r"), Plan::default());
+        // cline is only a hint, never a file.
+        let hints = manual_hints(&path, &[""]);
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].starts_with("cline has no project-level"));
+    }
+
+    #[test]
+    fn list_clients_shows_state_file_and_docs() {
+        let (_t, path) = fake_path(&["qwen", "goose"]);
+        let text = list_clients_text(&path, &[""]);
+        let qwen = text.lines().find(|l| l.starts_with("qwen")).unwrap();
+        assert!(qwen.contains("detected") && qwen.contains("settings.json"));
+        assert!(qwen.contains("https://qwenlm.github.io/qwen-code/"));
+        let pi = text.lines().find(|l| l.starts_with("pi ")).unwrap();
+        assert!(pi.contains("not found") && pi.contains("mcp.json"));
+        assert_eq!(
+            text.lines().filter(|l| !l.starts_with("goose")).count(),
+            Kind::ALL.len()
+        );
+        assert!(text.contains("goose has no project-level MCP config"));
+    }
+
+    #[test]
+    fn every_client_config_stays_inside_the_project_and_roundtrips() {
+        let t = tmp();
+        let plan = plan_files(t.path(), &Kind::ALL, "r");
+        assert!(plan.problems.is_empty(), "{:?}", plan.problems);
+        for k in Kind::ALL {
+            assert!(
+                plan.changes.iter().any(|c| c.path == k.config_path()),
+                "{k:?}"
+            );
+        }
+        all(&plan, t.path());
+        assert_eq!(plan_files(t.path(), &Kind::ALL, "r"), Plan::default());
     }
 }

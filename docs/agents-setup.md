@@ -17,6 +17,36 @@ The `--agent <name>` argument sets the local agent's identity in the room (for e
 
 ---
 
+## Supported CLIs (automatic: `herdmesh setup`)
+
+`herdmesh setup` writes a project-level MCP entry for every CLI below whose executable is on `PATH`, running `herdmesh mcp --kind <kind> --room <room>`. It shows a diff and asks first (unless `--yes`), merges into existing files, never writes through links, and never touches user-level config. `herdmesh setup --list-clients` shows what was detected, the file each would get and the docs link.
+
+| kind | executable | project file | format | docs |
+|---|---|---|---|---|
+| claude | `claude` | `.mcp.json` | JSON `mcpServers` | https://docs.claude.com/en/docs/claude-code/mcp |
+| codex | `codex` | `.codex/config.toml` | TOML `[mcp_servers]` | https://developers.openai.com/codex/mcp |
+| agy | `agy` | `.agents/mcp_config.json` | JSON `mcpServers` | (this guide, section 3) |
+| gemini | `gemini` | `.gemini/settings.json` | JSON `mcpServers` | https://geminicli.com/docs/tools/mcp/ |
+| opencode | `opencode` | `opencode.json` | JSON `mcp` (typed, command array) | https://opencode.ai/docs/mcp/ |
+| cursor | `agent` | `.cursor/mcp.json` | JSON `mcpServers` | https://docs.cursor.com/context/model-context-protocol |
+| copilot | `copilot` | `.github/mcp.json` | JSON `mcpServers` (typed local) | https://docs.github.com/en/copilot/using-github-copilot/using-copilot-in-the-cli |
+| kiro | `kiro-cli` | `.kiro/settings/mcp.json` | JSON `mcpServers` | https://kiro.dev/docs/mcp/ |
+| qwen | `qwen` | `.qwen/settings.json` | JSON `mcpServers` | https://qwenlm.github.io/qwen-code/ |
+| amp | `amp` | `.amp/settings.json` | JSON key `amp.mcpServers` | https://ampcode.com/docs/mcp |
+| droid | `droid` | `.factory/mcp.json` | JSON `mcpServers` | https://docs.factory.ai/cli/mcp |
+| kimi | `kimi` | `.kimi-code/mcp.json` | JSON `mcpServers` | https://code.kimi.com/docs/mcp |
+| devin | `devin` | `.devin/mcp_config.json` | JSON `mcpServers` | https://docs.devin.ai/cli/mcp |
+| grok | `grok` | `.grok/config.toml` | TOML `[mcp_servers]` | https://docs.x.ai/tools/mcp |
+| pi | `pi` | `.pi/mcp.json` | JSON `mcpServers` | https://pi.dev/docs/mcp/ |
+
+Paths come from `docs/research/mcp-clients.md` (best-effort, from vendor docs): if one is wrong for your version, fix its row in `crates/herdmesh/src/clients.rs`.
+
+**Manual only** (user-level config, no project file; setup prints a hint): `cline` (`~/.cline/data/settings/cline_mcp_settings.json`) and `goose` (`~/.config/goose/config.yaml`).
+
+---
+
+## Manual setup
+
 ## 1. Claude Code
 
 Add the `herdmesh` server entry to your project's `.mcp.json` file (at the repository root):
