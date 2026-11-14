@@ -13,7 +13,7 @@
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use hm_net::RoomTicket;
 use serde_json::{Value, json};
@@ -24,6 +24,7 @@ use crate::data::DataDir;
 use crate::naming;
 use crate::project;
 use crate::room;
+use crate::safefs::Root;
 
 const SNIPPET_DOC: &str = include_str!("../../../docs/snippets/herdmesh-collab.md");
 /// Heading of the snippet; its presence means the snippet is already installed.
@@ -297,165 +298,22 @@ pub struct Plan {
     pub problems: Vec<(PathBuf, String)>,
 }
 
-fn read_opt(path: &Path) -> Result<Option<String>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => Ok(Some(s.replace("\r\n", "\n"))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-fn refuse(msg: impl Into<String>) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg.into())
-}
-
-/// Symlinks, and on Windows junctions and every other reparse point.
-fn is_link(md: &std::fs::Metadata) -> bool {
-    if md.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return true;
-        }
-    }
-    false
-}
-
-/// `root/rel` for reading or writing, or an error. `root` must be canonical.
-/// Every existing component below the root must be a real folder (the last
-/// one a regular file): a link or reparse point anywhere on the way is
-/// refused, so nothing is ever read or written outside the project through
-/// one (GATE-4 N13). A missing tail is fine.
-fn checked_target(root: &Path, rel: &Path) -> std::io::Result<PathBuf> {
-    let comps: Vec<_> = rel.components().collect();
-    if comps.is_empty() || comps.iter().any(|c| !matches!(c, Component::Normal(_))) {
-        return Err(refuse(format!("unsafe path {}", rel.display())));
-    }
-    let mut cur = root.to_path_buf();
-    for (i, c) in comps.iter().enumerate() {
-        cur.push(c);
-        match std::fs::symlink_metadata(&cur) {
-            Ok(md) => {
-                if is_link(&md) {
-                    return Err(refuse(format!(
-                        "{} is a link; refusing to follow links out of the project",
-                        rel.display()
-                    )));
-                }
-                let last = i + 1 == comps.len();
-                if last && !md.is_file() {
-                    return Err(refuse(format!("{} is not a regular file", rel.display())));
-                }
-                if !last && !md.is_dir() {
-                    return Err(refuse(format!("{} is not a folder", cur.display())));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-            Err(e) => return Err(e),
-        }
-    }
-    // Belt and braces: the deepest existing part must resolve inside the root.
-    let full = root.join(rel);
-    if let Some(existing) = full
-        .ancestors()
-        .find(|a| std::fs::symlink_metadata(a).is_ok())
-    {
-        let real = std::fs::canonicalize(existing)?;
-        if !real.starts_with(root) {
-            return Err(refuse(format!(
-                "{} resolves outside the project",
-                rel.display()
-            )));
-        }
-    }
-    Ok(full)
-}
-
-/// Create the folders above `rel` one by one, never through a link.
-fn create_parents(root: &Path, rel: &Path) -> std::io::Result<()> {
-    let Some(parent) = rel.parent() else {
-        return Ok(());
-    };
-    let mut cur = root.to_path_buf();
-    for c in parent.components() {
-        cur.push(c);
-        match std::fs::symlink_metadata(&cur) {
-            Ok(md) if is_link(&md) || !md.is_dir() => {
-                return Err(refuse(format!("{} is not a plain folder", cur.display())));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&cur)?;
-                let md = std::fs::symlink_metadata(&cur)?;
-                if is_link(&md) || !md.is_dir() {
-                    return Err(refuse(format!("{} is not a plain folder", cur.display())));
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-fn random_hex() -> std::io::Result<String> {
-    let mut b = [0u8; 8];
-    getrandom::fill(&mut b).map_err(|e| std::io::Error::other(e.to_string()))?;
-    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
-}
-
-/// Write `text` to `root/rel` atomically: an exclusive, unpredictably named
-/// temp file in the same folder, then a rename. A pre-planted link with the
-/// temp name makes `create_new` fail instead of truncating its target, and
-/// the rename replaces a (refused) link rather than writing through it.
-fn write_checked(root: &Path, rel: &Path, text: &str) -> std::io::Result<()> {
-    checked_target(root, rel)?;
-    create_parents(root, rel)?;
-    let target = checked_target(root, rel)?;
-    let dir = target
-        .parent()
-        .ok_or_else(|| refuse("path has no parent"))?;
-    let name = target
-        .file_name()
-        .and_then(OsStr::to_str)
-        .ok_or_else(|| refuse("path has no file name"))?;
-    let tmp = dir.join(format!(".{name}.{}.herdmesh-tmp", random_hex()?));
-    let result = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        // Last check right before the swap (narrows, cannot close, a race).
-        checked_target(root, rel)?;
-        std::fs::rename(&tmp, &target)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
-}
-
-/// Like `read_opt`, but through `checked_target`: a link is an error, so a
-/// planted `CLAUDE.md -> ~/.ssh/...` is never read into a diff.
-fn read_checked(root: &Path, rel: &Path) -> Result<Option<String>, String> {
-    let path = checked_target(root, rel).map_err(|e| e.to_string())?;
-    read_opt(&path)
+/// Read `rel` under the anchored `root`: a link anywhere on the way is an
+/// error (never read into a diff), a missing file is `None`.
+fn read_checked(root: &Root, rel: &Path) -> Result<Option<String>, String> {
+    root.read_to_string(rel)
+        .map(|o| o.map(|s| s.replace("\r\n", "\n")))
+        .map_err(|e| e.to_string())
 }
 
 /// Which instruction file gets the snippet for `kinds`.
-fn instruction_targets(project: &Path, kinds: &[Kind]) -> Vec<&'static str> {
+fn instruction_targets(root: &Root, kinds: &[Kind]) -> Vec<&'static str> {
     let mut out = Vec::new();
     for k in kinds {
         let t = match k {
             Kind::Claude => {
                 // CLAUDE.md that imports AGENTS.md is satisfied by AGENTS.md.
-                let imports = read_checked(project, Path::new("CLAUDE.md"))
+                let imports = read_checked(root, Path::new("CLAUDE.md"))
                     .ok()
                     .flatten()
                     .is_some_and(|s| s.lines().any(|l| l.trim() == "@AGENTS.md"));
@@ -473,18 +331,17 @@ fn instruction_targets(project: &Path, kinds: &[Kind]) -> Vec<&'static str> {
 /// Work out the file changes for `kinds` in `project` without writing anything.
 pub fn plan_files(project: &Path, kinds: &[Kind], room: &str) -> Plan {
     let mut plan = Plan::default();
-    let project = match std::fs::canonicalize(project) {
-        Ok(p) => p,
+    let root = match Root::open(project) {
+        Ok(r) => r,
         Err(e) => {
             plan.problems
                 .push((PathBuf::from("."), format!("project folder: {e}")));
             return plan;
         }
     };
-    let project = project.as_path();
     for &kind in kinds {
         let rel = kind.config_path();
-        let result = read_checked(project, &rel).and_then(|old| {
+        let result = read_checked(&root, &rel).and_then(|old| {
             let new = if kind.is_toml() {
                 merge_toml(old.as_deref(), kind, room)
             } else {
@@ -503,9 +360,9 @@ pub fn plan_files(project: &Path, kinds: &[Kind], room: &str) -> Plan {
         }
     }
     let snip = snippet();
-    for target in instruction_targets(project, kinds) {
+    for target in instruction_targets(&root, kinds) {
         let rel = PathBuf::from(target);
-        match read_checked(project, &rel) {
+        match read_checked(&root, &rel) {
             Ok(Some(old)) if old.contains(SNIPPET_MARKER) => {}
             Ok(old) => {
                 let mut new = old.clone().unwrap_or_default();
@@ -550,14 +407,14 @@ pub fn apply(
     if plan.changes.is_empty() {
         return Ok(done);
     }
-    let root = std::fs::canonicalize(project)?;
+    let root = Root::open(project)?;
     for ch in &plan.changes {
         show(&ch.diff());
         if !confirm(ch) {
             done.declined.push(ch.path.clone());
             continue;
         }
-        match write_checked(&root, &ch.path, &ch.new) {
+        match root.write_atomic(&ch.path, &ch.new) {
             Ok(()) => done.written.push(ch.path.clone()),
             Err(e) => done.failed.push((ch.path.clone(), e.to_string())),
         }
@@ -901,7 +758,7 @@ mod tests {
     #[test]
     fn instruction_target_follows_agents_md_imports() {
         let t = tmp();
-        let root = std::fs::canonicalize(t.path()).unwrap();
+        let root = Root::open(t.path()).unwrap();
         assert_eq!(
             instruction_targets(&root, &[Kind::Claude]),
             vec!["CLAUDE.md"]
@@ -1202,16 +1059,6 @@ mod tests {
         assert!(plan.problems.is_empty(), "{:?}", plan.problems);
         all(&plan, &via);
         assert!(real.join(".mcp.json").is_file());
-    }
-
-    #[test]
-    fn unsafe_relative_paths_are_refused() {
-        let t = tmp();
-        let root = std::fs::canonicalize(t.path()).unwrap();
-        for bad in ["../x", "/abs", "a/../../x", ""] {
-            assert!(checked_target(&root, Path::new(bad)).is_err(), "{bad}");
-        }
-        assert!(checked_target(&root, Path::new("ok/new.txt")).is_ok());
     }
 
     // ---- GATE-4 N14: identity, not basename ----
