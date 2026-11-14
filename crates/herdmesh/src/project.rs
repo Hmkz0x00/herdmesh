@@ -13,20 +13,45 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 const DIR: &str = "projects";
-const DOMAIN: &str = "herdmesh-project-v1";
+const DOMAIN: &str = "herdmesh-project-v2";
 
 /// The folder's real path with links resolved: the project identity input.
 pub fn canonical_root(p: &Path) -> io::Result<PathBuf> {
     std::fs::canonicalize(p)
 }
 
-/// Stable identity of a canonical folder path: 32 hex chars.
-pub fn project_key(canonical: &Path) -> String {
+/// The path's raw OS bytes, lossless: Unix bytes as they are, Windows UTF-16
+/// code units (which may hold unpaired surrogates). A lossy `String` would give
+/// two sibling folders whose names differ only in invalid bytes the same
+/// identity (GATE-5 N18).
+fn raw_bytes(p: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        p.as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        p.encode_wide().flat_map(u16::to_le_bytes).collect()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        p.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+fn path_id(p: &std::ffi::OsStr) -> String {
     let mut h = blake3::Hasher::new();
     h.update(DOMAIN.as_bytes());
     h.update(&[0]);
-    h.update(canonical.to_string_lossy().as_bytes());
-    h.finalize().to_hex()[..32].to_owned()
+    h.update(&raw_bytes(p));
+    h.finalize().to_hex().to_string()
+}
+
+/// Stable identity of a canonical folder path: 32 hex chars.
+pub fn project_key(canonical: &Path) -> String {
+    path_id(canonical.as_os_str())[..32].to_owned()
 }
 
 fn binding_file(data_root: &Path, key: &str) -> PathBuf {
@@ -37,6 +62,9 @@ fn binding_file(data_root: &Path, key: &str) -> PathBuf {
 #[serde(deny_unknown_fields)]
 struct Binding {
     room_id: String,
+    /// Full lossless path identity, checked on lookup.
+    path_id: String,
+    /// For humans only (lossy).
     path: String,
 }
 
@@ -59,6 +87,7 @@ pub fn bind(data_root: &Path, canonical: &Path, room_id: &str) -> io::Result<()>
     }
     let text = toml::to_string(&Binding {
         room_id: room_id.to_owned(),
+        path_id: path_id(canonical.as_os_str()),
         path: canonical.display().to_string(),
     })
     .map_err(io::Error::other)?;
@@ -71,7 +100,7 @@ pub fn bind(data_root: &Path, canonical: &Path, room_id: &str) -> io::Result<()>
 pub fn bound_room(data_root: &Path, canonical: &Path) -> Option<String> {
     let text = std::fs::read_to_string(binding_file(data_root, &project_key(canonical))).ok()?;
     let b: Binding = toml::from_str(&text).ok()?;
-    valid_room_id(&b.room_id).then_some(b.room_id)
+    (valid_room_id(&b.room_id) && b.path_id == path_id(canonical.as_os_str())).then_some(b.room_id)
 }
 
 /// The room of `start` or the nearest parent folder that is bound.
@@ -161,7 +190,7 @@ mod tests {
         assert_eq!(bound_room(&data, &proj), None);
         std::fs::write(
             binding_file(&data, &project_key(&proj)),
-            "room_id = \"../x\"\npath = \"p\"\n",
+            "room_id = \"../x\"\npath_id = \"x\"\npath = \"p\"\n",
         )
         .unwrap();
         assert_eq!(bound_room(&data, &proj), None);
@@ -185,5 +214,52 @@ mod tests {
         std::fs::create_dir_all(proj.join(".herdmesh")).unwrap();
         std::fs::write(proj.join(".herdmesh/room"), "evil-room\n").unwrap();
         assert_eq!(find_room(&data, &proj), None);
+    }
+
+    #[test]
+    fn paths_differing_only_in_invalid_bytes_do_not_alias() {
+        // Both lossy-convert to the same string with U+FFFD (GATE-5 N18).
+        #[cfg(unix)]
+        let (a, b) = {
+            use std::os::unix::ffi::OsStrExt as _;
+            (
+                std::ffi::OsStr::from_bytes(b"/p/app\xff").to_owned(),
+                std::ffi::OsStr::from_bytes(b"/p/app\xfe").to_owned(),
+            )
+        };
+        #[cfg(windows)]
+        let (a, b) = {
+            use std::os::windows::ffi::OsStringExt as _;
+            let mk = |lone: u16| std::ffi::OsString::from_wide(&[0x5c, 0x70, 0x5c, 0x61, lone]);
+            (mk(0xD800), mk(0xD801))
+        };
+        assert_eq!(
+            a.to_string_lossy(),
+            b.to_string_lossy(),
+            "premise: lossy strings collide"
+        );
+        assert_ne!(path_id(&a), path_id(&b));
+        assert_ne!(path_id(&a)[..32], path_id(&b)[..32]);
+    }
+
+    #[test]
+    fn a_binding_whose_recorded_identity_differs_is_rejected() {
+        let (_t, data, proj) = dirs();
+        bind(&data, &proj, R1).unwrap();
+        let f = binding_file(&data, &project_key(&proj));
+        let text = std::fs::read_to_string(&f).unwrap();
+        let forged = text
+            .lines()
+            .map(|l| {
+                if l.starts_with("path_id") {
+                    format!("path_id = \"{}\"", "0".repeat(64))
+                } else {
+                    l.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&f, forged).unwrap();
+        assert_eq!(bound_room(&data, &proj), None);
     }
 }

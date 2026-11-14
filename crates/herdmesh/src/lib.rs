@@ -12,6 +12,7 @@ pub mod notify;
 pub mod project;
 pub mod repair;
 pub mod room;
+pub mod safefs;
 pub mod session;
 pub mod setup;
 
