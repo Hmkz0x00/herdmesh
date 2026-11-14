@@ -1002,6 +1002,152 @@ impl Store {
         px_at(&self.conn, node.as_bytes(), seq)
     }
 
+    /// Retry suppression is local to one peer and never changes stored events or views.
+    pub const SYNC_RETRY_TTL_MS: u64 = 60_000;
+    pub const SYNC_RETRY_PER_PEER: usize = 1024;
+    pub const SYNC_RETRY_TOTAL: usize = 4096;
+
+    // Lazy local metadata: no event-schema or admission changes are needed.
+    fn ensure_sync_retries(&self) -> Result<(), StoreError> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sync_retries (
+                peer BLOB NOT NULL, node BLOB NOT NULL, seq BLOB NOT NULL,
+                id BLOB NOT NULL, retry_at BLOB NOT NULL,
+                PRIMARY KEY (peer, node, seq)
+             );
+             CREATE INDEX IF NOT EXISTS sync_retries_expiry ON sync_retries (retry_at);",
+        )?;
+        Ok(())
+    }
+
+    /// After batch ingestion, remember offered IDs that were not retained (including
+    /// refused claims, invalid signatures, deferred events and discarded twins).
+    /// Only this peer's inventory treats them as seen, until the bounded retry time.
+    pub fn remember_sync_retries(
+        &mut self,
+        peer: &NodeId,
+        offered: &[Event],
+        now: u64,
+    ) -> Result<(), StoreError> {
+        self.ensure_sync_retries()?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM sync_retries WHERE retry_at <= ?1",
+            params![be(now)],
+        )?;
+        for e in offered {
+            if id_at(&tx, &e.author.node, e.seq)? == Some(e.id) {
+                tx.execute(
+                    "DELETE FROM sync_retries WHERE peer = ?1 AND node = ?2 AND seq = ?3",
+                    params![peer.as_bytes(), e.author.node.as_bytes(), be(e.seq)],
+                )?;
+            } else {
+                tx.execute(
+                    "INSERT OR REPLACE INTO sync_retries (peer, node, seq, id, retry_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        peer.as_bytes(),
+                        e.author.node.as_bytes(),
+                        be(e.seq),
+                        e.id.as_bytes(),
+                        be(now.saturating_add(Self::SYNC_RETRY_TTL_MS))
+                    ],
+                )?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM sync_retries WHERE rowid IN (
+                SELECT rowid FROM sync_retries WHERE peer = ?1
+                ORDER BY retry_at DESC, rowid DESC LIMIT -1 OFFSET ?2)",
+            params![peer.as_bytes(), Self::SYNC_RETRY_PER_PEER as i64],
+        )?;
+        tx.execute(
+            "DELETE FROM sync_retries WHERE rowid IN (
+                SELECT rowid FROM sync_retries
+                ORDER BY retry_at DESC, rowid DESC LIMIT -1 OFFSET ?1)",
+            params![Self::SYNC_RETRY_TOTAL as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Client author page including authors known only through refused/deferred IDs.
+    /// Otherwise an entirely refused author would keep using the legacy bootstrap range.
+    pub fn sync_seq_summary_page(
+        &self,
+        peer: &NodeId,
+        after: Option<NodeId>,
+        limit: usize,
+        now: u64,
+    ) -> Result<BTreeMap<NodeId, AuthorSeqs>, StoreError> {
+        self.ensure_sync_retries()?;
+        let mut page = self.seq_summary_page(after, limit, 0)?;
+        let after = after.map_or_else(Vec::new, |n| n.as_bytes().to_vec());
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT node, MAX(seq) FROM sync_retries
+             WHERE peer = ?1 AND node > ?2 AND retry_at > ?3
+             GROUP BY node ORDER BY node LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                peer.as_bytes(),
+                after,
+                be(now),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        )?;
+        for row in rows {
+            let (node, seq) = row?;
+            let summary = page
+                .entry(NodeId::from_bytes(arr(node, "retry author")?))
+                .or_default();
+            summary.max = summary.max.max(u64_of(seq, "retry seq")?);
+        }
+        Ok(page.into_iter().take(limit).collect())
+    }
+
+    /// Exact inventory for one peer: held IDs plus its unexpired retry suppressions.
+    /// A suppressed twin overrides the held ID only in this outgoing inventory;
+    /// other peers and server-side inventories continue to see the real stored ID.
+    pub fn sync_seq_ids_after(
+        &self,
+        peer: &NodeId,
+        author: &NodeId,
+        after: u64,
+        limit: usize,
+        now: u64,
+    ) -> Result<Vec<(u64, EventId)>, StoreError> {
+        self.ensure_sync_retries()?;
+        let mut ids: BTreeMap<_, _> = self
+            .seq_ids_after(author, after, limit)?
+            .into_iter()
+            .collect();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT seq, id FROM sync_retries
+             WHERE peer = ?1 AND node = ?2 AND seq > ?3 AND retry_at > ?4
+             ORDER BY seq LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                peer.as_bytes(),
+                author.as_bytes(),
+                be(after),
+                be(now),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        )?;
+        for row in rows {
+            let (seq, id) = row?;
+            ids.insert(
+                u64_of(seq, "retry seq")?,
+                EventId::from_bytes(arr(id, "retry id")?),
+            );
+        }
+        Ok(ids.into_iter().take(limit).collect())
+    }
+
     /// A bounded page of held sequence/ID pairs, including sparse tails.
     /// Reads only the author/sequence index, never event bodies or absent seqs.
     pub fn seq_ids_after(
