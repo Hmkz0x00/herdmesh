@@ -45,6 +45,10 @@ pub struct FeedEvent {
     pub full: bool,
     #[serde(rename = "ref")]
     pub reference: Option<String>,
+    /// `"observer"` for a message whose author was removed (or is a mere
+    /// observer); absent for ordinary events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,4 +80,7 @@ pub struct FullEvent {
     pub refs: Vec<String>,
     #[serde(default)]
     pub truncated: bool,
+    /// See [`FeedEvent::role`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }

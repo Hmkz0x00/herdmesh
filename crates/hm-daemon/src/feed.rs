@@ -243,6 +243,7 @@ pub fn full_event(e: &Event) -> Option<FullEvent> {
         refs: p.refs.iter().map(|r| reference(r)).collect(),
         truncated: p.truncated
             || sanitize_display(&redact(&p.raw).text, usize::MAX).len() > FULL_MAX,
+        role: None,
     })
 }
 
@@ -256,11 +257,28 @@ pub fn event_json(store: &Store, id: &str) -> Result<Option<String>, hm_store::S
     let Some(e) = store.event_by_prefix(&id)? else {
         return Ok(None);
     };
+    // Same rule as the store: an event its author's final role may not write
+    // is not shown (the raw audit log is separate).
+    if !visible(store, &e) {
+        return Ok(None);
+    }
     let Some(mut f) = full_event(&e) else {
         return Ok(None);
     };
+    f.role = role_mark(store, &e);
     f.to = recipient(store, &e)?;
     Ok(serde_json::to_string(&f).ok())
+}
+
+/// The store's rule: views ignore events their author's FINAL role may not
+/// write, so the feed must not show them as ordinary events either.
+fn visible(store: &Store, e: &Event) -> bool {
+    store.views().role_of(&e.author.node).may(e.kind())
+}
+
+/// `Some("observer")` for events of an observer (removed) author.
+fn role_mark(store: &Store, e: &Event) -> Option<String> {
+    (store.views().role_of(&e.author.node) == Role::Observer).then(|| "observer".to_owned())
 }
 
 // Structured event identifiers are references, never secret-looking free text.
@@ -349,7 +367,11 @@ pub fn build(
     if recent.len() > HISTORY_MAX {
         recent.remove(0);
     }
-    let all: Vec<&Event> = recent.iter().map(|(_, e)| e).collect();
+    let all: Vec<&Event> = recent
+        .iter()
+        .map(|(_, e)| e)
+        .filter(|e| visible(store, e))
+        .collect();
     let by_id: BTreeMap<EventId, &Event> = all.iter().map(|&e| (e.id, e)).collect();
     let limit = limit.clamp(1, EVENTS_MAX);
 
@@ -449,7 +471,10 @@ pub fn build(
             {
                 parts.push(format!("{act} {}", age(now, e.ts)));
             }
-            let activity = if parts.is_empty() {
+            let removed = views.role_of(&a.node) == Role::Observer;
+            let activity = if removed {
+                "removed".to_owned()
+            } else if parts.is_empty() {
                 "no activity yet".to_owned()
             } else {
                 parts.join(" · ")
@@ -460,7 +485,7 @@ pub fn build(
                 name: text(&a.agent_name),
                 role: role_str(m.role.unwrap_or_else(|| views.role_of(&a.node))).to_owned(),
                 local: a.node == me.node,
-                present: m.present,
+                present: m.present && !removed,
                 status: status_str(m.status).to_owned(),
                 activity: text(&activity),
                 last_ms: last_ms.get(a).copied().unwrap_or(0),
@@ -482,7 +507,7 @@ pub fn build(
     let head = arrivals.last().map_or(since, |(position, _)| *position);
     let shown: Vec<_> = arrivals
         .iter()
-        .filter(|(_, e)| parts(e).is_some())
+        .filter(|(_, e)| visible(store, e) && parts(e).is_some())
         .collect();
     let more = shown.len() > limit;
     truncated |= more;
@@ -510,6 +535,7 @@ pub fn build(
             text: t,
             full: full && !p.truncated,
             reference: p.reference.map(|r| reference(&r)),
+            role: role_mark(store, e),
         });
     }
     let mut feed = Feed {
@@ -815,5 +841,226 @@ mod budget_tests {
             },
         );
         assert!(log_line(&event).unwrap().contains("step 19"));
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use hm_proto::{Lamport, NodeId, RoomId, TaskId};
+
+    const T: u64 = 1_700_000_000_000;
+
+    fn key(n: u8) -> SigningKey {
+        SigningKey::from_bytes(&[n; 32])
+    }
+
+    fn node(n: u8) -> NodeId {
+        NodeId::from_bytes(key(n).verifying_key().to_bytes())
+    }
+
+    fn sign(k: u8, name: &str, seq: u64, l: u64, body: EventBody) -> Event {
+        Event::sign(
+            &key(k),
+            RoomId::from_bytes([2; 32]),
+            name,
+            seq,
+            Lamport(l),
+            T,
+            body,
+        )
+        .unwrap()
+    }
+
+    fn task(seq: u64, l: u64, id: &str) -> Event {
+        sign(
+            2,
+            "mallory",
+            seq,
+            l,
+            EventBody::TaskAdd {
+                task: TaskId::new(id).unwrap(),
+                title: format!("title-{id}"),
+                paths: vec![],
+            },
+        )
+    }
+
+    fn decision(seq: u64, l: u64, title: &str) -> Event {
+        sign(
+            2,
+            "mallory",
+            seq,
+            l,
+            EventBody::Decision {
+                title: title.into(),
+                rationale: String::new(),
+                refs: vec![],
+            },
+        )
+    }
+
+    fn claim(seq: u64, l: u64, path: &str) -> Event {
+        sign(
+            2,
+            "mallory",
+            seq,
+            l,
+            EventBody::LeaseClaim {
+                paths: vec![path.into()],
+                ttl_secs: 600,
+            },
+        )
+    }
+
+    fn note(seq: u64, l: u64, text: &str) -> Event {
+        sign(
+            2,
+            "mallory",
+            seq,
+            l,
+            EventBody::Note {
+                scope: "x".into(),
+                text: text.into(),
+            },
+        )
+    }
+
+    fn build_store(events: &[Event]) -> Store {
+        let genesis = sign(1, "owner", 1, 1, EventBody::Genesis { owner: node(1) });
+        let mut s = Store::open_in_memory(RoomId::from_bytes([2; 32])).unwrap();
+        s.pin_genesis(genesis.id).unwrap();
+        s.append_at(&genesis, T).unwrap();
+        for e in events {
+            let _ = s.append_at(e, T);
+        }
+        s
+    }
+
+    fn feed(store: &Store, since: u64, limit: usize) -> Feed {
+        let me = AgentRef::new(node(1), "owner");
+        build("r", store, &me, T, since, limit).unwrap()
+    }
+
+    fn removed_scenario() -> Store {
+        build_store(&[
+            sign(2, "mallory", 1, 2, EventBody::Join { role: Role::Member }),
+            task(2, 3, "early"),
+            decision(3, 4, "early-decision"),
+            claim(4, 5, "src/early/**"),
+            note(5, 6, "hello from before"),
+            // Owner demotes mallory at L10.
+            sign(
+                1,
+                "owner",
+                2,
+                10,
+                EventBody::RoleGrant {
+                    node: node(2),
+                    role: Role::Observer,
+                },
+            ),
+            // Backdated writes signed after removal.
+            task(6, 9, "late"),
+            decision(7, 9, "late-decision"),
+            claim(8, 9, "src/late/**"),
+            note(9, 9, "hello from after"),
+        ])
+    }
+
+    fn kinds_from_mallory(f: &Feed) -> Vec<&str> {
+        f.events
+            .iter()
+            .filter(|e| e.from.contains("mallory"))
+            .map(|e| e.kind.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn removed_members_operational_events_never_appear_before_or_after() {
+        let s = removed_scenario();
+        let f = feed(&s, 0, 200);
+        let kinds = kinds_from_mallory(&f);
+        for bad in ["task", "decision", "claim", "task_add", "lease", "release"] {
+            assert!(!kinds.contains(&bad), "{bad} leaked: {kinds:?}");
+        }
+        let json = serde_json::to_string(&f).unwrap();
+        for bad in [
+            "title-early",
+            "title-late",
+            "early-decision",
+            "late-decision",
+            "src/early",
+            "src/late",
+        ] {
+            assert!(!json.contains(bad), "{bad} leaked in {json}");
+        }
+        assert!(f.tasks.is_empty() && f.leases.is_empty());
+    }
+
+    #[test]
+    fn removed_members_messages_are_marked_observer() {
+        let s = removed_scenario();
+        let f = feed(&s, 0, 200);
+        let notes: Vec<_> = f.events.iter().filter(|e| e.kind == "note").collect();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes.iter().all(|e| e.role.as_deref() == Some("observer")));
+        // Ordinary members' events carry no role mark.
+        let join = f
+            .events
+            .iter()
+            .find(|e| e.kind == "genesis" || e.from.contains("owner"));
+        assert!(join.is_none_or(|e| e.role.is_none()));
+    }
+
+    #[test]
+    fn member_list_shows_removed_not_active() {
+        let s = removed_scenario();
+        let f = feed(&s, 0, 200);
+        let m = f.members.iter().find(|m| m.name == "mallory").unwrap();
+        assert_eq!(m.role, "observer");
+        assert!(!m.present);
+        assert_eq!(m.activity, "removed");
+    }
+
+    #[test]
+    fn event_detail_follows_the_same_rule() {
+        let s = removed_scenario();
+        let ev = |e: &Event| event_json(&s, &e.id.to_string()).unwrap();
+        assert!(ev(&task(6, 9, "late")).is_none());
+        assert!(ev(&decision(3, 4, "early-decision")).is_none());
+        assert!(ev(&claim(8, 9, "src/late/**")).is_none());
+        let shown = ev(&note(9, 9, "hello from after")).unwrap();
+        assert!(shown.contains(r#""role":"observer""#), "{shown}");
+    }
+
+    #[test]
+    fn pagination_advances_over_skipped_arrivals() {
+        let s = removed_scenario();
+        let first = feed(&s, 0, 200);
+        // Nothing new: polling from the cursor yields no events and the same head.
+        let next = feed(&s, first.cursor, 200);
+        assert!(next.events.is_empty());
+        assert_eq!(next.cursor, first.cursor);
+        // Page through from the start one event at a time: no hidden event
+        // appears and the cursor strictly advances to the end.
+        let mut since = 1;
+        let mut seen = Vec::new();
+        for _ in 0..40 {
+            let p = feed(&s, since, 1);
+            seen.extend(p.events.iter().map(|e| e.kind.clone()));
+            if p.cursor == since {
+                break;
+            }
+            since = p.cursor;
+        }
+        assert!(
+            !seen
+                .iter()
+                .any(|k| k.contains("task") || k == "decision" || k.contains("claim")),
+            "{seen:?}"
+        );
+        assert_eq!(since, first.cursor);
     }
 }
